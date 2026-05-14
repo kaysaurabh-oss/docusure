@@ -1,1382 +1,1273 @@
-"""
-HVPQ / PIQ Vetting Observation Checker
---------------------------------------
-Rule-based Streamlit app for objective, exportable HVPQ/PIQ checks.
-
-Design principles:
-1. Simple and objective checks first.
-2. Do not infer from JiBe incident list. Only compare HVPQ/PIQ declarations and flag blanks/no incidents.
-3. Class Status formats differ by class society, so use generic proximity-based extraction and mark uncertain items for manual check.
-4. Output is a targeted discrepancy/manual verification register that can be sent to ship.
-"""
-
 from __future__ import annotations
 
 import io
 import re
+import json
+import zipfile
+import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
-from datetime import date, datetime
+from datetime import datetime, date
+from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
-from rapidfuzz import fuzz
 
 try:
     import fitz  # PyMuPDF
-except Exception:  # pragma: no cover
+except Exception:
     fitz = None
 
 try:
-    from docx import Document
-except Exception:  # pragma: no cover
-    Document = None
-
-
-# -----------------------------
-# Configuration
-# -----------------------------
-
-APP_TITLE = "HVPQ / PIQ Vetting Observation Checker"
-DEFAULT_CERT_WARNING_DAYS = 90
-DEFAULT_SURVEY_WARNING_DAYS = 180
-DEFAULT_TS_GAP_MONTHS = 7.0
-DEFAULT_MS_GAP_MONTHS = 12.0
-
-RISK_SCORE = {
-    "PASS": 0,
-    "INFO": 0,
-    "LOW": 1,
-    "WARNING": 2,
-    "MEDIUM": 3,
-    "HIGH": 4,
-    "CRITICAL": 5,
-    "MANUAL CHECK": 2,
-}
-
-DATE_RE = re.compile(
-    r"\b(?:\d{1,2}[\s\-/\.](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*[\s\-/\.]\d{2,4}|"
-    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*[\s\-/\.]\d{1,2}[,\s\-/\.]\d{2,4}|"
-    r"\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4}|"
-    r"\d{4}[\-/\.]\d{1,2}[\-/\.]\d{1,2})\b",
-    flags=re.IGNORECASE,
-)
-
-CERTIFICATE_NAMES = [
-    "Safety Equipment Certificate",
-    "Safety Radio Certificate",
-    "Safety Construction Certificate",
-    "Loadline Certificate",
-    "International Oil Pollution Prevention Certificate",
-    "IOPPC",
-    "International Ballast Water Management Certificate",
-    "IBWMC",
-    "Safety Management Certificate",
-    "SMC",
-    "Document of Compliance",
-    "DOC",
-    "International Ship Security Certificate",
-    "ISSC",
-    "USCG Certificate of Compliance",
-    "Minimum Safe Manning Document",
-    "Civil Liability Certificate",
-    "Wreck Removal Convention Certificate",
-    "Certificate of Fitness",
-    "Class Certificate",
-]
-
-SURVEY_FIELDS = {
-    "last_dry_dock": ["date of last dry dock", "last dry dock"],
-    "next_dry_dock_due": ["date next dry dock due", "next dry dock", "dry dock due"],
-    "last_iws": ["date of last iws", "last iws", "in water survey"],
-    "next_iws_due": ["date next iws due", "next iws", "iws due"],
-    "last_special_survey": ["date of last special survey", "last special survey"],
-    "next_special_survey_due": ["date next special survey due", "special survey due"],
-    "last_annual_survey": ["date of last annual survey", "last annual survey", "annual survey"],
-    "last_intermediate_survey": ["date of last intermediate survey", "last intermediate survey", "intermediate survey"],
-    "conditions_of_class": ["conditions of class", "condition of class", "coc"],
-    "memoranda_of_class": ["memoranda of class", "memorandum of class", "moc"],
-    "flag_dispensation": ["flag state dispensation", "dispensation"],
-}
-
-HVPQ_HIGH_RISK_FIELDS = {
-    "ship_type": ["type of ship", "if other, then specify", "product carrier", "chemical tanker"],
-    "pni": ["p and i club", "p&i cover", "wreck removal"],
-    "cii": ["carbon intensity indicator", "cii rating", "annual efficiency ratio", "aer"],
-    "eexi": ["energy efficiency existing ship index", "eexi"],
-    "eedi": ["energy efficiency design index", "eedi"],
-    "eiv": ["estimated index value", "eiv"],
-    "psc": ["port state control", "psc"],
-    "incidents": ["pollution", "grounding", "collision", "allision", "other incidents", "type of incident"],
-    "certificates": CERTIFICATE_NAMES,
-    "foam": ["fixed foam", "foam", "test analysis certificate"],
-    "overboard": ["overboard discharges", "blanks", "testing arrangement"],
-    "cargo_pressure_test": ["cargo piping pressure test", "hydrostatically pressure test cargo"],
-    "bunker_pressure_test": ["bunker piping pressure test", "hydrostatically pressure test bunker"],
-    "tank_coating": ["cargo tank coating", "ballast tank coating", "coated", "coating inspection"],
-    "mooring": ["mooring", "brake test", "split drum", "rendering load", "bhc"],
-    "diagrams": ["mooring arrangement", "manifold arrangement", "fairlead", "chock", "bitt diagram"],
-    "lifting_gear": ["lifting gear", "crane", "annual test", "five yearly"],
-}
-
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 # -----------------------------
-# Data models
+# Data structures
 # -----------------------------
 
 @dataclass
+class DocPack:
+    name: str
+    kind: str
+    text: str = ""
+    fields: Dict[str, Any] = None
+    qmap: Dict[str, str] = None
+    meta: Dict[str, Any] = None
+
+    def __post_init__(self):
+        self.fields = self.fields or {}
+        self.qmap = self.qmap or {}
+        self.meta = self.meta or {}
+
+@dataclass
 class Finding:
-    check_id: str
-    module: str
+    area: str
     check: str
     status: str
     risk: str
     hvpq_value: str = ""
     piq_value: str = ""
-    class_status_value: str = ""
+    class_value: str = ""
     q88_value: str = ""
+    xml_value: str = ""
     reason: str = ""
-    recommended_action: str = ""
-    manual_verification_required: str = "No"
-    source_location: str = ""
-
-    @property
-    def score(self) -> int:
-        return RISK_SCORE.get(self.risk.upper(), 0)
-
-
-@dataclass
-class TextDoc:
-    name: str
-    kind: str
-    full_text: str
-    pages: List[str]
-
+    required_action: str = ""
+    source: str = ""
+    question_ref: str = ""
 
 # -----------------------------
-# File extraction helpers
+# Config / Targeted rule library
 # -----------------------------
 
-@st.cache_data(show_spinner=False)
-def read_uploaded_file(name: str, data: bytes) -> TextDoc:
-    suffix = name.lower().split(".")[-1]
-    if suffix == "pdf":
-        return read_pdf(name, data)
-    if suffix in ["xlsx", "xls"]:
-        return read_excel_as_text(name, data)
-    if suffix == "csv":
-        return read_csv_as_text(name, data)
-    if suffix in ["docx"]:
-        return read_docx_as_text(name, data)
-    return TextDoc(name=name, kind=suffix, full_text=data.decode("utf-8", errors="ignore"), pages=[])
+RISK_ORDER = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1, "PASS": 0}
+ACTIONABLE = {"CRITICAL", "HIGH", "MEDIUM", "MANUAL CHECK", "WARNING"}
 
+# Field specs use aliases because PIQ/HVPQ/Class/Q88 labels will never be identical.
+# Keep them objective; do not overinterpret.
+FIELD_SPECS: Dict[str, Dict[str, Any]] = {
+    "vessel_name": {
+        "area": "Identity", "risk": "HIGH", "kind": "text", "loose": True,
+        "aliases": ["Name of ship", "Vessel Name", "Ship Name", "Vessel", "Name"]
+    },
+    "imo_number": {
+        "area": "Identity", "risk": "CRITICAL", "kind": "number",
+        "aliases": ["LR/IMO number", "IMO/LR Number", "IMO number", "IMO No", "IMO"]
+    },
+    "document_date": {
+        "area": "Document status", "risk": "MEDIUM", "kind": "date",
+        "aliases": ["Date this HVPQ document completed", "Date", "Document exported", "completed"]
+    },
+    "vessel_type": {
+        "area": "General Particulars", "risk": "MEDIUM", "kind": "semantic_text", "loose": True,
+        "aliases": ["Vessel Type", "type of ship", "type of tanker", "ship type", "Product Carrier", "Products/Chemical Tanker"]
+    },
+    "flag": {"area": "General Particulars", "risk": "MEDIUM", "kind": "text", "aliases": ["Flag", "Flag State"]},
+    "class_society": {"area": "Class", "risk": "HIGH", "kind": "semantic_text", "aliases": ["Classification Society", "Class Society", "Class", "Recognized Organization"]},
+    "last_drydock": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date of last dry dock", "last dry dock", "last drydock", "dry dock date", "docking survey"]},
+    "next_drydock_due": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date next dry dock due", "next dry dock due", "next drydock", "docking survey due"]},
+    "last_iws": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date of last IWS", "last IWS", "in water survey", "underwater survey"]},
+    "next_iws_due": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date next IWS due", "next IWS due", "IWS due", "underwater survey due"]},
+    "last_special_survey": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date of last special survey", "last special survey", "special survey date"]},
+    "next_special_survey_due": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date next special survey due", "next special survey due", "special survey due"]},
+    "last_annual_survey": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date of last annual survey", "last annual survey", "annual survey"]},
+    "last_intermediate_survey": {"area": "Class / Survey", "risk": "HIGH", "kind": "date", "aliases": ["Date of Last Intermediate survey", "last intermediate survey", "intermediate survey"]},
+    "conditions_of_class": {"area": "Class / Survey", "risk": "CRITICAL", "kind": "yesno", "aliases": ["open Conditions of Class", "Conditions of Class", "COC", "Condition of Class"]},
+    "memoranda_of_class": {"area": "Class / Survey", "risk": "HIGH", "kind": "yesno", "aliases": ["Memoranda of Class", "Memorandum of Class", "MOC"]},
+    "flag_dispensation": {"area": "Class / Survey", "risk": "HIGH", "kind": "yesno", "aliases": ["flag state dispensations", "dispensation", "exemption"]},
+    "cii_rating": {"area": "Environmental", "risk": "HIGH", "kind": "semantic_text", "aliases": ["CII rating", "Carbon Intensity Indicator", "attained annual operational CII", "CII"]},
+    "cii_verified_by": {"area": "Environmental", "risk": "MEDIUM", "kind": "semantic_text", "aliases": ["CII rating verified", "CII verified", "Is the CII rating verified", "verified by"]},
+    "eexi_rating": {"area": "Environmental", "risk": "HIGH", "kind": "number", "aliases": ["EEXI rating", "Energy Efficiency Existing ship Index", "EEXI"]},
+    "eedi_rating": {"area": "Environmental", "risk": "MEDIUM", "kind": "number", "aliases": ["EEDI rating", "Energy Efficiency Design Index", "EEDI"]},
+    "eiv_rating": {"area": "Environmental", "risk": "MEDIUM", "kind": "number", "aliases": ["EIV rating", "Estimated Index Value", "EIV"]},
+    "last_psc_date": {"area": "PSC", "risk": "HIGH", "kind": "date", "aliases": ["Date of last Port State Control Inspection", "Date of PSC Inspection", "last PSC", "PSC inspection"]},
+    "last_psc_port": {"area": "PSC", "risk": "HIGH", "kind": "semantic_text", "aliases": ["Port of last Port State Control Inspection", "port did the inspection take place", "last PSC port", "Port"]},
+    "psc_detained": {"area": "PSC", "risk": "CRITICAL", "kind": "yesno", "aliases": ["detained during the last 36 months", "Was the vessel detained", "detained"]},
+    "incident_pollution": {"area": "Incidents", "risk": "HIGH", "kind": "yesno", "aliases": ["pollution incident", "release to the environment", "MARPOL"]},
+    "incident_grounding": {"area": "Incidents", "risk": "CRITICAL", "kind": "yesno", "aliases": ["grounding", "hard aground", "touched bottom", "suspected of touching bottom"]},
+    "incident_other": {"area": "Incidents", "risk": "HIGH", "kind": "yesno", "aliases": ["other incidents during the past 12 months", "any other incidents", "incident during previous 12 months"]},
+    "foam_type": {"area": "Firefighting", "risk": "MEDIUM", "kind": "semantic_text", "aliases": ["type of foam", "fixed foam", "foam type", "AR-AFFF"]},
+    "foam_test_date": {"area": "Firefighting", "risk": "HIGH", "kind": "date", "aliases": ["date of supply of the foam", "last Test Analysis Certificate", "foam test", "foam analysis"]},
+    "machinery_space_fixed_fire": {"area": "Firefighting", "risk": "MEDIUM", "kind": "semantic_text", "aliases": ["machinery space fixed", "engine room", "fixed fire extinguishing system - machinery space"]},
+    "cargo_pumproom_fixed_fire": {"area": "Firefighting", "risk": "MEDIUM", "kind": "semantic_text", "aliases": ["cargo pumproom", "Cargo pump room", "fixed fire extinguishing system - cargo pumproom"]},
+    "cargo_pressure_test": {"area": "Pollution / Cargo", "risk": "HIGH", "kind": "yesno", "aliases": ["cargo piping pressure tests", "hydrostatically pressure test cargo piping", "cargo pressure test"]},
+    "cargo_pressure": {"area": "Pollution / Cargo", "risk": "MEDIUM", "kind": "number", "aliases": ["cargo piping pressure", "specify pressure", "cargo pressure"]},
+    "bunker_pressure_test": {"area": "Pollution / Cargo", "risk": "HIGH", "kind": "yesno", "aliases": ["bunker piping pressure tests", "hydrostatically pressure test bunker piping", "bunker pressure test"]},
+    "bunker_pressure": {"area": "Pollution / Cargo", "risk": "MEDIUM", "kind": "number", "aliases": ["bunker piping pressure", "bunker pressure"]},
+    "overboard_blanks": {"area": "Pollution / Cargo", "risk": "HIGH", "kind": "yesno", "aliases": ["overboard discharges fitted with blanks", "overboard valves", "testing arrangement for the overboard valves"]},
+    "sea_chest": {"area": "Pollution / Cargo", "risk": "MEDIUM", "kind": "semantic_text", "aliases": ["sea valves", "seachest", "sea chest", "cargo sea chest"]},
+    "cargo_tank_oldest_inspection": {"area": "Tank Inspection", "risk": "HIGH", "kind": "date", "aliases": ["oldest inspection report for all cargo and slop", "cargo tank inspection", "cargo and slop tanks"]},
+    "ballast_tank_oldest_inspection": {"area": "Tank Inspection", "risk": "HIGH", "kind": "date", "aliases": ["oldest inspection report for all ballast", "ballast tank inspection", "ballast tanks"]},
+    "void_space_oldest_inspection": {"area": "Tank Inspection", "risk": "HIGH", "kind": "date", "aliases": ["oldest inspection report for all void", "void space inspection", "void spaces"]},
+    "tank_inspection_frequency": {"area": "Tank Inspection", "risk": "MEDIUM", "kind": "number", "aliases": ["required frequency of inspection for cargo tanks", "required frequency", "Frequency of Inspections"]},
+    "msmp": {"area": "Mooring", "risk": "HIGH", "kind": "yesno", "aliases": ["Mooring System Management Plan", "MSMP"]},
+    "lmp": {"area": "Mooring", "risk": "HIGH", "kind": "yesno", "aliases": ["Line Management Plan", "LMP"]},
+    "sdmbl": {"area": "Mooring", "risk": "MEDIUM", "kind": "number", "aliases": ["Ship design MBL", "SDMBL", "design MBL"]},
+    "brake_testing_equipment": {"area": "Mooring", "risk": "HIGH", "kind": "yesno", "aliases": ["brake testing equipment", "brake testing equipment on board"]},
+    "brake_test_date": {"area": "Mooring", "risk": "HIGH", "kind": "date", "aliases": ["last brake", "brake holding capacity test", "BHC test", "brake test"]},
+    "split_drum": {"area": "Mooring", "risk": "MEDIUM", "kind": "yesno", "aliases": ["split drum", "split drums"]},
+    "rope_end_for_end": {"area": "Mooring", "risk": "MEDIUM", "kind": "date", "aliases": ["end-for-end", "end for end", "rope rotation", "mooring rope end"]},
+    "mooring_ropes": {"area": "Mooring", "risk": "MEDIUM", "kind": "semantic_text", "aliases": ["Mooring ropes", "mooring lines", "tails", "Line Management"]},
+    "manifold_diagram": {"area": "Diagrams", "risk": "MEDIUM", "kind": "presence", "aliases": ["Manifold arrangement diagram", "manifold diagram", "manifold arrangement"]},
+    "mooring_diagram": {"area": "Diagrams", "risk": "MEDIUM", "kind": "presence", "aliases": ["mooring winch layout", "mooring arrangement diagram", "fairlead", "chock", "bitt diagram"]},
+    "crane_test_date": {"area": "Lifting Gear", "risk": "HIGH", "kind": "date", "aliases": ["last 5yr test", "crane", "lifting gear", "annual thorough examination", "five yearly test"]},
+    "generator_count": {"area": "Machinery", "risk": "MEDIUM", "kind": "number", "aliases": ["power generators", "generator details", "number of generators", "auxiliary generators"]},
+}
 
-def read_pdf(name: str, data: bytes) -> TextDoc:
-    if fitz is None:
-        raise RuntimeError("PyMuPDF is not installed. Install pymupdf.")
-    pages: List[str] = []
-    with fitz.open(stream=data, filetype="pdf") as doc:
-        for i, page in enumerate(doc):
-            text = page.get_text("text") or ""
-            pages.append(f"--- Page {i + 1} ---\n{text}")
-    return TextDoc(name=name, kind="pdf", full_text="\n".join(pages), pages=pages)
+# Targeted objective checks based on common observation themes. These are ship-facing.
+TARGETED_CHECKS = [
+    ("Mooring", "Brake test date / BHC / rendering load", ["brake", "brake holding", "BHC", "rendering load"], "Confirm latest brake test certificate/date, BHC and rendering load match HVPQ/Q88/records."),
+    ("Mooring", "Mooring ropes / tails / end-for-end / retirement", ["rope", "tail", "end-for-end", "end for end", "retirement", "discard", "LMP"], "Confirm ropes/tails particulars, certificate dates, end-for-end and retirement dates match LMP and HVPQ."),
+    ("Tank Inspection", "Cargo / ballast / void inspection sequence", ["cargo tank", "ballast", "void", "coating", "inspection"], "Confirm oldest inspection dates and annual frequency against inspection records."),
+    ("Class / Certificates", "Class status and survey dates", ["class", "dry dock", "IWS", "special survey", "annual survey", "intermediate"], "Verify HVPQ survey dates and COC/MOC/dispensation against latest Class Status."),
+    ("Certificates", "Certificate issue/expiry/endorsement dates", ["certificate", "expiry", "expires", "endorsement", "SMC", "ISSC", "IOPP", "Loadline", "Safety Equipment"], "Verify certificate dates against certificate copies/Class Status/Q88."),
+    ("PSC", "Last PSC date/port/MOU/deficiencies/detention", ["PSC", "Port State", "deficiencies", "detained", "MOU"], "Verify last three PSC entries match PIQ, HVPQ and company PSC records."),
+    ("Incidents", "Incident declaration status", ["incident", "injury", "blackout", "failure", "pollution", "grounding", "mooring rope parting"], "Confirm whether any incident is declared in HVPQ/PIQ; if none, ship must positively confirm nil incidents."),
+    ("Pollution / Cargo", "Overboard blanks / sea chest / pressure tests", ["overboard", "sea chest", "scupper", "cargo piping", "bunker piping", "pressure test"], "Verify arrangement and latest pressure test records match HVPQ."),
+    ("Firefighting", "Foam / fixed systems / rescue boat", ["foam", "fixed firefighting", "rescue boat", "lifeboat", "sample locker"], "Verify fixed systems and foam test date against certificates/onboard arrangements."),
+    ("Cargo / IGS", "IGS / venting / heating / cargo pumps", ["IGS", "inert", "vent", "heating", "cargo pump", "vapour", "COW"], "Verify cargo system declarations against manuals/diagrams/vessel arrangement."),
+    ("Diagrams", "Mooring / manifold / fairlead / chock / bitt diagrams", ["diagram", "manifold", "fairlead", "chock", "bitt", "SPM"], "Confirm diagrams are attached/current and match physical arrangement."),
+    ("Lifting Gear", "Crane annual / five-year test", ["crane", "lifting", "SWL", "5yr", "five-year", "annual"], "Verify crane/lifting gear certificate dates and SWL match HVPQ/Q88."),
+]
 
-
-def read_excel_as_text(name: str, data: bytes) -> TextDoc:
-    xls = pd.ExcelFile(io.BytesIO(data))
-    parts = []
-    for sheet in xls.sheet_names:
-        try:
-            df = pd.read_excel(xls, sheet_name=sheet, dtype=str).fillna("")
-            parts.append(f"--- Sheet: {sheet} ---")
-            parts.append(df.to_csv(index=False))
-        except Exception as exc:
-            parts.append(f"--- Sheet: {sheet} could not be read: {exc} ---")
-    return TextDoc(name=name, kind="excel", full_text="\n".join(parts), pages=parts)
-
-
-def read_csv_as_text(name: str, data: bytes) -> TextDoc:
-    df = pd.read_csv(io.BytesIO(data), dtype=str).fillna("")
-    return TextDoc(name=name, kind="csv", full_text=df.to_csv(index=False), pages=[])
-
-
-def read_docx_as_text(name: str, data: bytes) -> TextDoc:
-    if Document is None:
-        raise RuntimeError("python-docx is not installed. Install python-docx.")
-    doc = Document(io.BytesIO(data))
-    text = "\n".join(p.text for p in doc.paragraphs)
-    for table in doc.tables:
-        for row in table.rows:
-            text += "\n" + " | ".join(cell.text for cell in row.cells)
-    return TextDoc(name=name, kind="docx", full_text=text, pages=[])
-
+# Known semantic equivalences that should not be treated as mismatches.
+EQUIVALENCE_GROUPS = [
+    {"product carrier", "products tanker", "product tanker", "products/chemical tanker", "oil/product tanker", "chemical/products tanker"},
+    {"no", "not applicable", "na", "n/a", "not fitted", "none"},
+    {"yes", "fitted", "provided", "available"},
+    {"nippon kaiji kyokai", "classnk", "class nk", "nk"},
+    {"co2", "carbon dioxide"},
+]
 
 # -----------------------------
-# Parsing helpers
+# Text / extraction utilities
 # -----------------------------
 
-def normalize_text(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
+def normalize_text(s: Any) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\x00", " ").replace("\u00a0", " ")
+    s = re.sub(r"[\t\r]+", " ", s)
+    s = re.sub(r" +", " ", s)
+    return s.strip()
 
 
-def lower(s: str) -> str:
-    return normalize_text(s).lower()
+def clean_for_compare(s: Any) -> str:
+    s = normalize_text(s).lower()
+    s = re.sub(r"[^a-z0-9./+\- ]+", " ", s)
+    s = re.sub(r"\b(lr2|mr|aframax|suezmax)\b", " ", s)  # extraction noise / class descriptions not material for vessel name
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def canonicalize_vessel_name(name: str) -> str:
-    """Clean extracted ship names without being over-strict.
-    HVPQ/Q88/Class extracts often add IMO, vessel type (LR2/MR/VLCC) or headings.
-    We keep only meaningful name tokens for loose matching.
-    """
-    n = normalize_text(name).upper()
-    n = re.sub(r"\b(?:IMO|LR\/IMO|IMO\/LR|NUMBER|NO\.?|ID)\b[:\s-]*\d*", " ", n)
-    n = re.sub(r"\b\d{7}\b", " ", n)
-    n = re.sub(r"\b(?:HVPQ|PIQ|Q88|VPQ|VESSEL|PARTICULARS|QUESTIONNAIRE|FOR|REPORT)\b", " ", n)
-    # Size/type tokens sometimes get attached to Q88/HVPQ names. They should not create a mismatch.
-    n = re.sub(r"\b(?:LR1|LR2|MR|VLCC|ULCC|AFRAMAX|SUEZMAX|PANAMAX|HANDY|PRODUCT|CHEMICAL|TANKER|CARRIER|OIL)\b", " ", n)
-    n = re.sub(r"[^A-Z0-9 ]+", " ", n)
-    return normalize_text(n)
+def token_sort(s: Any) -> str:
+    return " ".join(sorted(clean_for_compare(s).split()))
 
 
-def vessel_names_materially_different(a: str, b: str) -> tuple[bool, int, str]:
-    ca, cb = canonicalize_vessel_name(a), canonicalize_vessel_name(b)
-    if not ca or not cb:
-        return False, 0, f"Could not clean one or both names: '{a}' / '{b}'."
-    set_a = {t for t in ca.split() if len(t) > 2}
-    set_b = {t for t in cb.split() if len(t) > 2}
-    common = set_a & set_b
-    score = max(fuzz.token_sort_ratio(ca, cb), fuzz.token_set_ratio(ca, cb))
-    # Loose acceptance: if at least the key vessel-name tokens overlap, don't flag.
-    if score >= 72 or (len(common) >= 2 and len(common) >= min(len(set_a), len(set_b)) - 1):
-        return False, score, f"Loose name match accepted: '{ca}' vs '{cb}'."
-    return True, score, f"Material vessel-name discrepancy: '{ca}' vs '{cb}'."
+def fuzzy_ratio(a: Any, b: Any) -> float:
+    aa, bb = clean_for_compare(a), clean_for_compare(b)
+    if not aa or not bb:
+        return 0.0
+    return SequenceMatcher(None, aa, bb).ratio()
 
 
-def clean_vessel_display_name(name: str) -> str:
-    c = canonicalize_vessel_name(name)
-    # Preserve readable title case but remove extra type suffixes/noise.
-    return c.title() if c else normalize_text(name)
-
-
-def semantic_normalize_value(value: str) -> str:
-    """Normalize operational wording so broad equivalence does not become a false mismatch."""
-    v = lower(value)
-    replacements = {
-        "products": "product",
-        "product carrier": "product tanker",
-        "chemical tanker": "chemical",
-        "products/chemical tanker": "product chemical tanker",
-        "products chemical tanker": "product chemical tanker",
-        "not applicable": "na",
-        "n/a": "na",
-        "nil": "no",
-        "none": "no",
-    }
-    for k, r in replacements.items():
-        v = v.replace(k, r)
-    v = re.sub(r"[^a-z0-9 ]+", " ", v)
-    return normalize_text(v)
-
-
-def broadly_similar(a: str, b: str, threshold: int = 70) -> bool:
-    aa, bb = semantic_normalize_value(a), semantic_normalize_value(b)
+def similar_enough(a: Any, b: Any, kind: str = "text", loose: bool = False) -> bool:
+    aa, bb = clean_for_compare(a), clean_for_compare(b)
     if not aa or not bb:
         return False
-    if aa in bb or bb in aa:
+    if aa == bb:
         return True
-    return max(fuzz.token_set_ratio(aa, bb), fuzz.partial_ratio(aa, bb)) >= threshold
+    # Equivalence groups
+    for group in EQUIVALENCE_GROUPS:
+        if any(g in aa for g in group) and any(g in bb for g in group):
+            return True
+    if kind == "semantic_text" or loose:
+        # tolerate product carrier vs products/chemical tanker and naming suffixes
+        if aa in bb or bb in aa:
+            return True
+        return max(fuzzy_ratio(aa, bb), fuzzy_ratio(token_sort(aa), token_sort(bb))) >= (0.72 if loose else 0.82)
+    return max(fuzzy_ratio(aa, bb), fuzzy_ratio(token_sort(aa), token_sort(bb))) >= (0.90 if not loose else 0.75)
 
 
-def vessel_type_broadly_compatible(a: str, b: str) -> bool:
-    aa, bb = semantic_normalize_value(a), semantic_normalize_value(b)
-    if not aa or not bb:
-        return False
-    # Product Carrier / Product Tanker / Products-Chemical Tanker are broadly compatible for this pre-check.
-    if ("product" in aa and "product" in bb) and any(x in aa + " " + bb for x in ["tanker", "carrier", "chemical"]):
-        return True
-    if ("chemical" in aa and "chemical" in bb):
-        return True
-    if ("oil" in aa and "oil" in bb and ("tanker" in aa or "tanker" in bb)):
-        return True
-    return broadly_similar(aa, bb, threshold=62)
-
-
-def action_required_df(df: pd.DataFrame, show_pass: bool = False) -> pd.DataFrame:
-    """Return only useful ship-check items unless the user explicitly asks to see PASS/INFO."""
-    if df.empty or show_pass:
-        return df
-    return df[~df["risk"].isin(["PASS", "INFO", "LOW"])].reset_index(drop=True)
-
-
-def parse_date_safe(s: str) -> Optional[date]:
+def parse_date(value: Any) -> Optional[date]:
+    s = normalize_text(value)
     if not s:
         return None
-    raw = s.strip()
-    # Avoid converting question numbers / clause references (e.g. 2.2.1002, Q1.11) into false dates.
-    if re.search(r"(?:^|\b)[Qq]\s*\d+(?:\.\d+)+", raw):
+    # protect question numbers / decimals from being parsed as dates
+    if re.fullmatch(r"\d+(?:\.\d+){1,4}", s):
         return None
-    if re.fullmatch(r"\d+(?:\.\d+){1,3}", raw):
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
         return None
-    raw = raw.replace("Sept", "Sep")
+    s = re.sub(r"\b(UTC|LT|hrs?|hours?)\b", " ", s, flags=re.I)
+    # ISO inside XML/PDF
+    m = re.search(r"\b(20\d{2}|19\d{2})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            pass
+    # Common OCR text dates
+    m = re.search(r"\b(\d{1,2})\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(20\d{2}|19\d{2})\b", s, flags=re.I)
+    if m:
+        try:
+            return dateparser.parse(m.group(0), dayfirst=True).date()
+        except Exception:
+            return None
+    m = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})\b", s)
+    if m:
+        try:
+            return dateparser.parse(m.group(0), dayfirst=True).date()
+        except Exception:
+            return None
     try:
-        dt = dateparser.parse(raw, dayfirst=True, fuzzy=True)
-        if dt and 1990 <= dt.year <= 2100:
+        dt = dateparser.parse(s, fuzzy=True, dayfirst=True)
+        if dt and 1990 <= dt.year <= 2050:
             return dt.date()
     except Exception:
         return None
     return None
 
 
-def fmt_date(d: Optional[date]) -> str:
-    return d.strftime("%d %b %Y") if d else ""
+def parse_number(value: Any) -> Optional[float]:
+    s = normalize_text(value)
+    if not s:
+        return None
+    # avoid question IDs
+    if re.fullmatch(r"\d+(?:\.\d+){2,5}", s):
+        return None
+    m = re.search(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except Exception:
+        return None
 
 
-def dates_equal(a: Optional[date], b: Optional[date]) -> bool:
-    return bool(a and b and a == b)
+def parse_yesno(value: Any) -> Optional[bool]:
+    s = clean_for_compare(value)
+    if not s:
+        return None
+    # avoid matching 'not detained? no' incorrectly is okay as value only ideally.
+    if re.search(r"\b(yes|true|1)\b", s):
+        return True
+    if re.search(r"\b(no|false|0|not applicable|n/a|na|none|not fitted)\b", s):
+        return False
+    return None
 
 
-def month_gap_days(start: date, end: date, max_months: float) -> Tuple[bool, int, float]:
-    days = (end - start).days
-    months = days / 30.4375
-    return months <= max_months, days, months
+def extract_pdf_text(file_bytes: bytes, filename: str = "") -> str:
+    text = ""
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            pages = []
+            for i, p in enumerate(doc):
+                pages.append(f"\n--- PAGE {i+1} ---\n" + p.get_text("text"))
+            text = "\n".join(pages)
+        except Exception:
+            text = ""
+    if not text and PdfReader is not None:
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join(f"\n--- PAGE {i+1} ---\n" + (p.extract_text() or "") for i, p in enumerate(reader.pages))
+        except Exception:
+            text = ""
+    return normalize_text_keep_lines(text)
 
 
-def find_line_after_keywords(text: str, keywords: Iterable[str], window_chars: int = 240) -> str:
-    """Find a block near any keyword.
-    Uses exact normalized match first, then fuzzy line matching for class/Q88 formats where labels vary.
+def normalize_text_keep_lines(s: str) -> str:
+    s = s.replace("\r", "\n").replace("\u00a0", " ")
+    s = unicodedata.normalize("NFKC", s)
+    lines = []
+    for line in s.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def read_any_upload(uploaded, kind: str) -> DocPack:
+    if uploaded is None:
+        return DocPack(name="", kind=kind)
+    b = uploaded.getvalue()
+    name = uploaded.name
+    lower = name.lower()
+    if lower.endswith(".pdf"):
+        return DocPack(name=name, kind=kind, text=extract_pdf_text(b, name))
+    if lower.endswith(".xml"):
+        fields, meta = parse_hvpq_xml(b)
+        return DocPack(name=name, kind=kind, text=xml_to_searchable_text(fields, meta), fields=fields, meta=meta)
+    if lower.endswith(".txt"):
+        return DocPack(name=name, kind=kind, text=normalize_text_keep_lines(b.decode("utf-8", errors="ignore")))
+    if lower.endswith((".xlsx", ".xls", ".csv")):
+        text = read_tabular_as_text(b, lower)
+        return DocPack(name=name, kind=kind, text=text)
+    return DocPack(name=name, kind=kind, text="")
+
+
+def read_tabular_as_text(b: bytes, lower: str) -> str:
+    try:
+        if lower.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(b), dtype=str)
+        else:
+            df = pd.read_excel(io.BytesIO(b), dtype=str)
+        df = df.fillna("")
+        rows = [" | ".join(map(str, df.columns.tolist()))]
+        for _, row in df.head(2000).iterrows():
+            rows.append(" | ".join(normalize_text(x) for x in row.tolist()))
+        return "\n".join(rows)
+    except Exception:
+        return ""
+
+
+def parse_hvpq_xml(b: bytes, ctrl_map: Optional[pd.DataFrame] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Parse OCIMF XPQ response XML. Without control mapping this is intentionally limited.
+    The response XML normally contains ctrl GUIDs and response values, but not the human readable question labels.
+    If a ctrl->qid/label map is supplied, the responses become directly usable.
     """
+    fields: Dict[str, Any] = {}
+    meta: Dict[str, Any] = {"xml_warning": "Response XML parsed. Control IDs need template mapping for question-level checks."}
+    try:
+        root = ET.fromstring(b)
+    except Exception as e:
+        return {}, {"error": f"XML parse failed: {e}"}
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0].strip("{")
+    def q(name): return f"{{{ns}}}{name}" if ns else name
+    header = root.find(q("Header"))
+    if header is not None:
+        vessel = header.find(q("Vessel"))
+        templ = header.find(q("Template"))
+        doc = header.find(q("Document"))
+        if vessel is not None:
+            meta["vessel_name"] = vessel.attrib.get("name", "")
+            meta["imo_number"] = vessel.attrib.get("id", "")
+            fields["vessel_name"] = meta["vessel_name"]
+            fields["imo_number"] = meta["imo_number"]
+        if templ is not None:
+            meta["template_code"] = templ.attrib.get("code", "")
+            meta["template_variant"] = templ.attrib.get("variant", "")
+        if doc is not None:
+            meta["document_name"] = doc.attrib.get("name", "")
+            meta["exported"] = doc.attrib.get("exported", "")
+            fields["document_date"] = meta["exported"]
+    responses = []
+    for resp in root.findall(q("Response")):
+        ctrl = resp.attrib.get("ctrl", "")
+        typ = resp.attrib.get("type", "")
+        val = response_value(resp, ns)
+        responses.append({"ctrl": ctrl, "type": typ, "value": val})
+    meta["response_count"] = len(responses)
+    meta["response_types"] = dict(pd.Series([r["type"] for r in responses]).value_counts()) if responses else {}
+    fields["_raw_responses"] = responses
+    if ctrl_map is not None and not ctrl_map.empty:
+        mapped = apply_ctrl_map(responses, ctrl_map)
+        fields.update(mapped)
+        meta["xml_warning"] = "Response XML parsed with supplied ctrl mapping."
+    return fields, meta
+
+
+def response_value(elem: ET.Element, ns: str) -> str:
+    def q(name): return f"{{{ns}}}{name}" if ns else name
+    for tag in ["ResponseString", "ResponseDate", "ResponseBoolean", "ResponseInt", "ResponseDecimal", "ResponseMemo"]:
+        x = elem.find(q(tag))
+        if x is not None and x.text is not None:
+            if tag == "ResponseBoolean":
+                return "Yes" if x.text.strip() in {"1", "true", "True"} else "No"
+            return normalize_text(x.text)
+    selected = elem.find(q("SelectedItems"))
+    if selected is not None:
+        vals = []
+        for item in selected.findall(q("SelectedItem")):
+            rs = item.find(q("ResponseString"))
+            if rs is not None and rs.text:
+                vals.append(normalize_text(rs.text))
+        if vals:
+            return ", ".join(vals)
+    # CellResponse tables
+    cells = []
+    for c in elem.iter():
+        if c.tag.split("}")[-1] == "CellResponse":
+            val = response_value(c, ns)
+            if val:
+                cells.append(val)
+    return " | ".join(cells[:50])
+
+
+def apply_ctrl_map(responses: List[Dict[str, str]], ctrl_map: pd.DataFrame) -> Dict[str, Any]:
+    cols = {clean_for_compare(c): c for c in ctrl_map.columns}
+    ctrl_col = cols.get("ctrl") or cols.get("control") or cols.get("control id") or cols.get("controlid")
+    qid_col = cols.get("qid") or cols.get("question id") or cols.get("question") or cols.get("ref")
+    label_col = cols.get("label") or cols.get("question label") or cols.get("text") or cols.get("question text")
+    if not ctrl_col:
+        return {}
+    map_by_ctrl = {}
+    for _, r in ctrl_map.iterrows():
+        ctrl = normalize_text(r.get(ctrl_col, ""))
+        if not ctrl:
+            continue
+        qid = normalize_text(r.get(qid_col, "")) if qid_col else ""
+        label = normalize_text(r.get(label_col, "")) if label_col else ""
+        key = qid or label or ctrl
+        map_by_ctrl[ctrl.upper()] = key
+    out = {}
+    for r in responses:
+        key = map_by_ctrl.get(r["ctrl"].upper())
+        if key:
+            out[key] = r["value"]
+    return out
+
+
+def xml_to_searchable_text(fields: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    lines = []
+    for k, v in meta.items():
+        lines.append(f"{k}: {v}")
+    for k, v in fields.items():
+        if k == "_raw_responses":
+            continue
+        lines.append(f"{k}: {v}")
+    return "\n".join(lines)
+
+# -----------------------------
+# HVPQ/PIQ parsing helpers
+# -----------------------------
+
+def build_question_blocks(text: str) -> Dict[str, str]:
+    """Build approximate blocks keyed by HVPQ/PIQ question number from PDF text."""
+    blocks: Dict[str, List[str]] = {}
+    current = None
+    for line in text.splitlines():
+        # HVPQ: 1.1.1 Date... ; PIQ sometimes: 2.2.1001.
+        m = re.match(r"^((?:\d+\.){1,4}\d+)\.?\s+(.*)", line)
+        if m:
+            qid = m.group(1).rstrip(".")
+            current = qid
+            blocks.setdefault(qid, []).append(m.group(2).strip())
+        elif current:
+            blocks[current].append(line.strip())
+    return {k: "\n".join(v).strip() for k, v in blocks.items()}
+
+
+def extract_near_alias(text: str, aliases: Iterable[str], kind: str = "text", window_lines: int = 4) -> str:
     if not text:
         return ""
-    t = normalize_text(text)
-    tl = t.lower()
-    for kw in keywords:
-        idx = tl.find(normalize_text(kw).lower())
-        if idx >= 0:
-            return t[idx : idx + window_chars]
-
-    # Fuzzy fallback: scan source lines. This handles labels like
-    # 'Last Annual Survey Date', 'Annual Survey carried out', etc.
-    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
-    lowered_labels = [lower(k) for k in keywords]
+    lines = text.splitlines()
+    best = (0.0, "")
     for i, line in enumerate(lines):
-        ll = lower(line)
-        score = max((fuzz.token_set_ratio(ll, kw) for kw in lowered_labels), default=0)
-        if score >= 84:
-            block = " ".join(lines[i : min(i + 8, len(lines))])
-            return block[:window_chars]
+        cl = clean_for_compare(line)
+        for alias in aliases:
+            ca = clean_for_compare(alias)
+            if not ca:
+                continue
+            score = 0.0
+            if ca in cl:
+                score = 1.0
+            else:
+                score = fuzzy_ratio(ca, cl[:max(len(ca)+40, 60)])
+            if score >= 0.72:
+                chunk = "\n".join(lines[i:i+window_lines])
+                value = strip_label_value(chunk, alias, kind)
+                if value and score > best[0]:
+                    best = (score, value)
+    return best[1]
+
+
+def strip_label_value(chunk: str, alias: str, kind: str) -> str:
+    # try same-line extraction first
+    lines = chunk.splitlines()
+    for idx, line in enumerate(lines):
+        if clean_for_compare(alias) in clean_for_compare(line) or fuzzy_ratio(alias, line) > 0.72:
+            # remove leading question number and alias-like text
+            candidate = line
+            candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s*", "", candidate)
+            # If alias appears literally, keep after it
+            m = re.search(re.escape(alias), candidate, flags=re.I)
+            if m:
+                candidate = candidate[m.end():]
+            else:
+                # split on ? if present
+                if "?" in candidate:
+                    candidate = candidate.split("?")[-1]
+            candidate = candidate.strip(" :-?\t")
+            if usable_value(candidate, kind):
+                return candidate
+            # else next line(s)
+            for nxt in lines[idx+1:idx+4]:
+                nxt2 = nxt.strip(" :-?\t")
+                if usable_value(nxt2, kind):
+                    return nxt2
+    # fallback by kind in whole chunk
+    if kind == "date":
+        d = parse_date(chunk)
+        return d.isoformat() if d else ""
+    if kind == "number":
+        n = parse_number(chunk)
+        return str(n) if n is not None else ""
+    if kind == "yesno":
+        y = parse_yesno(chunk)
+        return "Yes" if y is True else "No" if y is False else ""
     return ""
 
 
-def find_first_date_near(text: str, keywords: Iterable[str], window_chars: int = 280) -> Tuple[str, Optional[date]]:
-    snippet = find_line_after_keywords(text, keywords, window_chars=window_chars)
-    if not snippet:
-        return "", None
-    m = DATE_RE.search(snippet)
-    return snippet, parse_date_safe(m.group(0)) if m else None
-
-
-def find_yes_no_near(text: str, keywords: Iterable[str], window_chars: int = 280) -> Tuple[str, str]:
-    snippet = find_line_after_keywords(text, keywords, window_chars=window_chars)
-    if not snippet:
-        return "", ""
-    # Prefer explicit Yes/No following the keyword block.
-    m = re.search(r"\b(Yes|No|Not applicable|NA|N/A)\b", snippet, flags=re.IGNORECASE)
-    return snippet, m.group(1).title() if m else ""
-
-
-def extract_value_after_label(text: str, labels: Iterable[str], max_chars: int = 120) -> Tuple[str, str]:
-    """Extract a value after a label, with fuzzy fallback for slightly different document wording."""
-    t = normalize_text(text)
-    tl = t.lower()
-    for label in labels:
-        idx = tl.find(normalize_text(label).lower())
-        if idx >= 0:
-            snippet = t[idx : idx + max_chars]
-            tail = t[idx + len(label) : idx + max_chars]
-            tail = re.split(r"\s\d+\.\d+(?:\.\d+)?\s", tail)[0]
-            return snippet, normalize_text(tail)
-
-    # Fuzzy line fallback: if a line strongly resembles the label, take the text
-    # after the label-like part; if empty, take the next line.
-    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
-    lab_norm = [lower(x) for x in labels]
-    for i, line in enumerate(lines):
-        ll = lower(line)
-        score = max((fuzz.token_set_ratio(ll, lab) for lab in lab_norm), default=0)
-        if score >= 88:
-            value = ""
-            # Try splitting by common delimiters first.
-            if ":" in line:
-                value = line.split(":", 1)[1]
-            elif len(line.split()) > 3:
-                # Remove the longest matching label words from the front only loosely.
-                value = line
-                for lab in labels:
-                    value = re.sub(re.escape(lab), "", value, flags=re.I).strip()
-            if not value and i + 1 < len(lines):
-                value = lines[i + 1]
-            snippet = " ".join(lines[i : min(i + 4, len(lines))])[:max_chars]
-            return snippet, normalize_text(value)[:max_chars]
-    return "", ""
-
-
-def fuzzy_contains(text: str, phrase: str, threshold: int = 88) -> bool:
-    txt = lower(text)
-    ph = lower(phrase)
-    if ph in txt:
+def usable_value(candidate: str, kind: str) -> bool:
+    c = normalize_text(candidate)
+    if not c or len(c) > 220:
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+){1,5}\.?", c):
+        return False
+    if kind == "date":
+        return parse_date(c) is not None
+    if kind == "number":
+        return parse_number(c) is not None
+    if kind == "yesno":
+        return parse_yesno(c) is not None
+    if kind == "presence":
         return True
-    # Only fuzzy on short phrase chunks to avoid heavy computation.
-    for chunk in re.split(r"[\n\.;:]", text):
-        if fuzz.partial_ratio(lower(chunk), ph) >= threshold:
-            return True
-    return False
+    # reject if still looks like a label only
+    if c.endswith("?"):
+        return False
+    return True
 
 
-# -----------------------------
-# Document-specific extraction
-# -----------------------------
-
-def extract_hvpq_fields(doc: Optional[TextDoc]) -> Dict[str, Any]:
-    if doc is None:
-        return {}
-    text = doc.full_text
-    fields: Dict[str, Any] = {"doc_name": doc.name, "_full_text": text}
-
-    # Identity - use line-based document-specific patterns before generic label extraction.
-    fields["vessel_name"] = ""
-    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
-    for line in lines[:80]:
-        if "Vessel Particulars Questionnaire for" in line:
-            raw = re.sub(r".*Vessel Particulars Questionnaire for", "", line, flags=re.I)
-            fields["vessel_name"] = clean_vessel_display_name(raw)
-            break
-    if not fields["vessel_name"]:
-        ntext = normalize_text(text)
-        m_name = re.search(r"Name of ship\s+(.+?)\s+\d+\s+(?:LR/IMO|IMO)", ntext, flags=re.I)
-        if m_name:
-            fields["vessel_name"] = clean_vessel_display_name(m_name.group(1))
-        else:
-            _, raw_name = extract_value_after_label(text, ["Name of ship"], 90)
-            fields["vessel_name"] = clean_vessel_display_name(raw_name)
-    m = re.search(r"(?:IMO/LR Number|LR/IMO number|IMO:)\s*(\d{7})", text, flags=re.I)
-    fields["imo"] = m.group(1) if m else ""
-    _, doc_date = find_first_date_near(text, ["Date this HVPQ document completed", "Harmonised Vessel Particulars Questionnaire"])
-    fields["doc_date"] = doc_date
-
-    # Vessel type - extract answers, not the whole question text.
-    ntext = normalize_text(text)
-    fields["ship_type"] = ""
-    fields["ship_type_other"] = ""
-    m_ship_type = re.search(r"1\.1\.8\s+What is the type of ship.*?\?\s+([^?]+?)\s+1\.1\.9", ntext, flags=re.I)
-    if m_ship_type:
-        fields["ship_type"] = normalize_text(m_ship_type.group(1))
-    m_ship_other = re.search(r"1\.1\.9\s+If other, then specify\s+(.+?)\s+1\.1\.10", ntext, flags=re.I)
-    if m_ship_other:
-        fields["ship_type_other"] = normalize_text(m_ship_other.group(1))
-    if not fields["ship_type"]:
-        _, fields["ship_type"] = extract_value_after_label(text, ["What is the type of ship", "Type of ship"], 160)
-    if not fields["ship_type_other"]:
-        _, fields["ship_type_other"] = extract_value_after_label(text, ["If other, then specify"], 120)
-
-    # Environmental
-    for key, labels in {
-        "cii_rating": ["provide CII rating", "CII rating"],
-        "cii_verified_by": ["Is the CII rating verified by", "CII rating verified"],
-        "eexi_rating": ["provide EEXI rating", "EEXI rating"],
-        "eedi_rating": ["provide EEDI rating", "EEDI rating"],
-        "eiv_rating": ["provide EIV rating", "EIV rating"],
-    }.items():
-        _, val = extract_value_after_label(text, labels, 140)
-        fields[key] = val
-
-    # Class/survey fields
-    for key, labels in SURVEY_FIELDS.items():
-        snippet, d = find_first_date_near(text, labels)
-        fields[key] = d
-        fields[key + "_snippet"] = snippet
-        if key in ["conditions_of_class", "memoranda_of_class", "flag_dispensation"]:
-            snippet2, yn = find_yes_no_near(text, labels)
-            fields[key + "_yn"] = yn
-            fields[key + "_snippet"] = snippet2 or snippet
-
-    # PSC
-    snippet, d = find_first_date_near(text, ["Date of last Port State Control Inspection", "last Port State Control Inspection"])
-    fields["last_psc_date"] = d
-    fields["last_psc_snippet"] = snippet
-    _, fields["last_psc_port"] = extract_value_after_label(text, ["Port of last Port State Control Inspection"], 120)
-    snippet, yn = find_yes_no_near(text, ["detained during the last 36 months"])
-    fields["detained_36m"] = yn
-    fields["detained_36m_snippet"] = snippet
-
-    # Incidents
-    snippet, yn = find_yes_no_near(text, ["pollution, grounding, collision or allision incident during the past 12 months"])
-    fields["pollution_grounding_collision_allision_12m"] = yn
-    fields["pollution_grounding_collision_allision_snippet"] = snippet
-    snippet, yn = find_yes_no_near(text, ["any other incidents during the past 12 months"])
-    fields["other_incidents_12m"] = yn
-    fields["other_incidents_snippet"] = snippet
-    fields["incident_detail_text"] = find_line_after_keywords(text, ["If yes, provide details (see table)", "Type of Incident"], 500)
-
-    # Certificates: generic extraction of lines around certificate names
-    fields["certificates"] = extract_certificate_dates_generic(text)
-
-    # Targeted high-observation areas: generic snippets/dates from HVPQ.
-    targeted_keywords = {
-        # Use section-specific labels first to avoid grabbing publication titles such as 'OCIMF Mooring Equipment Guidelines'.
-        "mooring_block": ["Mooring Winches and Brake Testing", "Details of winches and brake testing", "10.1.4", "Provide details for Mooring Ropes", "10.1.7"],
-        "tank_block": ["7.1.1 Cargo tank coating", "7.1.3 Ballast tank coating", "cargo tank coating", "ballast tank coating", "Frequency of Inspections"],
-        "piping_pressure_block": ["6.1.13 Cargo piping pressure tests", "6.1.14 Bunker piping pressure tests", "hydrostatically pressure test"],
-        "pollution_block": ["6.1.10", "overboard discharges", "sea valves", "seachest", "scupper", "spill containment"],
-        "fire_foam_block": ["5.3.1 Fixed foam firefighting", "fixed foam", "Test Analysis Certificate", "firefighting system"],
-        "lifting_block": ["10.9.1", "Provide details of derricks", "last annual test last 5Yr Test", "lifting equipment"],
-        "diagram_block": ["10.2.1", "10.7.1", "10.8.1", "mooring arrangement diagram", "Manifold Arrangement Diagram"],
-    }
-    for k, kws in targeted_keywords.items():
-        fields[k] = find_line_after_keywords(text, kws, 1800)
-        fields[k + "_dates"] = extract_dates_from_block(text, kws, max_dates=8, window_chars=1800)
-    return fields
-
-
-def extract_piq_fields(doc: Optional[TextDoc]) -> Dict[str, Any]:
-    if doc is None:
-        return {}
-    text = doc.full_text
-    fields: Dict[str, Any] = {"doc_name": doc.name, "_full_text": text}
-    # PIQ front page is usually: PIQ Report / VESSEL NAME / Vessel Name / Date / date.
-    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
-    fields["vessel_name"] = ""
-    for i, line in enumerate(lines[:12]):
-        if lower(line) == "piq report" and i + 1 < len(lines):
-            fields["vessel_name"] = clean_vessel_display_name(lines[i + 1])
-            break
-    if not fields["vessel_name"]:
-        _, raw_name = extract_value_after_label(text, ["Vessel Name"], 90)
-        fields["vessel_name"] = clean_vessel_display_name(raw_name)
-    snippet, fields["doc_date"] = find_first_date_near(text, ["Date"] )
-    fields["vessel_type"] = ""
-    for i, line in enumerate(lines[:80]):
-        if lower(line) == "vessel type":
-            for cand in lines[i+1:i+6]:
-                if re.fullmatch(r"\d+(?:\.\d+)*\.?", cand):
-                    continue
-                if lower(cand) == "vessel type":
-                    continue
-                fields["vessel_type"] = normalize_text(cand)
-                break
-            if fields["vessel_type"]:
-                break
-    if not fields["vessel_type"]:
-        _, fields["vessel_type"] = extract_value_after_label(text, ["Vessel Type"], 160)
-
-    # Superintendent visits - extract dates near the block.
-    fields["technical_superintendent_dates"] = extract_dates_from_block(
-        text,
-        ["Technical Superintendent inspection completed", "Technical Superintendent"],
-        max_dates=8,
-        window_chars=850,
-    )
-    fields["marine_superintendent_dates"] = extract_dates_from_block(
-        text,
-        ["Marine Superintendent inspection completed", "Marine Superintendent"],
-        max_dates=8,
-        window_chars=650,
-    )
-
-    # PSC table block
-    fields["psc_dates"] = extract_dates_from_block(text, ["last three Port State Control", "PSC inspection"], max_dates=6, window_chars=1000)
-    fields["psc_block"] = find_line_after_keywords(text, ["last three Port State Control", "PSC inspection"], 1200)
-
-    # Tank inspections
-    tank_label_map = {
-        "cargo_tank_oldest_inspection": "oldest inspection report for all cargo and slop tanks",
-        "ballast_tank_oldest_inspection": "oldest inspection report for all ballast tanks",
-        "void_space_oldest_inspection": "oldest inspection report for all void spaces",
-    }
-    for key, label in tank_label_map.items():
-        # PIQ PDF text order often places the answer date immediately before the printed question.
-        d = extract_last_date_before_label(text, label, lookback_chars=260)
-        snippet = find_line_after_keywords(text, [label], 320)
-        if not d:
-            snippet, d = find_first_date_near(text, [label])
-        fields[key] = d
-        fields[key + "_snippet"] = snippet
-
-    # MOC / retrofit
-    _, fields["structural_changes"] = find_yes_no_near(text, ["structural changes been made"])
-    snippet, yn = find_yes_no_near(text, ["equipment been retrofitted"])
-    fields["equipment_retrofitted"] = yn
-    fields["equipment_retrofitted_snippet"] = snippet
-    _, fields["equipment_replaced"] = find_yes_no_near(text, ["non like-for-like", "non-like-for-like"])
-    _, fields["equipment_decommissioned"] = find_yes_no_near(text, ["equipment been decommissioned"])
-
-    # Incident declarations from PIQ can vary. Gather blocks and yes/no around incident terms.
-    incident_keywords = [
-        "incident", "lost time", "injury", "pollution", "grounding", "collision", "allision",
-        "blackout", "machinery failure", "mooring", "rope parting", "fire", "explosion",
-    ]
-    fields["incident_blocks"] = collect_keyword_blocks(text, incident_keywords, max_blocks=20, window_chars=320)
-    fields["incident_yes_count"] = count_yes_near_blocks(fields["incident_blocks"])
-    fields["incident_no_count"] = count_no_near_blocks(fields["incident_blocks"])
-
-    # PIQ targeted snippets useful for ship verification checklists.
-    piq_targeted_keywords = {
-        "tank_inspection_block": ["required frequency of inspection for cargo tanks", "ballast tanks", "void spaces", "oldest inspection report"],
-        "moc_block": ["structural changes", "retrofitted", "equipment replaced", "decommissioned"],
-        "management_oversight_block": ["Technical Superintendent", "Marine Superintendent", "full inspection"],
-    }
-    for k, kws in piq_targeted_keywords.items():
-        fields[k] = find_line_after_keywords(text, kws, 1600)
-        fields[k + "_dates"] = extract_dates_from_block(text, kws, max_dates=10, window_chars=1600)
-    return fields
-
-
-def extract_reference_fields(doc: Optional[TextDoc], label: str) -> Dict[str, Any]:
-    """Generic extractor for Class Status / Q88 / certificate packs."""
-    if doc is None:
-        return {}
-    text = doc.full_text
-    fields: Dict[str, Any] = {"doc_name": doc.name, "label": label, "_full_text": text}
-    for key, labels in SURVEY_FIELDS.items():
-        snippet, d = find_first_date_near(text, labels, window_chars=360)
-        fields[key] = d
-        fields[key + "_snippet"] = snippet
-        if key in ["conditions_of_class", "memoranda_of_class", "flag_dispensation"]:
-            _, yn = find_yes_no_near(text, labels, window_chars=360)
-            fields[key + "_yn"] = yn
-    fields["certificates"] = extract_certificate_dates_generic(text)
-    fields["psc_dates"] = extract_dates_from_block(text, ["Port State Control", "PSC"], max_dates=10, window_chars=1600)
-    return fields
-
-
-def extract_dates_from_block(text: str, keywords: Iterable[str], max_dates: int = 10, window_chars: int = 900) -> List[date]:
-    block = find_line_after_keywords(text, keywords, window_chars=window_chars)
-    dates = []
-    for m in DATE_RE.finditer(block):
-        d = parse_date_safe(m.group(0))
-        if d and d not in dates:
-            dates.append(d)
-        if len(dates) >= max_dates:
-            break
-    return dates
-
-
-def extract_last_date_before_label(text: str, label: str, lookback_chars: int = 260) -> Optional[date]:
-    n = normalize_text(text)
-    idx = n.lower().find(label.lower())
-    if idx < 0:
-        return None
-    block = n[max(0, idx - lookback_chars):idx]
-    dates = []
-    for m in DATE_RE.finditer(block):
-        d = parse_date_safe(m.group(0))
-        if d:
-            dates.append(d)
-    return dates[-1] if dates else None
-
-
-def collect_keyword_blocks(text: str, keywords: Iterable[str], max_blocks: int = 20, window_chars: int = 260) -> List[str]:
-    blocks = []
-    tl = text.lower()
-    for kw in keywords:
-        for m in re.finditer(re.escape(kw.lower()), tl):
-            start = max(0, m.start() - 80)
-            end = min(len(text), m.end() + window_chars)
-            block = normalize_text(text[start:end])
-            if block and block not in blocks:
-                blocks.append(block)
-            if len(blocks) >= max_blocks:
-                return blocks
-    return blocks
-
-
-def count_yes_near_blocks(blocks: List[str]) -> int:
-    return sum(1 for b in blocks if re.search(r"\bYes\b", b, flags=re.I))
-
-
-def count_no_near_blocks(blocks: List[str]) -> int:
-    return sum(1 for b in blocks if re.search(r"\bNo\b", b, flags=re.I))
-
-
-def extract_certificate_dates_generic(text: str) -> Dict[str, Dict[str, Any]]:
-    results: Dict[str, Dict[str, Any]] = {}
-    norm = normalize_text(text)
-    nlow = norm.lower()
-    for cert in CERTIFICATE_NAMES:
-        idx = nlow.find(cert.lower())
-        if idx < 0:
+def extract_doc_fields(doc: DocPack, specs: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    fields = dict(doc.fields or {})
+    qblocks = build_question_blocks(doc.text)
+    doc.qmap = qblocks
+    # HVPQ / PIQ standard exact qid helpers first
+    # Save qblocks in text-like fields for debug but not displayed.
+    for key, spec in specs.items():
+        if key in fields and fields[key]:
             continue
-        snippet = norm[idx : idx + 420]
-        dates = []
-        for m in DATE_RE.finditer(snippet):
-            d = parse_date_safe(m.group(0))
-            if d and d not in dates:
-                dates.append(d)
-        results[cert] = {"snippet": snippet, "dates": dates}
-    return results
+        val = extract_near_alias(doc.text, spec.get("aliases", []), spec.get("kind", "text"))
+        if val:
+            fields[key] = val
+    # Specific smarter extractions
+    fields.update(extract_specifics(doc.text, doc.kind))
+    return fields
 
+
+def extract_specifics(text: str, kind: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    blocks = build_question_blocks(text)
+    # HVPQ known qids
+    qid_map = {
+        "vessel_name": ["1.1.2"], "imo_number": ["1.1.2"], "document_date": ["1.1.1"],
+        "vessel_type": ["1.1.8", "1.1.9", "2.1.4"], "class_society": ["1.5.1"],
+        "last_drydock": ["1.5.4"], "next_drydock_due": ["1.5.4"],
+        "last_iws": ["1.5.5"], "next_iws_due": ["1.5.5"],
+        "last_special_survey": ["1.5.6"], "next_special_survey_due": ["1.5.6"],
+        "last_annual_survey": ["1.5.11"], "last_intermediate_survey": ["1.5.12"],
+        "conditions_of_class": ["1.5.14"], "memoranda_of_class": ["1.5.16"], "flag_dispensation": ["1.5.18"],
+        "last_psc_date": ["1.9.8"], "last_psc_port": ["1.9.8"], "psc_detained": ["1.9.8"],
+        "incident_other": ["1.9.5"], "eedi_rating": ["1.2.1"], "eexi_rating": ["1.2.2"], "cii_rating": ["1.2.3"],
+        "foam_type": ["5.3.1"], "foam_test_date": ["5.3.1"], "overboard_blanks": ["6.1.10"],
+        "cargo_pressure_test": ["6.1.13"], "bunker_pressure_test": ["6.1.14"], "cargo_pressure": ["6.1.13"], "bunker_pressure": ["6.1.14"],
+        "msmp": ["10.1.2"], "lmp": ["10.1.2"], "sdmbl": ["10.1.2"], "brake_testing_equipment": ["10.1.3"], "brake_test_date": ["10.1.4"],
+        "split_drum": ["10.1.4", "10.1.3"], "mooring_diagram": ["10.1.3", "10.2.1", "10.7.1"], "manifold_diagram": ["10.8.1"],
+        "crane_test_date": ["10.9.1"], "generator_count": ["11.3.1"],
+    }
+    for field, qids in qid_map.items():
+        chunks = [blocks[q] for q in qids if q in blocks]
+        if not chunks:
+            continue
+        spec = FIELD_SPECS.get(field, {})
+        val = extract_near_alias("\n".join(chunks), spec.get("aliases", []), spec.get("kind", "text"))
+        if val:
+            out[field] = val
+    # PIQ specific qids / unique patterns
+    if "Technical Superintendent inspection completed" in text:
+        out["technical_superintendent_section"] = get_context(text, "Technical Superintendent inspection completed", 16)
+    if "Marine Superintendent inspection completed" in text:
+        out["marine_superintendent_section"] = get_context(text, "Marine Superintendent inspection completed", 12)
+    if "Date of PSC" in text or "Port State Control" in text:
+        out["psc_section"] = get_context(text, "Date of PSC", 12) or get_context(text, "Port State Control", 12)
+    # incidents section
+    if "5.7." in text or "incidents occurred during" in text:
+        out["piq_incident_section"] = get_context(text, "5.7. Safety Management", 80) or get_context(text, "Have any of the following incidents occurred", 80)
+    # PIQ tank inspection dates
+    for k, label in [
+        ("cargo_tank_oldest_inspection", "oldest inspection report for all cargo and slop"),
+        ("ballast_tank_oldest_inspection", "oldest inspection report for all ballast"),
+        ("void_space_oldest_inspection", "oldest inspection report for all void"),
+    ]:
+        d = parse_date(get_context(text, label, 3))
+        if d:
+            out[k] = d.isoformat()
+    return out
+
+
+def get_context(text: str, needle: str, n_lines: int = 10) -> str:
+    lines = text.splitlines()
+    cneedle = clean_for_compare(needle)
+    for i, line in enumerate(lines):
+        if cneedle in clean_for_compare(line):
+            return "\n".join(lines[i:i+n_lines])
+    return ""
+
+# -----------------------------
+# Observation library parsing
+# -----------------------------
+
+def parse_observation_workbook(uploaded) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if uploaded is None:
+        return pd.DataFrame(), {}
+    try:
+        b = uploaded.getvalue()
+        df = pd.read_excel(io.BytesIO(b), header=None, dtype=str).fillna("")
+        rows = []
+        current_question = ""
+        for _, r in df.iterrows():
+            cells = [normalize_text(x) for x in r.tolist()]
+            line = " ".join([x for x in cells if x])
+            m = re.search(r"Observations for Question:\s*([\d.]+)", line, flags=re.I)
+            if m:
+                current_question = m.group(1).rstrip(".")
+                continue
+            if len(cells) >= 2 and cells[0].lower() in {"s.no", "sno", "s no"}:
+                continue
+            if len(cells) >= 2 and cells[1]:
+                rows.append({"source_question": current_question, "sno": cells[0], "observation": cells[1]})
+            elif line and not line.lower().startswith("observations"):
+                rows.append({"source_question": current_question, "sno": "", "observation": line})
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out, {}
+        out["question_refs"] = out["observation"].apply(extract_question_refs)
+        out["category"] = out["observation"].apply(categorize_observation)
+        summary = {
+            "count": int(len(out)),
+            "category_counts": out["category"].value_counts().to_dict(),
+            "top_question_refs": count_question_refs(out).head(20).to_dict("records"),
+        }
+        return out, summary
+    except Exception as e:
+        return pd.DataFrame(), {"error": str(e)}
+
+
+def extract_question_refs(s: str) -> List[str]:
+    refs = re.findall(r"\b\d{1,2}\s*\.\s*\d+(?:\s*\.\s*\d+){0,3}\b", s)
+    out = []
+    for r in refs:
+        r = re.sub(r"\s+", "", r).strip(".")
+        # avoid dates like 03.10.2024 - crude filter
+        parts = r.split(".")
+        if len(parts) >= 2 and not (len(parts) == 3 and len(parts[-1]) == 4):
+            out.append(r)
+    return sorted(set(out))
+
+
+def categorize_observation(s: str) -> str:
+    cs = clean_for_compare(s)
+    for area, _, keywords, _ in TARGETED_CHECKS:
+        if any(clean_for_compare(k) in cs for k in keywords):
+            return area
+    return "General HVPQ accuracy"
+
+
+def count_question_refs(df: pd.DataFrame) -> pd.DataFrame:
+    counts: Dict[str, int] = {}
+    for refs in df.get("question_refs", []):
+        for r in refs:
+            counts[r] = counts.get(r, 0) + 1
+    return pd.DataFrame([{"question_ref": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: -x[1])])
 
 # -----------------------------
 # Rules
 # -----------------------------
 
-def run_all_rules(
-    hvpq: Dict[str, Any],
-    piq: Dict[str, Any],
-    class_status: Dict[str, Any],
-    q88: Dict[str, Any],
-    settings: Dict[str, Any],
-    obs_docs: List[TextDoc],
-) -> List[Finding]:
+def run_rules(hvpq: DocPack, piq: DocPack, class_doc: DocPack, q88: DocPack, xml_doc: DocPack, obs_df: pd.DataFrame, obs_summary: Dict[str, Any], settings: Dict[str, Any]) -> List[Finding]:
     findings: List[Finding] = []
-    findings.extend(rule_identity(hvpq, piq))
-    findings.extend(rule_piq_vs_hvpq_general(hvpq, piq))
-    findings.extend(rule_incident_declarations(hvpq, piq))
-    findings.extend(rule_superintendent_visits(piq, hvpq, settings))
-    findings.extend(rule_psc_cross_check(hvpq, piq, class_status, q88))
-    findings.extend(rule_survey_and_certificate_due(hvpq, settings))
-    findings.extend(rule_class_status_cross_check(hvpq, class_status, source_label="Class Status"))
-    findings.extend(rule_class_status_cross_check(hvpq, q88, source_label="Q88"))
-    findings.extend(rule_cii(hvpq, q88))
-    findings.extend(rule_moc_retrofit(hvpq, piq))
-    findings.extend(rule_targeted_operational_checks(hvpq, piq, class_status, q88, settings))
-    findings.extend(rule_observation_library_scan(hvpq, piq, obs_docs))
+    docs = {"HVPQ": hvpq, "PIQ": piq, "Class": class_doc, "Q88": q88, "XML": xml_doc}
+    for d in docs.values():
+        if d and (d.text or d.fields):
+            d.fields.update(extract_doc_fields(d, FIELD_SPECS))
+
+    findings.extend(rule_xml_diagnostic(xml_doc))
+    findings.extend(rule_cross_doc_mismatches(hvpq, piq, class_doc, q88, xml_doc, settings))
+    findings.extend(rule_incident_declaration(hvpq, piq, settings))
+    findings.extend(rule_superintendent_gaps(piq, settings))
+    findings.extend(rule_due_dates(hvpq, piq, class_doc, q88, settings))
+    findings.extend(rule_targeted_ship_checks(hvpq, piq, class_doc, q88, obs_summary, settings))
+    findings.extend(rule_observation_library_coverage(hvpq, piq, class_doc, q88, obs_df, obs_summary, settings))
     return findings
 
 
-def rule_identity(hvpq: Dict[str, Any], piq: Dict[str, Any]) -> List[Finding]:
-    # Identity is only a guardrail. Do not clutter the ship register with successful identity checks.
-    # It should flag only a material discrepancy, not harmless suffixes like LR2 / product tanker.
-    out: List[Finding] = []
-    hv_name = normalize_text(hvpq.get("vessel_name", ""))
-    piq_name = normalize_text(piq.get("vessel_name", ""))
-    if hv_name and piq_name:
-        different, score, reason = vessel_names_materially_different(hv_name, piq_name)
-        if different:
-            out.append(Finding(
-                "ID-001", "Identity", "Vessel name material mismatch", "FAIL", "CRITICAL",
-                hv_name, piq_name, reason=f"{reason} Match score {score}.",
-                recommended_action="Confirm correct HVPQ/PIQ documents have been uploaded."
-            ))
-    elif hv_name or piq_name:
-        out.append(Finding(
-            "ID-001", "Identity", "Vessel name extraction incomplete", "MANUAL CHECK", "MEDIUM",
-            hv_name, piq_name, reason="Vessel name could not be extracted from one document. This is not treated as a mismatch.",
-            recommended_action="Confirm both documents belong to the same vessel."
+def rule_xml_diagnostic(xml_doc: DocPack) -> List[Finding]:
+    if not xml_doc or not xml_doc.meta:
+        return []
+    warning = xml_doc.meta.get("xml_warning", "")
+    if warning and "Control IDs need" in warning:
+        return [Finding(
+            area="XML / JSON Input",
+            check="HVPQ XML response mapping",
+            status="MANUAL CHECK",
+            risk="MEDIUM",
+            xml_value=f"Vessel={xml_doc.meta.get('vessel_name','')}; IMO={xml_doc.meta.get('imo_number','')}; Template={xml_doc.meta.get('template_variant','')}; Responses={xml_doc.meta.get('response_count','')}",
+            reason="The uploaded OCIMF response XML provides reliable raw answers but uses control GUIDs. It does not expose human-readable HVPQ question labels unless a control mapping/template file is supplied.",
+            required_action="For highest accuracy, upload/export the HVPQ as JSON/Excel with question text, or provide a control-map file with columns ctrl, qid, label. The app will still use the PDF for labels and XML for document identity/metadata.",
+            source=xml_doc.name
+        )]
+    return []
+
+
+def value_from(doc: DocPack, field: str) -> str:
+    if not doc:
+        return ""
+    v = doc.fields.get(field, "") if doc.fields else ""
+    if v is None:
+        return ""
+    return normalize_text(v)
+
+
+def normalize_for_kind(value: str, kind: str) -> str:
+    if kind == "date":
+        d = parse_date(value)
+        return d.isoformat() if d else ""
+    if kind == "number":
+        n = parse_number(value)
+        return f"{n:g}" if n is not None else ""
+    if kind == "yesno":
+        y = parse_yesno(value)
+        return "Yes" if y is True else "No" if y is False else ""
+    return normalize_text(value)
+
+
+def compare_values(a: str, b: str, kind: str, loose: bool = False) -> Tuple[bool, str]:
+    aa, bb = normalize_for_kind(a, kind), normalize_for_kind(b, kind)
+    if not aa or not bb:
+        return False, "missing value"
+    if kind == "date":
+        return aa == bb, f"date compare {aa} vs {bb}"
+    if kind == "number":
+        try:
+            return abs(float(aa) - float(bb)) < 0.01, f"number compare {aa} vs {bb}"
+        except Exception:
+            return aa == bb, f"number text compare {aa} vs {bb}"
+    if kind == "yesno":
+        return aa == bb, f"yes/no compare {aa} vs {bb}"
+    ok = similar_enough(aa, bb, kind, loose=loose)
+    return ok, f"semantic compare {aa} vs {bb}"
+
+
+def rule_cross_doc_mismatches(hvpq: DocPack, piq: DocPack, class_doc: DocPack, q88: DocPack, xml_doc: DocPack, settings: Dict[str, Any]) -> List[Finding]:
+    findings: List[Finding] = []
+    # Compare HVPQ to PIQ/Class/Q88/XML for fields where values exist in both.
+    for field, spec in FIELD_SPECS.items():
+        kind = spec.get("kind", "text")
+        risk = spec.get("risk", "MEDIUM")
+        area = spec.get("area", "General")
+        loose = bool(spec.get("loose", False))
+        hv = value_from(hvpq, field)
+        pv = value_from(piq, field)
+        cv = value_from(class_doc, field)
+        qv = value_from(q88, field)
+        xv = value_from(xml_doc, field)
+        pairs = []
+        if hv and pv: pairs.append(("PIQ", pv))
+        if hv and cv: pairs.append(("Class Status", cv))
+        if hv and qv: pairs.append(("Q88", qv))
+        if hv and xv: pairs.append(("HVPQ XML", xv))
+        for source_name, other in pairs:
+            ok, detail = compare_values(hv, other, kind, loose=loose)
+            if not ok:
+                # Don't flag missing via compare; missing handled elsewhere.
+                if detail == "missing value":
+                    continue
+                findings.append(Finding(
+                    area=area,
+                    check=f"{field.replace('_',' ').title()} mismatch: HVPQ vs {source_name}",
+                    status="MISMATCH",
+                    risk=risk,
+                    hvpq_value=hv,
+                    piq_value=other if source_name == "PIQ" else "",
+                    class_value=other if source_name == "Class Status" else "",
+                    q88_value=other if source_name == "Q88" else "",
+                    xml_value=other if source_name == "HVPQ XML" else "",
+                    reason=f"Values are not equivalent after normalization ({detail}).",
+                    required_action=f"Verify {field.replace('_',' ')} from source documents and correct the wrong declaration before submission.",
+                    source=f"HVPQ vs {source_name}"
+                ))
+        # if Class/Q88 uploaded and HVPQ has important field but source cannot extract, add targeted manual check for high-risk only
+        if risk in {"CRITICAL", "HIGH"} and hv:
+            for source_name, doc in [("Class Status", class_doc), ("Q88", q88)]:
+                if doc and doc.text and not value_from(doc, field) and area in {"Class / Survey", "Class", "Certificates", "PSC"}:
+                    findings.append(Finding(
+                        area=area,
+                        check=f"{field.replace('_',' ').title()} requires {source_name} verification",
+                        status="MANUAL CHECK",
+                        risk="MEDIUM",
+                        hvpq_value=hv,
+                        reason=f"{source_name} was uploaded but the app could not confidently extract this field due to variable format.",
+                        required_action=f"Ship/office to verify HVPQ value against {source_name}. If correct, mark verified; if not, update HVPQ.",
+                        source=source_name
+                    ))
+    return dedupe_findings(findings)
+
+
+def rule_incident_declaration(hvpq: DocPack, piq: DocPack, settings: Dict[str, Any]) -> List[Finding]:
+    findings: List[Finding] = []
+    hv_inc = value_from(hvpq, "incident_other")
+    hv_section = "\n".join([hvpq.qmap.get("1.9.5", ""), hvpq.qmap.get("1.9.6", "")]) if hvpq and hvpq.qmap else ""
+    piq_sec = value_from(piq, "piq_incident_section")
+    # Extract PIQ incident yes/no counts in 5.7 section
+    piq_yes = len(re.findall(r"\bYes\b", piq_sec, flags=re.I)) if piq_sec else 0
+    piq_no = len(re.findall(r"\bNo\b", piq_sec, flags=re.I)) if piq_sec else 0
+    hv_yesno = parse_yesno(hv_inc or hv_section)
+
+    if hv_yesno is False and (not piq_sec or piq_yes == 0):
+        findings.append(Finding(
+            area="Incidents",
+            check="No incident declaration in HVPQ/PIQ",
+            status="MANUAL CHECK",
+            risk="MEDIUM",
+            hvpq_value=hv_inc or "No / no incident details found",
+            piq_value=f"PIQ 5.7 Yes count={piq_yes}, No count={piq_no}" if piq_sec else "PIQ incident section not clearly extracted",
+            reason="No incident was detected in HVPQ/PIQ. This is not automatically wrong, but historic observations commonly arise when incidents existed but were not declared.",
+            required_action="Send to vessel/office for positive confirmation: no pollution, grounding/touch bottom, blackout, main engine failure, mooring rope parting, injury/LTI, cargo/steering/critical equipment incident in previous 12 months.",
+            source="HVPQ/PIQ"
         ))
+    elif hv_yesno is True and piq_sec and piq_yes == 0:
+        findings.append(Finding(
+            area="Incidents",
+            check="HVPQ lists incident but PIQ incident questions appear all No",
+            status="MISMATCH",
+            risk="HIGH",
+            hvpq_value=shorten(hv_section, 300),
+            piq_value=f"PIQ 5.7 Yes count={piq_yes}, No count={piq_no}",
+            reason="HVPQ appears to declare an incident, while PIQ incident checklist appears to have no positive incident declaration.",
+            required_action="Review PIQ 5.7 answers against HVPQ 1.9.5/1.9.6 and update if the incident falls under any PIQ incident category.",
+            source="HVPQ vs PIQ",
+            question_ref="HVPQ 1.9.5/1.9.6; PIQ 5.7"
+        ))
+    elif not hv_inc and not hv_section:
+        findings.append(Finding(
+            area="Incidents",
+            check="HVPQ incident section not confidently extracted",
+            status="MANUAL CHECK",
+            risk="MEDIUM",
+            reason="Could not confidently extract HVPQ 1.9.5/1.9.6 incident declaration.",
+            required_action="Verify HVPQ 1.9.5/1.9.6 manually and confirm consistency with PIQ 5.7.",
+            source="HVPQ"
+        ))
+    return findings
 
-    hv_date = hvpq.get("doc_date")
-    piq_date = piq.get("doc_date")
-    if hv_date and piq_date:
-        delta = abs((hv_date - piq_date).days)
-        if delta > 30:
-            out.append(Finding(
-                "ID-002", "Identity", "Document date gap", "WARNING", "MEDIUM",
-                fmt_date(hv_date), fmt_date(piq_date),
-                reason=f"HVPQ/PIQ document date difference is {delta} days. This may still be acceptable, but check latest version control.",
-                recommended_action="Confirm that the latest HVPQ and PIQ versions are being compared."
-            ))
-    return out
 
-
-def rule_piq_vs_hvpq_general(hvpq: Dict[str, Any], piq: Dict[str, Any]) -> List[Finding]:
-    out: List[Finding] = []
-    hv_type = " ".join([normalize_text(hvpq.get("ship_type", "")), normalize_text(hvpq.get("ship_type_other", ""))]).strip()
-    piq_type = normalize_text(piq.get("vessel_type", ""))
-    if hv_type or piq_type:
-        if hv_type and piq_type and vessel_type_broadly_compatible(hv_type, piq_type):
-            # Broadly aligned. Do not show pass item in the action register.
-            pass
-        else:
-            out.append(Finding("GEN-001", "PIQ vs HVPQ", "Vessel type consistency", "MANUAL CHECK", "MEDIUM", hv_type, piq_type, reason="Vessel type wording differs materially or could not be matched. Product Carrier vs Products/Chemical Tanker may be acceptable only when consistent with IOPP/CoF/Annex II carriage.", recommended_action="Ask vessel/office to confirm correct vessel type wording and Annex II carriage intention."))
-
-    # Tank inspection dates in PIQ against HVPQ tank coating text presence.
-    for key, label in [
-        ("cargo_tank_oldest_inspection", "Cargo/slop tank inspection sequence"),
-        ("ballast_tank_oldest_inspection", "Ballast tank inspection sequence"),
-        ("void_space_oldest_inspection", "Void space inspection sequence"),
+def rule_superintendent_gaps(piq: DocPack, settings: Dict[str, Any]) -> List[Finding]:
+    findings: List[Finding] = []
+    if not piq or not piq.text:
+        return findings
+    piq_date = parse_date(value_from(piq, "document_date")) or date.today()
+    for label, section_key, max_months in [
+        ("Technical Superintendent", "technical_superintendent_section", float(settings.get("tech_gap_months", 7.0))),
+        ("Marine Superintendent", "marine_superintendent_section", float(settings.get("marine_gap_months", 12.0))),
     ]:
-        d = piq.get(key)
-        if d:
-            out.append(Finding(f"GEN-{key}", "PIQ General Accuracy", label, "INFO", "INFO", "", fmt_date(d), reason="PIQ date extracted. Confirm supporting tank/void inspection reports are available onboard.", recommended_action="Ship to verify the oldest report date in the current sequence and evidence availability.", manual_verification_required="Yes"))
-        else:
-            out.append(Finding(f"GEN-{key}", "PIQ General Accuracy", label, "MANUAL CHECK", "MEDIUM", "", "Not extracted", reason="Could not extract PIQ inspection sequence date.", recommended_action="Ship to verify field and supporting evidence."))
-    return out
-
-
-def rule_incident_declarations(hvpq: Dict[str, Any], piq: Dict[str, Any]) -> List[Finding]:
-    out: List[Finding] = []
-    hv_poll = normalize_text(hvpq.get("pollution_grounding_collision_allision_12m", ""))
-    hv_other = normalize_text(hvpq.get("other_incidents_12m", ""))
-    hv_detail = normalize_text(hvpq.get("incident_detail_text", ""))
-    piq_yes = piq.get("incident_yes_count", 0)
-    piq_no = piq.get("incident_no_count", 0)
-
-    # User's instruction: no JiBe list. If no incidents entered, flag no incidents entered.
-    if hv_poll.lower() in ["no", "n/a", "na", ""] and hv_other.lower() in ["no", "n/a", "na", ""]:
-        out.append(Finding(
-            "INC-001", "Incident Declaration", "HVPQ incident declaration blank/no",
-            "MANUAL CHECK", "HIGH",
-            hvpq_value=f"Pollution/grounding/collision/allision: {hv_poll or 'Not extracted'}; Other incidents: {hv_other or 'Not extracted'}",
-            piq_value="",
-            reason="HVPQ appears to have no incidents entered or incident fields could not be extracted. This should be positively confirmed, not assumed correct.",
-            recommended_action="Send to vessel/office: confirm there were no reportable incidents, injuries, machinery failures, pollution, mooring, navigation or equipment incidents during the HVPQ/PIQ lookback period.",
-            manual_verification_required="Yes",
-        ))
-    else:
-        out.append(Finding(
-            "INC-001", "Incident Declaration", "HVPQ incident declaration present",
-            "INFO", "INFO",
-            hvpq_value=f"Pollution/grounding/collision/allision: {hv_poll}; Other incidents: {hv_other}; Details: {hv_detail[:220]}",
-            reason="HVPQ has incident declaration data. Verify that PIQ incident questions and details are consistent.",
-            recommended_action="Ship/office to confirm all incidents in HVPQ are correctly reflected in PIQ where applicable.",
-            manual_verification_required="Yes",
-        ))
-
-    # Mismatch logic from document declarations only.
-    if hv_other.lower() == "yes" and piq_yes == 0:
-        out.append(Finding(
-            "INC-002", "Incident Declaration", "HVPQ incident yes vs PIQ incident no/blank",
-            "FAIL", "HIGH",
-            hvpq_value=f"Other incidents: {hv_other}; details: {hv_detail[:220]}",
-            piq_value=f"PIQ incident yes count: {piq_yes}, no count: {piq_no}",
-            reason="HVPQ indicates other incidents but PIQ incident-related positive declarations were not detected.",
-            recommended_action="Check PIQ incident section manually and update relevant PIQ fields if required.",
-            manual_verification_required="Yes",
-        ))
-    if hv_poll.lower() == "yes" and piq_yes == 0:
-        out.append(Finding(
-            "INC-003", "Incident Declaration", "Major incident declaration mismatch",
-            "FAIL", "CRITICAL",
-            hvpq_value=f"Pollution/grounding/collision/allision: {hv_poll}",
-            piq_value=f"PIQ incident yes count: {piq_yes}",
-            reason="HVPQ indicates pollution/grounding/collision/allision but PIQ positive declaration was not detected.",
-            recommended_action="Urgently verify PIQ and supporting incident evidence before inspection.",
-            manual_verification_required="Yes",
-        ))
-    if piq_yes == 0:
-        out.append(Finding(
-            "INC-004", "Incident Declaration", "PIQ incident positive entries not detected",
-            "MANUAL CHECK", "MEDIUM",
-            hvpq_value=f"HVPQ other incidents: {hv_other}",
-            piq_value="No clear PIQ incident Yes detected from extracted text",
-            reason="PIQ incident sections vary in wording. No positive incident declaration was detected by text parsing.",
-            recommended_action="Ship to verify PIQ incident questions one by one, especially injury, machinery, mooring, navigation, pollution and security-related questions.",
-            manual_verification_required="Yes",
-        ))
-    return out
-
-
-def rule_superintendent_visits(piq: Dict[str, Any], hvpq: Dict[str, Any], settings: Dict[str, Any]) -> List[Finding]:
-    out: List[Finding] = []
-    ref_date = piq.get("doc_date") or hvpq.get("doc_date") or date.today()
-    for label, key, max_months in [
-        ("Technical Superintendent", "technical_superintendent_dates", settings.get("ts_gap_months", DEFAULT_TS_GAP_MONTHS)),
-        ("Marine Superintendent", "marine_superintendent_dates", settings.get("ms_gap_months", DEFAULT_MS_GAP_MONTHS)),
-    ]:
-        dates = sorted(piq.get(key, []))
+        sec = value_from(piq, section_key)
+        if not sec:
+            findings.append(Finding(
+                area="Management Oversight",
+                check=f"{label} visit section extraction",
+                status="MANUAL CHECK",
+                risk="MEDIUM",
+                reason=f"Could not confidently extract {label} visit history from PIQ.",
+                required_action=f"Verify {label} inspection dates and gap rule manually.",
+                source="PIQ"
+            ))
+            continue
+        dates = sorted(set(d for d in extract_dates(sec)))
         if not dates:
-            out.append(Finding(f"SUP-{key}-000", "Management Oversight", f"{label} visit dates", "MANUAL CHECK", "HIGH", piq_value="No dates extracted", reason=f"{label} visit dates could not be extracted from PIQ.", recommended_action="Verify PIQ management oversight table and supporting visit reports.", manual_verification_required="Yes"))
-            continue
-        # Check gaps between successive visit end/start dates approximately. Dates extracted include from/to, so use unique sorted dates.
-        all_dates = dates + [ref_date]
-        for i in range(len(all_dates) - 1):
-            ok, days, months = month_gap_days(all_dates[i], all_dates[i + 1], float(max_months))
-            out.append(Finding(
-                f"SUP-{key}-{i+1:03d}", "Management Oversight", f"{label} gap check",
-                "PASS" if ok else "FAIL", "PASS" if ok else "CRITICAL",
-                piq_value=f"{fmt_date(all_dates[i])} → {fmt_date(all_dates[i + 1])}",
-                reason=f"Gap is {days} days / {months:.2f} months. Limit is {max_months:.1f} months strict.",
-                recommended_action="No action." if ok else f"Explain gap and arrange/record {label} full inspection as required.",
-                manual_verification_required="No" if ok else "Yes",
+            findings.append(Finding(
+                area="Management Oversight",
+                check=f"{label} visit dates missing",
+                status="MANUAL CHECK",
+                risk="HIGH",
+                piq_value=shorten(sec, 250),
+                reason=f"{label} section found, but dates were not extracted.",
+                required_action=f"Confirm {label} last/second/third inspection dates.",
+                source="PIQ"
             ))
-    return out
-
-
-def rule_psc_cross_check(hvpq: Dict[str, Any], piq: Dict[str, Any], class_status: Dict[str, Any], q88: Dict[str, Any]) -> List[Finding]:
-    out: List[Finding] = []
-    hv_date = hvpq.get("last_psc_date")
-    piq_dates = piq.get("psc_dates", [])
-    piq_last = max(piq_dates) if piq_dates else None
-    if hv_date and piq_last:
-        if hv_date == piq_last:
-            out.append(Finding("PSC-001", "PSC", "Last PSC date HVPQ vs PIQ", "PASS", "PASS", fmt_date(hv_date), fmt_date(piq_last), reason="Last PSC dates match."))
-        else:
-            out.append(Finding("PSC-001", "PSC", "Last PSC date HVPQ vs PIQ", "FAIL", "HIGH", fmt_date(hv_date), fmt_date(piq_last), reason="Last PSC dates differ.", recommended_action="Verify latest PSC inspection date, port, MOU, deficiencies and detention status."))
-    else:
-        out.append(Finding("PSC-001", "PSC", "Last PSC date HVPQ vs PIQ", "MANUAL CHECK", "MEDIUM", fmt_date(hv_date), fmt_date(piq_last), reason="Could not extract PSC date from one or both documents.", recommended_action="Ship/office to confirm latest PSC data."))
-
-    hv_det = normalize_text(hvpq.get("detained_36m", ""))
-    if not hv_det:
-        out.append(Finding("PSC-002", "PSC", "Detention status in HVPQ", "MANUAL CHECK", "HIGH", hvpq_value="Not extracted", reason="Detention status for last 36 months was not extracted.", recommended_action="Confirm HVPQ detention status and PSC database entries."))
-    return out
-
-
-def rule_survey_and_certificate_due(hvpq: Dict[str, Any], settings: Dict[str, Any]) -> List[Finding]:
-    out: List[Finding] = []
-    ref_date = hvpq.get("doc_date") or date.today()
-    survey_warn = int(settings.get("survey_warning_days", DEFAULT_SURVEY_WARNING_DAYS))
-    cert_warn = int(settings.get("cert_warning_days", DEFAULT_CERT_WARNING_DAYS))
-
-    for key in ["next_dry_dock_due", "next_iws_due", "next_special_survey_due"]:
-        d = hvpq.get(key)
-        label = key.replace("_", " ").title()
-        if not d:
-            out.append(Finding(f"DUE-{key}", "HVPQ Dates", label, "MANUAL CHECK", "MEDIUM", hvpq_value="Not extracted", reason="Due date not extracted from HVPQ.", recommended_action="Verify against Class Status."))
             continue
-        days = (d - ref_date).days
-        if days < 0:
-            out.append(Finding(f"DUE-{key}", "HVPQ Dates", label, "FAIL", "CRITICAL", hvpq_value=fmt_date(d), reason=f"Due date appears overdue by {-days} days as of {fmt_date(ref_date)}.", recommended_action="Verify immediately against Class Status and update HVPQ."))
-        elif days <= survey_warn:
-            out.append(Finding(f"DUE-{key}", "HVPQ Dates", label, "WARNING", "MEDIUM", hvpq_value=fmt_date(d), reason=f"Due date is within {survey_warn} days.", recommended_action="Confirm planning and HVPQ accuracy."))
-        else:
-            out.append(Finding(f"DUE-{key}", "HVPQ Dates", label, "PASS", "PASS", hvpq_value=fmt_date(d), reason=f"Due date is {days} days away."))
-
-    # Certificate expiry dates from HVPQ table, if extracted.
-    certs = hvpq.get("certificates", {})
-    for cert, info in certs.items():
-        dates = info.get("dates", [])
-        # Be conservative: some rows such as Minimum Safe Manning have only an issue date and the
-        # next row's dates may be accidentally captured as false expiry dates.
-        if len(dates) < 2 or "minimum safe manning" in cert.lower():
-            continue
-        # For certificate lines, expiry is often second date; this remains generic. Ignore impossible ordering.
-        expiry = dates[1]
-        if dates[0] and expiry <= dates[0]:
-            continue
-        days = (expiry - ref_date).days
-        if days < 0:
-            risk, status = "CRITICAL", "FAIL"
-        elif days <= cert_warn:
-            risk, status = "HIGH", "WARNING"
-        else:
-            risk, status = "INFO", "INFO"
-        if risk != "INFO":
-            out.append(Finding(
-                f"CERT-DUE-{cert[:20]}", "Certificate Due", cert, status, risk,
-                hvpq_value=f"Possible expiry: {fmt_date(expiry)}",
-                reason=f"Generic extraction found certificate date within/over warning window. Days to expiry: {days}.",
-                recommended_action="Confirm exact certificate issue/expiry/endorsement dates against certificate or Class Status.",
-                manual_verification_required="Yes",
-                source_location=info.get("snippet", "")[:250],
-            ))
-    return out
+        # Gaps between successive dates and from latest date to PIQ date
+        all_dates = dates + [piq_date]
+        for a, b in zip(all_dates, all_dates[1:]):
+            days = (b - a).days
+            allowed = approx_months_to_days(max_months)
+            if days > allowed:
+                findings.append(Finding(
+                    area="Management Oversight",
+                    check=f"{label} inspection gap exceeds {max_months:g} months",
+                    status="NON-COMPLIANT",
+                    risk="CRITICAL",
+                    piq_value=f"{a.isoformat()} to {b.isoformat()} = {days} days",
+                    reason=f"Configured strict maximum gap is {max_months:g} months. Any exceedance is flagged.",
+                    required_action=f"Provide office justification if applicable and schedule/record compliant {label} inspection. Update PIQ if dates are wrong.",
+                    source="PIQ"
+                ))
+    return findings
 
 
-def rule_class_status_cross_check(hvpq: Dict[str, Any], ref: Dict[str, Any], source_label: str) -> List[Finding]:
-    out: List[Finding] = []
-    if not ref:
-        out.append(Finding(f"{source_label}-000", source_label, f"{source_label} uploaded", "INFO", "INFO", reason=f"No {source_label} file uploaded. Cross-check skipped."))
-        return out
-
-    for key, labels in SURVEY_FIELDS.items():
-        if key in ["conditions_of_class", "memoranda_of_class", "flag_dispensation"]:
-            hv = normalize_text(hvpq.get(key + "_yn", ""))
-            rv = normalize_text(ref.get(key + "_yn", ""))
-            if hv and rv and hv.lower() != rv.lower():
-                out.append(Finding(f"{source_label}-{key}", source_label, key.replace("_", " ").title(), "FAIL", "HIGH", hvpq_value=hv, class_status_value=rv if source_label == "Class Status" else "", q88_value=rv if source_label == "Q88" else "", reason=f"HVPQ and {source_label} appear to differ for {key}.", recommended_action=f"Verify {key} in latest {source_label} and update HVPQ if required.", manual_verification_required="Yes"))
-            elif hv or rv:
-                out.append(Finding(f"{source_label}-{key}", source_label, key.replace("_", " ").title(), "INFO", "INFO", hvpq_value=hv, class_status_value=rv if source_label == "Class Status" else "", q88_value=rv if source_label == "Q88" else "", reason=f"{key} values extracted for reference. Confirm if parsing is uncertain."))
-            continue
-
-        hvd = hvpq.get(key)
-        rd = ref.get(key)
-        if hvd and rd:
-            if hvd == rd:
-                out.append(Finding(f"{source_label}-{key}", source_label, key.replace("_", " ").title(), "PASS", "PASS", hvpq_value=fmt_date(hvd), class_status_value=fmt_date(rd) if source_label == "Class Status" else "", q88_value=fmt_date(rd) if source_label == "Q88" else "", reason=f"HVPQ date matches {source_label}."))
-            else:
-                out.append(Finding(f"{source_label}-{key}", source_label, key.replace("_", " ").title(), "FAIL", "HIGH", hvpq_value=fmt_date(hvd), class_status_value=fmt_date(rd) if source_label == "Class Status" else "", q88_value=fmt_date(rd) if source_label == "Q88" else "", reason=f"HVPQ date does not match {source_label} extracted date.", recommended_action=f"Verify exact value in latest {source_label}; update HVPQ if wrong.", manual_verification_required="Yes", source_location=normalize_text(ref.get(key + "_snippet", ""))[:250]))
-        elif hvd and not rd:
-            out.append(Finding(f"{source_label}-{key}", source_label, key.replace("_", " ").title(), "MANUAL CHECK", "LOW", hvpq_value=fmt_date(hvd), reason=f"HVPQ date exists but matching {source_label} date was not extracted. Class status formats vary; this is not automatically a defect.", recommended_action=f"Manual check against {source_label}.", manual_verification_required="Yes"))
-    # Certificates generic comparison by name.
-    hv_certs = hvpq.get("certificates", {})
-    ref_certs = ref.get("certificates", {})
-    for cert, hv_info in hv_certs.items():
-        if cert not in ref_certs:
-            continue
-        hv_dates = hv_info.get("dates", [])
-        ref_dates = ref_certs[cert].get("dates", [])
-        if hv_dates and ref_dates:
-            if set(hv_dates[:3]).intersection(ref_dates[:4]):
-                out.append(Finding(f"{source_label}-CERT-{cert[:18]}", source_label, f"{cert} date cross-check", "INFO", "INFO", hvpq_value=", ".join(fmt_date(d) for d in hv_dates[:4]), class_status_value=", ".join(fmt_date(d) for d in ref_dates[:4]) if source_label == "Class Status" else "", q88_value=", ".join(fmt_date(d) for d in ref_dates[:4]) if source_label == "Q88" else "", reason=f"Some certificate dates overlap between HVPQ and {source_label}. Confirm exact issue/expiry/endorsement columns manually."))
-            else:
-                out.append(Finding(f"{source_label}-CERT-{cert[:18]}", source_label, f"{cert} date cross-check", "MANUAL CHECK", "MEDIUM", hvpq_value=", ".join(fmt_date(d) for d in hv_dates[:4]), class_status_value=", ".join(fmt_date(d) for d in ref_dates[:4]) if source_label == "Class Status" else "", q88_value=", ".join(fmt_date(d) for d in ref_dates[:4]) if source_label == "Q88" else "", reason=f"Certificate date sets do not visibly overlap between HVPQ and {source_label}. Generic extraction may be imperfect.", recommended_action=f"Confirm {cert} dates against original certificate/{source_label}.", manual_verification_required="Yes"))
-    return out
-
-
-def rule_cii(hvpq: Dict[str, Any], q88: Dict[str, Any]) -> List[Finding]:
-    out: List[Finding] = []
-    cii = normalize_text(hvpq.get("cii_rating", ""))
-    verified = normalize_text(hvpq.get("cii_verified_by", ""))
-    if not cii or cii.upper() in ["NA", "N/A", "NO"]:
-        out.append(Finding("CII-001", "Environmental", "CII rating declared", "FAIL", "HIGH", hvpq_value=cii or "Blank/not extracted", reason="CII rating is blank/not extracted or appears not declared.", recommended_action="Verify latest CII/AER evidence and update HVPQ."))
-    else:
-        risk = "WARNING" if "owner" in verified.lower() else "INFO"
-        out.append(Finding("CII-001", "Environmental", "CII rating declared", "INFO", risk, hvpq_value=f"CII: {cii}; verified by: {verified}", reason="CII data extracted from HVPQ. If verified by Owner only, confirm latest class/recognized evidence if required by vetting party.", recommended_action="Ship/office to attach latest CII/AER evidence for verification.", manual_verification_required="Yes"))
-    return out
-
-
-def rule_moc_retrofit(hvpq: Dict[str, Any], piq: Dict[str, Any]) -> List[Finding]:
-    out: List[Finding] = []
-    retrofit = normalize_text(piq.get("equipment_retrofitted", ""))
-    retrofit_snip = normalize_text(piq.get("equipment_retrofitted_snippet", ""))
-    hv_text = " ".join([str(v) for v in hvpq.values() if isinstance(v, str)])
-    if retrofit.lower() == "yes":
-        if any(term in retrofit_snip.lower() for term in ["egcs", "scrubber", "sox"]):
-            if re.search(r"\b(EGCS|SOx|scrubber)\b", hv_text, flags=re.I):
-                out.append(Finding("MOC-001", "MOC / Retrofit", "EGCS retrofit reflected in HVPQ", "PASS", "PASS", hvpq_value="EGCS/SOx text detected", piq_value=retrofit_snip[:220], reason="PIQ retrofit item appears reflected in HVPQ text/class notation."))
-            else:
-                out.append(Finding("MOC-001", "MOC / Retrofit", "EGCS retrofit reflected in HVPQ", "MANUAL CHECK", "HIGH", hvpq_value="EGCS/SOx not detected", piq_value=retrofit_snip[:220], reason="PIQ mentions EGCS/SOx retrofit but related HVPQ text was not detected.", recommended_action="Verify class notation/certificates/equipment sections and update HVPQ if required.", manual_verification_required="Yes"))
-        out.append(Finding("MOC-002", "MOC / Retrofit", "Retrofitted equipment declaration", "INFO", "MEDIUM", piq_value=retrofit_snip[:250], reason="PIQ states equipment was retrofitted. HVPQ, class status and relevant certificates should be checked for consistency.", recommended_action="Ship/office to confirm all retrofits are correctly reflected in HVPQ and certificates.", manual_verification_required="Yes"))
-    return out
-
-
-
-def rule_targeted_operational_checks(hvpq: Dict[str, Any], piq: Dict[str, Any], class_status: Dict[str, Any], q88: Dict[str, Any], settings: Dict[str, Any]) -> List[Finding]:
-    """
-    Detailed targeted checks based on recurring HVPQ/PIQ observations.
-    These checks are intentionally objective: if a value cannot be reliably extracted,
-    the output is a ship-verification item rather than an assumed defect.
-    """
-    out: List[Finding] = []
-    ref_date = piq.get("doc_date") or hvpq.get("doc_date") or date.today()
-
-    def has_text(source: Dict[str, Any], key: str) -> bool:
-        return bool(normalize_text(source.get(key, "")))
-
-    def snippet(source: Dict[str, Any], key: str, n: int = 300) -> str:
-        return normalize_text(source.get(key, ""))[:n]
-
-    # 1. Tank / void inspection objective due checks from PIQ.
-    tank_items = [
-        ("TANK-001", "Cargo/slop tank inspection sequence", "cargo_tank_oldest_inspection", 12),
-        ("TANK-002", "Ballast tank inspection sequence", "ballast_tank_oldest_inspection", 12),
-        ("TANK-003", "Void space inspection sequence", "void_space_oldest_inspection", 12),
+def extract_dates(text: str) -> List[date]:
+    dates = []
+    # Find robust dates; avoid question numbers.
+    patterns = [
+        r"\b\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(?:20\d{2}|19\d{2})\b",
+        r"\b(?:20\d{2}|19\d{2})[-/]\d{1,2}[-/]\d{1,2}\b",
+        r"\b\d{1,2}[-/]\d{1,2}[-/](?:20\d{2}|19\d{2})\b",
     ]
-    warn_days = int(settings.get("tank_warning_days", 60))
-    for cid, label, key, freq_months in tank_items:
-        d = piq.get(key)
+    for pat in patterns:
+        for m in re.finditer(pat, text, flags=re.I):
+            d = parse_date(m.group(0))
+            if d:
+                dates.append(d)
+    return dates
+
+
+def approx_months_to_days(months: float) -> int:
+    return int(round(months * 30.4375))
+
+
+def rule_due_dates(hvpq: DocPack, piq: DocPack, class_doc: DocPack, q88: DocPack, settings: Dict[str, Any]) -> List[Finding]:
+    findings: List[Finding] = []
+    ref_date = parse_date(value_from(hvpq, "document_date")) or parse_date(value_from(piq, "document_date")) or date.today()
+    warning_days = int(settings.get("due_warning_days", 180))
+    cert_warning_days = int(settings.get("cert_warning_days", 90))
+    # due survey checks
+    for field, label in [("next_drydock_due", "Next drydock"), ("next_iws_due", "Next IWS"), ("next_special_survey_due", "Next special survey")]:
+        d = parse_date(value_from(hvpq, field))
+        if d:
+            days = (d - ref_date).days
+            if days < 0:
+                findings.append(Finding("Class / Survey", label, "OVERDUE", "CRITICAL", hvpq_value=d.isoformat(), reason=f"Due date is {abs(days)} days before document/reference date {ref_date}.", required_action="Verify latest class status/certificate and update HVPQ immediately.", source="HVPQ"))
+            elif days <= warning_days:
+                findings.append(Finding("Class / Survey", label, "DUE SOON", "MEDIUM", hvpq_value=d.isoformat(), reason=f"Due within {days} days of reference date {ref_date}.", required_action="Verify class status and ensure no outdated HVPQ entry.", source="HVPQ"))
+    # Tank inspection due based on oldest inspection + frequency
+    freq_months = int(settings.get("tank_frequency_months", 12))
+    tank_warning = int(settings.get("tank_warning_days", 60))
+    for field, label in [("cargo_tank_oldest_inspection", "Cargo/slop tank inspection"), ("ballast_tank_oldest_inspection", "Ballast tank inspection"), ("void_space_oldest_inspection", "Void space inspection")]:
+        d = parse_date(value_from(piq, field) or value_from(hvpq, field))
         if d:
             due = d + relativedelta(months=freq_months)
-            days_left = (due - ref_date).days
-            if days_left < 0:
-                status, risk = "FAIL", "HIGH"
-                reason = f"PIQ oldest inspection date is {fmt_date(d)}; next due calculated as {fmt_date(due)}, overdue by {-days_left} days."
-            elif days_left <= warn_days:
-                status, risk = "WARNING", "MEDIUM"
-                reason = f"PIQ oldest inspection date is {fmt_date(d)}; next due calculated as {fmt_date(due)}, due in {days_left} days."
-            else:
-                status, risk = "INFO", "INFO"
-                reason = f"PIQ oldest inspection date is {fmt_date(d)}; next due calculated as {fmt_date(due)}."
-            out.append(Finding(cid, "Tank / Structural", label, status, risk, piq_value=f"Oldest: {fmt_date(d)}; calculated due: {fmt_date(due)}", reason=reason, recommended_action="Ship to verify actual tank/void inspection report sequence and confirm all applicable spaces are covered.", manual_verification_required="Yes"))
-        else:
-            out.append(Finding(cid, "Tank / Structural", label, "MANUAL CHECK", "MEDIUM", piq_value="Not extracted", reason="PIQ oldest inspection date could not be extracted.", recommended_action="Ship to confirm oldest inspection report date and inspection frequency for this category.", manual_verification_required="Yes"))
-
-    # HVPQ tank coating/table presence check.
-    if has_text(hvpq, "tank_block"):
-        out.append(Finding("TANK-004", "Tank / Structural", "HVPQ tank coating / inspection table presence", "INFO", "INFO", hvpq_value=snippet(hvpq, "tank_block"), reason="HVPQ tank coating/inspection text detected. This should be checked for full tank listing and date accuracy.", recommended_action="Ship to verify all cargo, slop, ballast and applicable void spaces are individually listed with coating condition and last inspection dates.", manual_verification_required="Yes"))
-    else:
-        out.append(Finding("TANK-004", "Tank / Structural", "HVPQ tank coating / inspection table presence", "MANUAL CHECK", "HIGH", hvpq_value="Not detected", reason="HVPQ tank coating/inspection section was not detected by text extraction.", recommended_action="Verify HVPQ tank coating/inspection entries manually.", manual_verification_required="Yes"))
-
-    # 2. Mooring / ropes / brake testing. These are often not reliably extractable from all HVPQs, so use targeted objective prompts.
-    moor_text = (snippet(hvpq, "mooring_block", 900) + " " + hvpq.get("_full_text", "")[:0])
-    moor_dates = hvpq.get("mooring_block_dates", [])
-    mooring_checks = [
-        ("MOOR-001", "Mooring winch brake test date", ["brake test", "brake", "BHC", "brake holding"], "Confirm last brake test date, brake holding capacity and test certificate/report. Update HVPQ if date or value is wrong."),
-        ("MOOR-002", "Brake holding capacity / rendering load", ["bhc", "brake holding", "rendering load"], "Confirm BHC/rendering load values against mooring equipment records and brake test certificates."),
-        ("MOOR-003", "Split drum declaration", ["split drum", "split"], "Confirm whether winches are split drum/non-split drum and HVPQ declaration is correct."),
-        ("MOOR-004", "Mooring rope / tail particulars", ["rope", "tail", "mbs", "ldbf", "material"], "Confirm rope/tail material, diameter, MBL/LDBF, certificate dates and compatibility with MEG/company line management plan."),
-        ("MOOR-005", "Mooring rope end-for-end / retirement records", ["end-for-end", "end for end", "retirement", "discard", "line management"], "Confirm end-for-end, retirement/discard and inspection records are updated and match HVPQ/company records."),
-    ]
-    hv_full = normalize_text(hvpq.get("_full_text", "")).lower()
-    for cid, label, kws, action in mooring_checks:
-        found = any(k.lower() in hv_full for k in kws)
-        if found:
-            out.append(Finding(cid, "Mooring", label, "INFO", "MEDIUM", hvpq_value=snippet(hvpq, "mooring_block"), reason=f"Related mooring keywords detected. Dates extracted near mooring block: {', '.join(fmt_date(x) for x in moor_dates[:5]) or 'None'}.", recommended_action=action, manual_verification_required="Yes"))
-        else:
-            out.append(Finding(cid, "Mooring", label, "MANUAL CHECK", "MEDIUM", hvpq_value="Keyword not clearly detected", reason="This is a recurring HVPQ observation area but reliable value extraction was not achieved.", recommended_action=action, manual_verification_required="Yes"))
-
-    # 3. Piping pressure tests and pollution-prevention declarations.
-    for cid, label, block_key, action in [
-        ("PIPE-001", "Cargo/bunker piping pressure test declaration", "piping_pressure_block", "Confirm cargo and bunker piping hydrostatic pressure test interval, latest test date/pressure and supporting records."),
-        ("POLL-001", "Overboard discharge / sea chest / scupper declaration", "pollution_block", "Confirm sea chest wording, overboard discharge blanks/testing arrangement and scupper/spill containment declarations against physical arrangement and records."),
-        ("FIRE-001", "Foam / fixed firefighting declaration", "fire_foam_block", "Confirm foam type, last foam analysis date and fixed firefighting systems against certificates and onboard arrangement."),
-        ("LIFT-001", "Lifting gear / crane declaration", "lifting_block", "Confirm crane/lifting gear SWL, annual/five-year test dates and certificates against HVPQ."),
-        ("DIAG-001", "Mooring/manifold/fairlead/chock/bitt diagrams", "diagram_block", "Confirm diagrams are uploaded/available, current and consistent with HVPQ dimensions/equipment."),
-    ]:
-        if has_text(hvpq, block_key):
-            out.append(Finding(cid, "Targeted HVPQ", label, "INFO", "MEDIUM", hvpq_value=snippet(hvpq, block_key), reason="Relevant HVPQ text detected; ship verification is still required because this is a recurring observation area.", recommended_action=action, manual_verification_required="Yes"))
-        else:
-            out.append(Finding(cid, "Targeted HVPQ", label, "MANUAL CHECK", "MEDIUM", hvpq_value="Not detected", reason="Relevant HVPQ text was not clearly detected. This may be extraction limitation or missing/blank declaration.", recommended_action=action, manual_verification_required="Yes"))
-
-    # 4. Q88 cross-reference availability for commercial/vetting data.
-    if q88:
-        out.append(Finding("Q88-001", "Q88", "Q88 uploaded for cross-check", "INFO", "INFO", reason="Q88/reference file uploaded. Generic class/certificate comparison has been run where possible.", recommended_action="Use exported register to manually verify non-date equipment particulars from Q88 against HVPQ.", manual_verification_required="Yes"))
-    else:
-        out.append(Finding("Q88-001", "Q88", "Q88 not uploaded", "INFO", "INFO", reason="Q88 cross-check skipped because no Q88/reference file was uploaded.", recommended_action="Upload Q88 when available for vessel particulars/equipment cross-check."))
-
-    return out
-
-def rule_observation_library_scan(hvpq: Dict[str, Any], piq: Dict[str, Any], obs_docs: List[TextDoc]) -> List[Finding]:
-    out: List[Finding] = []
-    if not obs_docs:
-        return out
-    hv_text = " ".join([str(v) for v in hvpq.values() if isinstance(v, str)]).lower()
-    piq_text = " ".join([str(v) for v in piq.values() if isinstance(v, str)] + piq.get("incident_blocks", [])).lower()
-
-    # Use observation files as keyword/risk library, not as direct evidence.
-    combined_obs = "\n".join(doc.full_text for doc in obs_docs)
-    categories = classify_observation_patterns(combined_obs)
-    for cat, data in categories.items():
-        keywords = data["keywords"]
-        # If the historical obs category is relevant but target docs don't contain expected keywords, flag targeted manual check.
-        hv_hit = any(k.lower() in hv_text for k in keywords)
-        piq_hit = any(k.lower() in piq_text for k in keywords)
-        if data["priority"] >= 2 and not (hv_hit or piq_hit):
-            out.append(Finding(
-                f"OBS-{cat}", "Observation Library", data["label"], "MANUAL CHECK", data["risk"],
-                reason="Historical observation pattern is high-risk, but matching target document text was not clearly detected.",
-                recommended_action=data["action"],
-                manual_verification_required="Yes",
-            ))
-    return out
+            days = (due - ref_date).days
+            if days < 0:
+                findings.append(Finding("Tank Inspection", label, "OVERDUE", "HIGH", hvpq_value=value_from(hvpq, field), piq_value=value_from(piq, field), reason=f"Oldest inspection {d}; due {due}; overdue by {abs(days)} days.", required_action="Verify tank inspection sequence and update PIQ/HVPQ if wrong.", source="PIQ/HVPQ"))
+            elif days <= tank_warning:
+                findings.append(Finding("Tank Inspection", label, "DUE SOON", "MEDIUM", hvpq_value=value_from(hvpq, field), piq_value=value_from(piq, field), reason=f"Oldest inspection {d}; due {due}; due within {days} days.", required_action="Ship to confirm next inspection plan and whether PIQ/HVPQ dates are correct.", source="PIQ/HVPQ"))
+    return findings
 
 
-def classify_observation_patterns(text: str) -> Dict[str, Dict[str, Any]]:
-    tl = text.lower()
-    patterns = {
-        "INCIDENTS": {
-            "label": "Incident non-reporting / mismatch pattern",
-            "match_words": ["incident", "injury", "blackout", "failure", "reported", "not reported"],
-            "keywords": ["incident", "injury", "failure", "blackout", "pollution", "grounding", "collision", "allision"],
-            "risk": "HIGH",
-            "priority": 3,
-            "action": "Ship to confirm PIQ/HVPQ incident declarations are complete; if no incidents are entered, provide positive confirmation.",
-        },
-        "CII": {
-            "label": "CII / EEXI / EEDI accuracy pattern",
-            "match_words": ["cii", "eexi", "eedi", "aer"],
-            "keywords": ["cii", "eexi", "eedi", "aer"],
-            "risk": "HIGH",
-            "priority": 3,
-            "action": "Verify HVPQ environmental values against latest CII/EEXI/EEDI evidence.",
-        },
-        "CLASS_CERT": {
-            "label": "Class / certificate date accuracy pattern",
-            "match_words": ["certificate", "class", "dry dock", "iws", "survey", "expiry", "issued"],
-            "keywords": ["certificate", "class", "dry dock", "iws", "survey", "expiry"],
-            "risk": "HIGH",
-            "priority": 3,
-            "action": "Verify HVPQ certificate and survey dates against latest certificates/Class Status.",
-        },
-        "PSC": {
-            "label": "PSC history accuracy pattern",
-            "match_words": ["psc", "port state", "deficien", "detention"],
-            "keywords": ["psc", "port state", "detention", "deficien"],
-            "risk": "HIGH",
-            "priority": 3,
-            "action": "Verify last three PSC entries, port, MOU, deficiencies, detention and OCIMF PSC database entry.",
-        },
-        "MOORING": {
-            "label": "Mooring / BHC / brake test pattern",
-            "match_words": ["mooring", "brake", "bhc", "split drum", "rope"],
-            "keywords": ["mooring", "brake", "bhc", "split drum", "rope"],
-            "risk": "MEDIUM",
-            "priority": 2,
-            "action": "Verify mooring winch, BHC, brake test, line data and diagrams against records.",
-        },
-        "TANKS": {
-            "label": "Tank coating / inspection pattern",
-            "match_words": ["tank", "coating", "ballast", "cargo tank", "void"],
-            "keywords": ["tank", "coating", "ballast", "cargo tank", "void"],
-            "risk": "MEDIUM",
-            "priority": 2,
-            "action": "Verify cargo/ballast/void inspection dates, coating condition and tank list completeness.",
-        },
-    }
-    found = {}
-    for key, cfg in patterns.items():
-        count = sum(tl.count(w) for w in cfg["match_words"])
-        if count > 0:
-            found[key] = cfg
-    return found
+def rule_targeted_ship_checks(hvpq: DocPack, piq: DocPack, class_doc: DocPack, q88: DocPack, obs_summary: Dict[str, Any], settings: Dict[str, Any]) -> List[Finding]:
+    findings: List[Finding] = []
+    combined_text = "\n".join([d.text for d in [hvpq, piq, class_doc, q88] if d and d.text])
+    obs_cats = set((obs_summary or {}).get("category_counts", {}).keys())
+    # Only show targeted checks if relevant docs are missing or extract confidence low. Not pass checks.
+    for area, check, keywords, action in TARGETED_CHECKS:
+        # Only if observation library indicates this area OR the document contains the area keywords.
+        relevant = area in obs_cats or any(clean_for_compare(k) in clean_for_compare(combined_text) for k in keywords)
+        if not relevant:
+            continue
+        # If no concrete mismatch already, create manual targeted check only where evidence doc isn't enough.
+        # This is intended for ship export.
+        missing_sources = []
+        if area in {"Class / Certificates", "Certificates", "Class / Survey"} and not (class_doc and class_doc.text):
+            missing_sources.append("Class Status")
+        if area in {"Mooring", "Diagrams", "Pollution / Cargo", "Lifting Gear", "Cargo / IGS"} and not (q88 and q88.text):
+            # Q88 not mandatory but useful. Avoid too much noise by lower risk.
+            pass
+        findings.append(Finding(
+            area=area,
+            check=check,
+            status="TARGETED CHECK",
+            risk="MEDIUM",
+            reason="This topic appears in the uploaded documents and/or historical observation library. It is a recurring HVPQ/PIQ observation area and should be ship-confirmed even where extraction is uncertain.",
+            required_action=action,
+            source="Observation library + uploaded docs"
+        ))
+    return dedupe_findings(findings)
 
+
+def rule_observation_library_coverage(hvpq: DocPack, piq: DocPack, class_doc: DocPack, q88: DocPack, obs_df: pd.DataFrame, obs_summary: Dict[str, Any], settings: Dict[str, Any]) -> List[Finding]:
+    findings: List[Finding] = []
+    if obs_df is None or obs_df.empty:
+        return findings
+    # Generate a concise library-driven priority note, not 213 rows of noise.
+    cat_counts = obs_summary.get("category_counts", {}) if obs_summary else {}
+    if cat_counts:
+        top = ", ".join([f"{k}({v})" for k, v in list(cat_counts.items())[:8]])
+        findings.append(Finding(
+            area="Observation Library",
+            check="Historical observation library applied",
+            status="INFO",
+            risk="INFO",
+            reason=f"Loaded {len(obs_df)} historical observations. Top risk families: {top}.",
+            required_action="Use the targeted checks tab/export as the ship-facing pre-inspection verification list.",
+            source="Observation Excel"
+        ))
+    # If high-frequency qrefs exist but not found in HVPQ text, flag as manual because it may be missing/extraction issue.
+    qcounts = count_question_refs(obs_df)
+    if not qcounts.empty and hvpq and hvpq.text:
+        for _, row in qcounts.head(20).iterrows():
+            qid = row["question_ref"]
+            if row["count"] >= int(settings.get("obs_qid_threshold", 2)):
+                if qid not in hvpq.qmap and qid not in hvpq.text:
+                    findings.append(Finding(
+                        area="Observation Library",
+                        check=f"Recurring observed HVPQ question {qid} not clearly extracted",
+                        status="MANUAL CHECK",
+                        risk="MEDIUM",
+                        reason=f"Question {qid} appears {row['count']} times in the historical observation library, but was not confidently extracted from current HVPQ PDF.",
+                        required_action=f"Verify HVPQ question {qid} manually if applicable to this vessel.",
+                        source="Observation Excel",
+                        question_ref=qid
+                    ))
+    return findings
 
 # -----------------------------
-# Export helpers
+# Output / UI helpers
 # -----------------------------
 
-def findings_to_df(findings: List[Finding]) -> pd.DataFrame:
-    rows = []
+def shorten(s: Any, n: int = 180) -> str:
+    s = normalize_text(s)
+    return s if len(s) <= n else s[:n-3] + "..."
+
+
+def dedupe_findings(findings: List[Finding]) -> List[Finding]:
+    seen = set()
+    out = []
     for f in findings:
-        d = asdict(f)
-        d["score"] = f.score
-        rows.append(d)
+        key = (f.area, f.check, f.status, f.hvpq_value, f.piq_value, f.class_value, f.q88_value)
+        if key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out
+
+
+def findings_to_df(findings: List[Finding], show_info: bool = False) -> pd.DataFrame:
+    rows = [asdict(f) for f in findings]
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    cols = [
-        "check_id", "module", "check", "status", "risk", "score", "hvpq_value", "piq_value",
-        "class_status_value", "q88_value", "reason", "recommended_action", "manual_verification_required", "source_location",
-    ]
-    return df[cols]
+    if not show_info:
+        df = df[~df["risk"].isin(["PASS", "INFO", "LOW"])]
+    df["risk_rank"] = df["risk"].map(RISK_ORDER).fillna(2)
+    df = df.sort_values(["risk_rank", "area", "check"], ascending=[False, True, True]).drop(columns=["risk_rank"])
+    return df
 
 
-def make_excel_download(df: pd.DataFrame, summary: Dict[str, Any]) -> bytes:
+def to_excel_bytes(df: pd.DataFrame, obs_df: pd.DataFrame = None, debug_fields: Dict[str, Any] = None) -> bytes:
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, sheet_name="Audit Register", index=False)
-        workbook = writer.book
-        ws = writer.sheets["Audit Register"]
-        header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1, "text_wrap": True})
-        wrap_fmt = workbook.add_format({"text_wrap": True, "valign": "top"})
-        high_fmt = workbook.add_format({"bg_color": "#F8CBAD"})
-        crit_fmt = workbook.add_format({"bg_color": "#FF9999", "bold": True})
-        pass_fmt = workbook.add_format({"bg_color": "#C6E0B4"})
-        for col, name in enumerate(df.columns):
-            ws.write(0, col, name, header_fmt)
-            width = 18
-            if name in ["reason", "recommended_action", "source_location"]:
-                width = 45
-            if name in ["hvpq_value", "piq_value", "class_status_value", "q88_value"]:
-                width = 32
-            ws.set_column(col, col, width, wrap_fmt)
-        ws.freeze_panes(1, 0)
-        ws.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
-        risk_col = df.columns.get_loc("risk")
-        ws.conditional_format(1, risk_col, len(df), risk_col, {"type": "text", "criteria": "containing", "value": "CRITICAL", "format": crit_fmt})
-        ws.conditional_format(1, risk_col, len(df), risk_col, {"type": "text", "criteria": "containing", "value": "HIGH", "format": high_fmt})
-        ws.conditional_format(1, risk_col, len(df), risk_col, {"type": "text", "criteria": "containing", "value": "PASS", "format": pass_fmt})
-
-        summary_df = pd.DataFrame(list(summary.items()), columns=["Metric", "Value"])
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        ws2 = writer.sheets["Summary"]
-        ws2.set_column(0, 0, 35)
-        ws2.set_column(1, 1, 25)
-        for col, name in enumerate(summary_df.columns):
-            ws2.write(0, col, name, header_fmt)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        if df.empty:
+            pd.DataFrame([{"Message": "No actionable findings generated."}]).to_excel(writer, index=False, sheet_name="Findings")
+        else:
+            df.to_excel(writer, index=False, sheet_name="Findings")
+        if obs_df is not None and not obs_df.empty:
+            obs_df.head(500).to_excel(writer, index=False, sheet_name="Obs Library")
+        if debug_fields:
+            rows = []
+            for doc, fields in debug_fields.items():
+                for k, v in fields.items():
+                    if k.startswith("_"):
+                        continue
+                    rows.append({"Document": doc, "Field": k, "Value": shorten(v, 500)})
+            pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="Extracted Fields")
+        # basic formatting
+        wb = writer.book
+        for ws in wb.worksheets:
+            ws.freeze_panes = "A2"
+            for col in ws.columns:
+                max_len = 10
+                col_letter = col[0].column_letter
+                for cell in col[:1000]:
+                    try:
+                        max_len = max(max_len, min(len(str(cell.value or "")), 60))
+                    except Exception:
+                        pass
+                ws.column_dimensions[col_letter].width = max_len + 2
     return output.getvalue()
 
-
-def summarize_findings(df: pd.DataFrame) -> Dict[str, Any]:
-    if df.empty:
-        return {"Total checks": 0}
-    return {
-        "Total checks": len(df),
-        "Critical": int((df["risk"] == "CRITICAL").sum()),
-        "High": int((df["risk"] == "HIGH").sum()),
-        "Medium": int((df["risk"] == "MEDIUM").sum()),
-        "Manual checks": int((df["manual_verification_required"] == "Yes").sum()),
-        "Overall risk score": int(df["score"].sum()),
-    }
-
-
 # -----------------------------
-# Streamlit UI
+# Streamlit app
 # -----------------------------
 
-def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    st.caption("Observation-driven, rule-based mismatch checks. PASS/INFO items are hidden by default so the export stays suitable for ship verification.")
+def main():
+    st.set_page_config(page_title="HVPQ / PIQ Vetting Checker", layout="wide")
+    st.title("HVPQ / PIQ Vetting Observation Checker v4")
+    st.caption("Mismatch-focused. Observation-library driven. Designed to export simple targeted checks for ship/office verification.")
 
     with st.sidebar:
         st.header("Upload documents")
-        hvpq_file = st.file_uploader("HVPQ PDF / Q88-style vessel particulars", type=["pdf", "xlsx", "xls", "csv", "docx"], key="hvpq")
-        piq_file = st.file_uploader("PIQ PDF", type=["pdf", "xlsx", "xls", "csv", "docx"], key="piq")
-        class_file = st.file_uploader("Class Status / Class survey status / certificate status", type=["pdf", "xlsx", "xls", "csv", "docx"], key="class_status")
-        q88_file = st.file_uploader("Optional Q88 / other VPQ reference", type=["pdf", "xlsx", "xls", "csv", "docx"], key="q88")
-        obs_files = st.file_uploader("Optional observation libraries", type=["xlsx", "xls", "csv", "pdf", "docx"], accept_multiple_files=True, key="obs")
-
+        hvpq_pdf = st.file_uploader("HVPQ PDF", type=["pdf"], key="hvpq_pdf")
+        hvpq_xml = st.file_uploader("HVPQ XML / response XML (optional)", type=["xml"], key="hvpq_xml")
+        ctrl_map_file = st.file_uploader("Optional XML control map (ctrl, qid, label)", type=["xlsx", "xls", "csv"], key="ctrl_map")
+        piq_pdf = st.file_uploader("PIQ PDF", type=["pdf"], key="piq_pdf")
+        class_file = st.file_uploader("Class Status / Certificate Status (PDF/XLSX/CSV/TXT)", type=["pdf", "xlsx", "xls", "csv", "txt"], key="class")
+        q88_file = st.file_uploader("Q88 / Vessel Particulars (optional)", type=["pdf", "xlsx", "xls", "csv", "txt"], key="q88")
+        st.divider()
+        obs_hvpq = st.file_uploader("HVPQ Observation Library Excel", type=["xlsx", "xls"], key="obs_hvpq")
+        obs_inc = st.file_uploader("Incident Observation Library Excel", type=["xlsx", "xls"], key="obs_inc")
+        st.divider()
         st.header("Rules")
-        ts_gap = st.number_input("Technical Superintendent max gap months", value=DEFAULT_TS_GAP_MONTHS, min_value=1.0, step=0.5)
-        ms_gap = st.number_input("Marine Superintendent max gap months", value=DEFAULT_MS_GAP_MONTHS, min_value=1.0, step=0.5)
-        cert_warning = st.number_input("Certificate expiry warning days", value=DEFAULT_CERT_WARNING_DAYS, min_value=1, step=15)
-        survey_warning = st.number_input("Survey/drydock due warning days", value=DEFAULT_SURVEY_WARNING_DAYS, min_value=1, step=30)
-        show_pass_checks = st.checkbox("Show PASS / INFO checks", value=False, help="Keep this off for ship-facing exports. Turn on only for debugging.")
-        run_btn = st.button("Run checks", type="primary")
+        tech_gap = st.number_input("Technical Superintendent max gap (months)", value=7.0, min_value=1.0, step=0.5)
+        marine_gap = st.number_input("Marine Superintendent max gap (months)", value=12.0, min_value=1.0, step=0.5)
+        due_warning = st.number_input("Survey due warning days", value=180, min_value=0, step=30)
+        cert_warning = st.number_input("Certificate expiry warning days", value=90, min_value=0, step=30)
+        tank_warning = st.number_input("Tank inspection due warning days", value=60, min_value=0, step=15)
+        show_info = st.checkbox("Show INFO / PASS / debug rows", value=False)
+        run = st.button("Run verification", type="primary")
 
-    if not run_btn:
-        st.info("Upload HVPQ and PIQ at minimum, then click **Run checks**. Class Status and Q88 are optional but recommended.")
-        st.markdown(
-            """
-            **Core logic included:**
-            - HVPQ vs PIQ mismatch checks
-            - Incident declaration checks only from HVPQ/PIQ; no JiBe incident list required
-            - If no incidents are entered, the app flags a positive confirmation requirement
-            - Class Status cross-check using generic extraction because class society formats differ
-            - Optional Q88 reference comparison
-            - Exportable ship-verification register
-            """
-        )
+    if not run:
+        st.info("Upload HVPQ + PIQ and optionally Class Status/Q88/observation files, then run verification.")
+        st.markdown("""
+        **Important design point:** this app does not try to certify the whole HVPQ. It finds likely mismatches and creates ship-facing targeted verification items based on historical observation patterns.
+        """)
         return
 
-    if not hvpq_file or not piq_file:
-        st.error("Please upload at least HVPQ and PIQ.")
-        return
+    settings = {
+        "tech_gap_months": tech_gap,
+        "marine_gap_months": marine_gap,
+        "due_warning_days": due_warning,
+        "cert_warning_days": cert_warning,
+        "tank_warning_days": tank_warning,
+        "tank_frequency_months": 12,
+        "obs_qid_threshold": 2,
+    }
 
-    with st.spinner("Reading files and running rules..."):
-        hvpq_doc = read_uploaded_file(hvpq_file.name, hvpq_file.getvalue())
-        piq_doc = read_uploaded_file(piq_file.name, piq_file.getvalue())
-        class_doc = read_uploaded_file(class_file.name, class_file.getvalue()) if class_file else None
-        q88_doc = read_uploaded_file(q88_file.name, q88_file.getvalue()) if q88_file else None
-        obs_docs = [read_uploaded_file(f.name, f.getvalue()) for f in obs_files] if obs_files else []
+    # Optional control map for XML
+    ctrl_map = None
+    if ctrl_map_file:
+        try:
+            b = ctrl_map_file.getvalue()
+            if ctrl_map_file.name.lower().endswith(".csv"):
+                ctrl_map = pd.read_csv(io.BytesIO(b), dtype=str)
+            else:
+                ctrl_map = pd.read_excel(io.BytesIO(b), dtype=str)
+        except Exception as e:
+            st.warning(f"Could not read control map: {e}")
 
-        hvpq = extract_hvpq_fields(hvpq_doc)
-        piq = extract_piq_fields(piq_doc)
-        class_status = extract_reference_fields(class_doc, "Class Status") if class_doc else {}
-        q88 = extract_reference_fields(q88_doc, "Q88") if q88_doc else {}
-        settings = {
-            "ts_gap_months": ts_gap,
-            "ms_gap_months": ms_gap,
-            "cert_warning_days": cert_warning,
-            "survey_warning_days": survey_warning,
-        }
-        findings = run_all_rules(hvpq, piq, class_status, q88, settings, obs_docs)
-        df_all = findings_to_df(findings)
-        show_pass = False
-        df = action_required_df(df_all, show_pass=show_pass_checks)
-        summary = summarize_findings(df)
+    with st.spinner("Extracting documents..."):
+        hvpq = read_any_upload(hvpq_pdf, "HVPQ") if hvpq_pdf else DocPack("", "HVPQ")
+        piq = read_any_upload(piq_pdf, "PIQ") if piq_pdf else DocPack("", "PIQ")
+        class_doc = read_any_upload(class_file, "Class Status") if class_file else DocPack("", "Class Status")
+        q88 = read_any_upload(q88_file, "Q88") if q88_file else DocPack("", "Q88")
+        xml_doc = DocPack("", "HVPQ XML")
+        if hvpq_xml:
+            fields, meta = parse_hvpq_xml(hvpq_xml.getvalue(), ctrl_map)
+            xml_doc = DocPack(hvpq_xml.name, "HVPQ XML", xml_to_searchable_text(fields, meta), fields, meta=meta)
+        obs_frames = []
+        obs_summaries = []
+        for u in [obs_hvpq, obs_inc]:
+            df, summ = parse_observation_workbook(u)
+            if not df.empty:
+                df["library_file"] = u.name
+                obs_frames.append(df)
+                obs_summaries.append(summ)
+        obs_df = pd.concat(obs_frames, ignore_index=True) if obs_frames else pd.DataFrame()
+        obs_summary = merge_obs_summaries(obs_df)
 
-    st.subheader("Dashboard")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Total", summary.get("Total checks", 0))
-    c2.metric("Critical", summary.get("Critical", 0))
-    c3.metric("High", summary.get("High", 0))
-    c4.metric("Medium", summary.get("Medium", 0))
-    c5.metric("Manual", summary.get("Manual checks", 0))
-    c6.metric("Score", summary.get("Overall risk score", 0))
+    with st.spinner("Running rules..."):
+        findings = run_rules(hvpq, piq, class_doc, q88, xml_doc, obs_df, obs_summary, settings)
+        df = findings_to_df(findings, show_info=show_info)
 
-    st.subheader("Extracted identity")
-    id_df = pd.DataFrame([
-        {"Document": "HVPQ", "Name": hvpq.get("vessel_name", ""), "IMO": hvpq.get("imo", ""), "Date": fmt_date(hvpq.get("doc_date"))},
-        {"Document": "PIQ", "Name": piq.get("vessel_name", ""), "IMO": "", "Date": fmt_date(piq.get("doc_date"))},
-    ])
-    st.dataframe(id_df, use_container_width=True, hide_index=True)
-
-    st.subheader("Audit register")
-    if df.empty:
-        st.success("No actionable mismatch/manual-check items were generated under the current filters.")
-        view_df = df
+    # Dashboard
+    c1, c2, c3, c4, c5 = st.columns(5)
+    if not df.empty:
+        c1.metric("Actionable rows", len(df))
+        c2.metric("Critical", int((df["risk"] == "CRITICAL").sum()))
+        c3.metric("High", int((df["risk"] == "HIGH").sum()))
+        c4.metric("Medium", int((df["risk"] == "MEDIUM").sum()))
+        c5.metric("Manual/Targeted", int(df["status"].isin(["MANUAL CHECK", "TARGETED CHECK"]).sum()))
     else:
-        risk_filter = st.multiselect("Filter risk", sorted(df["risk"].unique().tolist()), default=sorted(df["risk"].unique().tolist()))
-        view_df = df[df["risk"].isin(risk_filter)] if risk_filter else df
-        st.dataframe(view_df, use_container_width=True, hide_index=True)
+        c1.metric("Actionable rows", 0)
 
-    excel_bytes = make_excel_download(df, summary)
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download Excel audit register", excel_bytes, file_name="hvpq_piq_audit_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.download_button("Download CSV audit register", csv_bytes, file_name="hvpq_piq_audit_register.csv", mime="text/csv")
+    tabs = st.tabs(["Findings", "Targeted ship checklist", "Observation library", "Extracted fields", "XML diagnostic"])
+    with tabs[0]:
+        st.subheader("Actionable mismatch / manual-check register")
+        if df.empty:
+            st.success("No actionable findings generated from the extracted data. This does not mean the HVPQ is fully verified; use targeted checks if required.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            excel = to_excel_bytes(df, obs_df, debug_fields={
+                "HVPQ": hvpq.fields, "PIQ": piq.fields, "Class": class_doc.fields, "Q88": q88.fields, "XML": xml_doc.fields
+            })
+            st.download_button("Download Excel register", excel, file_name="hvpq_piq_verification_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("Download CSV register", df.to_csv(index=False).encode("utf-8"), file_name="hvpq_piq_verification_register.csv", mime="text/csv")
+    with tabs[1]:
+        ship_df = df[df["status"].isin(["TARGETED CHECK", "MANUAL CHECK", "MISMATCH", "NON-COMPLIANT", "OVERDUE", "DUE SOON"])] if not df.empty else df
+        st.subheader("Ship-facing targeted checks")
+        st.caption("This is the simplified list you can export/send to vessel. It intentionally avoids PASS rows.")
+        st.dataframe(ship_df[[c for c in ["area","check","risk","hvpq_value","piq_value","class_value","q88_value","reason","required_action","question_ref"] if c in ship_df.columns]], use_container_width=True, hide_index=True)
+    with tabs[2]:
+        st.subheader("Observation library analysis")
+        if obs_df.empty:
+            st.warning("No observation library loaded. Upload your HVPQ/Incident observation Excel files for better targeted checks.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("Category counts")
+                st.dataframe(pd.DataFrame([{"category": k, "count": v} for k, v in obs_summary.get("category_counts", {}).items()]), hide_index=True)
+            with col2:
+                st.write("Top question references")
+                st.dataframe(pd.DataFrame(obs_summary.get("top_question_refs", [])), hide_index=True)
+            st.write("Observation rows")
+            st.dataframe(obs_df, use_container_width=True, hide_index=True)
+    with tabs[3]:
+        st.subheader("Extracted fields / debug")
+        for name, doc in [("HVPQ", hvpq), ("PIQ", piq), ("Class", class_doc), ("Q88", q88), ("XML", xml_doc)]:
+            with st.expander(name, expanded=False):
+                if doc and doc.fields:
+                    st.json({k: shorten(v, 500) for k, v in doc.fields.items() if not k.startswith("_")})
+                else:
+                    st.write("No fields extracted.")
+                st.caption(f"Text length: {len(doc.text) if doc else 0}")
+    with tabs[4]:
+        st.subheader("XML / JSON guidance")
+        if xml_doc and xml_doc.meta:
+            st.json(xml_doc.meta)
+        st.markdown("""
+        **Best input hierarchy for HVPQ accuracy:**
+        1. JSON/Excel export with `question id + question text + answer` — best.
+        2. OCIMF XML response **plus** control map `ctrl -> qid/label` — very good.
+        3. HVPQ PDF only — workable, but extraction can be noisy because tables split across lines.
+        
+        The response XML alone helps with vessel identity and raw answer values, but the control GUIDs are not useful for question-level validation unless mapped to the HVPQ template.
+        """)
 
-    with st.expander("Raw extracted fields - HVPQ"):
-        st.json({k: (fmt_date(v) if isinstance(v, date) else str(v)[:500]) for k, v in hvpq.items() if k != "certificates"})
-    with st.expander("Raw extracted fields - PIQ"):
-        st.json({k: (", ".join(fmt_date(d) for d in v) if isinstance(v, list) and all(isinstance(x, date) for x in v) else str(v)[:500]) for k, v in piq.items()})
-    with st.expander("Important limitation"):
-        st.write(
-            "Class status documents vary by classification society and layout. The app therefore uses generic date/keyword proximity extraction and deliberately marks uncertain items as manual checks. For high accuracy, future versions should add class-specific parsers for NK, LR, DNV, ABS, BV, KR, RINA, CCS, etc."
-        )
+
+def merge_obs_summaries(obs_df: pd.DataFrame) -> Dict[str, Any]:
+    if obs_df is None or obs_df.empty:
+        return {}
+    return {
+        "count": int(len(obs_df)),
+        "category_counts": obs_df["category"].value_counts().to_dict(),
+        "top_question_refs": count_question_refs(obs_df).head(30).to_dict("records"),
+    }
 
 
 if __name__ == "__main__":
