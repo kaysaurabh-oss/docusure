@@ -225,13 +225,104 @@ def lower(s: str) -> str:
     return normalize_text(s).lower()
 
 
+def canonicalize_vessel_name(name: str) -> str:
+    """Clean extracted ship names without being over-strict.
+    HVPQ/Q88/Class extracts often add IMO, vessel type (LR2/MR/VLCC) or headings.
+    We keep only meaningful name tokens for loose matching.
+    """
+    n = normalize_text(name).upper()
+    n = re.sub(r"\b(?:IMO|LR\/IMO|IMO\/LR|NUMBER|NO\.?|ID)\b[:\s-]*\d*", " ", n)
+    n = re.sub(r"\b\d{7}\b", " ", n)
+    n = re.sub(r"\b(?:HVPQ|PIQ|Q88|VPQ|VESSEL|PARTICULARS|QUESTIONNAIRE|FOR|REPORT)\b", " ", n)
+    # Size/type tokens sometimes get attached to Q88/HVPQ names. They should not create a mismatch.
+    n = re.sub(r"\b(?:LR1|LR2|MR|VLCC|ULCC|AFRAMAX|SUEZMAX|PANAMAX|HANDY|PRODUCT|CHEMICAL|TANKER|CARRIER|OIL)\b", " ", n)
+    n = re.sub(r"[^A-Z0-9 ]+", " ", n)
+    return normalize_text(n)
+
+
+def vessel_names_materially_different(a: str, b: str) -> tuple[bool, int, str]:
+    ca, cb = canonicalize_vessel_name(a), canonicalize_vessel_name(b)
+    if not ca or not cb:
+        return False, 0, f"Could not clean one or both names: '{a}' / '{b}'."
+    set_a = {t for t in ca.split() if len(t) > 2}
+    set_b = {t for t in cb.split() if len(t) > 2}
+    common = set_a & set_b
+    score = max(fuzz.token_sort_ratio(ca, cb), fuzz.token_set_ratio(ca, cb))
+    # Loose acceptance: if at least the key vessel-name tokens overlap, don't flag.
+    if score >= 72 or (len(common) >= 2 and len(common) >= min(len(set_a), len(set_b)) - 1):
+        return False, score, f"Loose name match accepted: '{ca}' vs '{cb}'."
+    return True, score, f"Material vessel-name discrepancy: '{ca}' vs '{cb}'."
+
+
+def clean_vessel_display_name(name: str) -> str:
+    c = canonicalize_vessel_name(name)
+    # Preserve readable title case but remove extra type suffixes/noise.
+    return c.title() if c else normalize_text(name)
+
+
+def semantic_normalize_value(value: str) -> str:
+    """Normalize operational wording so broad equivalence does not become a false mismatch."""
+    v = lower(value)
+    replacements = {
+        "products": "product",
+        "product carrier": "product tanker",
+        "chemical tanker": "chemical",
+        "products/chemical tanker": "product chemical tanker",
+        "products chemical tanker": "product chemical tanker",
+        "not applicable": "na",
+        "n/a": "na",
+        "nil": "no",
+        "none": "no",
+    }
+    for k, r in replacements.items():
+        v = v.replace(k, r)
+    v = re.sub(r"[^a-z0-9 ]+", " ", v)
+    return normalize_text(v)
+
+
+def broadly_similar(a: str, b: str, threshold: int = 70) -> bool:
+    aa, bb = semantic_normalize_value(a), semantic_normalize_value(b)
+    if not aa or not bb:
+        return False
+    if aa in bb or bb in aa:
+        return True
+    return max(fuzz.token_set_ratio(aa, bb), fuzz.partial_ratio(aa, bb)) >= threshold
+
+
+def vessel_type_broadly_compatible(a: str, b: str) -> bool:
+    aa, bb = semantic_normalize_value(a), semantic_normalize_value(b)
+    if not aa or not bb:
+        return False
+    # Product Carrier / Product Tanker / Products-Chemical Tanker are broadly compatible for this pre-check.
+    if ("product" in aa and "product" in bb) and any(x in aa + " " + bb for x in ["tanker", "carrier", "chemical"]):
+        return True
+    if ("chemical" in aa and "chemical" in bb):
+        return True
+    if ("oil" in aa and "oil" in bb and ("tanker" in aa or "tanker" in bb)):
+        return True
+    return broadly_similar(aa, bb, threshold=62)
+
+
+def action_required_df(df: pd.DataFrame, show_pass: bool = False) -> pd.DataFrame:
+    """Return only useful ship-check items unless the user explicitly asks to see PASS/INFO."""
+    if df.empty or show_pass:
+        return df
+    return df[~df["risk"].isin(["PASS", "INFO", "LOW"])].reset_index(drop=True)
+
+
 def parse_date_safe(s: str) -> Optional[date]:
     if not s:
         return None
-    s = s.strip().replace("Sept", "Sep")
+    raw = s.strip()
+    # Avoid converting question numbers / clause references (e.g. 2.2.1002, Q1.11) into false dates.
+    if re.search(r"(?:^|\b)[Qq]\s*\d+(?:\.\d+)+", raw):
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+){1,3}", raw):
+        return None
+    raw = raw.replace("Sept", "Sep")
     try:
-        dt = dateparser.parse(s, dayfirst=True, fuzzy=True)
-        if dt:
+        dt = dateparser.parse(raw, dayfirst=True, fuzzy=True)
+        if dt and 1990 <= dt.year <= 2100:
             return dt.date()
     except Exception:
         return None
@@ -253,12 +344,28 @@ def month_gap_days(start: date, end: date, max_months: float) -> Tuple[bool, int
 
 
 def find_line_after_keywords(text: str, keywords: Iterable[str], window_chars: int = 240) -> str:
+    """Find a block near any keyword.
+    Uses exact normalized match first, then fuzzy line matching for class/Q88 formats where labels vary.
+    """
+    if not text:
+        return ""
     t = normalize_text(text)
     tl = t.lower()
     for kw in keywords:
-        idx = tl.find(kw.lower())
+        idx = tl.find(normalize_text(kw).lower())
         if idx >= 0:
             return t[idx : idx + window_chars]
+
+    # Fuzzy fallback: scan source lines. This handles labels like
+    # 'Last Annual Survey Date', 'Annual Survey carried out', etc.
+    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
+    lowered_labels = [lower(k) for k in keywords]
+    for i, line in enumerate(lines):
+        ll = lower(line)
+        score = max((fuzz.token_set_ratio(ll, kw) for kw in lowered_labels), default=0)
+        if score >= 84:
+            block = " ".join(lines[i : min(i + 8, len(lines))])
+            return block[:window_chars]
     return ""
 
 
@@ -280,16 +387,38 @@ def find_yes_no_near(text: str, keywords: Iterable[str], window_chars: int = 280
 
 
 def extract_value_after_label(text: str, labels: Iterable[str], max_chars: int = 120) -> Tuple[str, str]:
+    """Extract a value after a label, with fuzzy fallback for slightly different document wording."""
     t = normalize_text(text)
     tl = t.lower()
     for label in labels:
-        idx = tl.find(label.lower())
+        idx = tl.find(normalize_text(label).lower())
         if idx >= 0:
             snippet = t[idx : idx + max_chars]
             tail = t[idx + len(label) : idx + max_chars]
-            # Stop at likely next numbered question if present.
             tail = re.split(r"\s\d+\.\d+(?:\.\d+)?\s", tail)[0]
             return snippet, normalize_text(tail)
+
+    # Fuzzy line fallback: if a line strongly resembles the label, take the text
+    # after the label-like part; if empty, take the next line.
+    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
+    lab_norm = [lower(x) for x in labels]
+    for i, line in enumerate(lines):
+        ll = lower(line)
+        score = max((fuzz.token_set_ratio(ll, lab) for lab in lab_norm), default=0)
+        if score >= 88:
+            value = ""
+            # Try splitting by common delimiters first.
+            if ":" in line:
+                value = line.split(":", 1)[1]
+            elif len(line.split()) > 3:
+                # Remove the longest matching label words from the front only loosely.
+                value = line
+                for lab in labels:
+                    value = re.sub(re.escape(lab), "", value, flags=re.I).strip()
+            if not value and i + 1 < len(lines):
+                value = lines[i + 1]
+            snippet = " ".join(lines[i : min(i + 4, len(lines))])[:max_chars]
+            return snippet, normalize_text(value)[:max_chars]
     return "", ""
 
 
@@ -315,20 +444,41 @@ def extract_hvpq_fields(doc: Optional[TextDoc]) -> Dict[str, Any]:
     text = doc.full_text
     fields: Dict[str, Any] = {"doc_name": doc.name, "_full_text": text}
 
-    # Identity
-    _, fields["vessel_name"] = extract_value_after_label(text, ["Name of ship", "Vessel Particulars Questionnaire for"], 90)
-    if "Vessel Particulars Questionnaire for" in text and not fields.get("vessel_name"):
-        m = re.search(r"Vessel Particulars Questionnaire for\s+(.+?)\s+IMO", text, flags=re.I)
-        if m:
-            fields["vessel_name"] = normalize_text(m.group(1))
+    # Identity - use line-based document-specific patterns before generic label extraction.
+    fields["vessel_name"] = ""
+    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
+    for line in lines[:80]:
+        if "Vessel Particulars Questionnaire for" in line:
+            raw = re.sub(r".*Vessel Particulars Questionnaire for", "", line, flags=re.I)
+            fields["vessel_name"] = clean_vessel_display_name(raw)
+            break
+    if not fields["vessel_name"]:
+        ntext = normalize_text(text)
+        m_name = re.search(r"Name of ship\s+(.+?)\s+\d+\s+(?:LR/IMO|IMO)", ntext, flags=re.I)
+        if m_name:
+            fields["vessel_name"] = clean_vessel_display_name(m_name.group(1))
+        else:
+            _, raw_name = extract_value_after_label(text, ["Name of ship"], 90)
+            fields["vessel_name"] = clean_vessel_display_name(raw_name)
     m = re.search(r"(?:IMO/LR Number|LR/IMO number|IMO:)\s*(\d{7})", text, flags=re.I)
     fields["imo"] = m.group(1) if m else ""
     _, doc_date = find_first_date_near(text, ["Date this HVPQ document completed", "Harmonised Vessel Particulars Questionnaire"])
     fields["doc_date"] = doc_date
 
-    # Vessel type
-    _, fields["ship_type"] = extract_value_after_label(text, ["What is the type of ship", "Type of ship"], 160)
-    _, fields["ship_type_other"] = extract_value_after_label(text, ["If other, then specify"], 120)
+    # Vessel type - extract answers, not the whole question text.
+    ntext = normalize_text(text)
+    fields["ship_type"] = ""
+    fields["ship_type_other"] = ""
+    m_ship_type = re.search(r"1\.1\.8\s+What is the type of ship.*?\?\s+([^?]+?)\s+1\.1\.9", ntext, flags=re.I)
+    if m_ship_type:
+        fields["ship_type"] = normalize_text(m_ship_type.group(1))
+    m_ship_other = re.search(r"1\.1\.9\s+If other, then specify\s+(.+?)\s+1\.1\.10", ntext, flags=re.I)
+    if m_ship_other:
+        fields["ship_type_other"] = normalize_text(m_ship_other.group(1))
+    if not fields["ship_type"]:
+        _, fields["ship_type"] = extract_value_after_label(text, ["What is the type of ship", "Type of ship"], 160)
+    if not fields["ship_type_other"]:
+        _, fields["ship_type_other"] = extract_value_after_label(text, ["If other, then specify"], 120)
 
     # Environmental
     for key, labels in {
@@ -374,13 +524,14 @@ def extract_hvpq_fields(doc: Optional[TextDoc]) -> Dict[str, Any]:
 
     # Targeted high-observation areas: generic snippets/dates from HVPQ.
     targeted_keywords = {
-        "mooring_block": ["mooring", "brake test", "brake holding", "BHC", "rendering load", "split drum", "rope", "tail", "end-for-end"],
-        "tank_block": ["cargo tank coating", "ballast tank coating", "void", "coating inspection", "Frequency of Inspections"],
-        "piping_pressure_block": ["cargo piping pressure tests", "bunker piping pressure tests", "hydrostatically pressure test"],
-        "pollution_block": ["overboard discharges", "sea valves", "seachest", "scupper", "spill containment"],
-        "fire_foam_block": ["fixed foam", "foam", "Test Analysis Certificate", "firefighting system"],
-        "lifting_block": ["crane", "lifting", "SWL", "annual test", "five year"],
-        "diagram_block": ["mooring arrangement", "manifold arrangement", "fairlead", "chock", "bitt diagram", "bow mooring"],
+        # Use section-specific labels first to avoid grabbing publication titles such as 'OCIMF Mooring Equipment Guidelines'.
+        "mooring_block": ["Mooring Winches and Brake Testing", "Details of winches and brake testing", "10.1.4", "Provide details for Mooring Ropes", "10.1.7"],
+        "tank_block": ["7.1.1 Cargo tank coating", "7.1.3 Ballast tank coating", "cargo tank coating", "ballast tank coating", "Frequency of Inspections"],
+        "piping_pressure_block": ["6.1.13 Cargo piping pressure tests", "6.1.14 Bunker piping pressure tests", "hydrostatically pressure test"],
+        "pollution_block": ["6.1.10", "overboard discharges", "sea valves", "seachest", "scupper", "spill containment"],
+        "fire_foam_block": ["5.3.1 Fixed foam firefighting", "fixed foam", "Test Analysis Certificate", "firefighting system"],
+        "lifting_block": ["10.9.1", "Provide details of derricks", "last annual test last 5Yr Test", "lifting equipment"],
+        "diagram_block": ["10.2.1", "10.7.1", "10.8.1", "mooring arrangement diagram", "Manifold Arrangement Diagram"],
     }
     for k, kws in targeted_keywords.items():
         fields[k] = find_line_after_keywords(text, kws, 1800)
@@ -393,9 +544,31 @@ def extract_piq_fields(doc: Optional[TextDoc]) -> Dict[str, Any]:
         return {}
     text = doc.full_text
     fields: Dict[str, Any] = {"doc_name": doc.name, "_full_text": text}
-    _, fields["vessel_name"] = extract_value_after_label(text, ["Vessel Name"], 90)
-    snippet, fields["doc_date"] = find_first_date_near(text, ["Date"])
-    _, fields["vessel_type"] = extract_value_after_label(text, ["Vessel Type"], 160)
+    # PIQ front page is usually: PIQ Report / VESSEL NAME / Vessel Name / Date / date.
+    lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
+    fields["vessel_name"] = ""
+    for i, line in enumerate(lines[:12]):
+        if lower(line) == "piq report" and i + 1 < len(lines):
+            fields["vessel_name"] = clean_vessel_display_name(lines[i + 1])
+            break
+    if not fields["vessel_name"]:
+        _, raw_name = extract_value_after_label(text, ["Vessel Name"], 90)
+        fields["vessel_name"] = clean_vessel_display_name(raw_name)
+    snippet, fields["doc_date"] = find_first_date_near(text, ["Date"] )
+    fields["vessel_type"] = ""
+    for i, line in enumerate(lines[:80]):
+        if lower(line) == "vessel type":
+            for cand in lines[i+1:i+6]:
+                if re.fullmatch(r"\d+(?:\.\d+)*\.?", cand):
+                    continue
+                if lower(cand) == "vessel type":
+                    continue
+                fields["vessel_type"] = normalize_text(cand)
+                break
+            if fields["vessel_type"]:
+                break
+    if not fields["vessel_type"]:
+        _, fields["vessel_type"] = extract_value_after_label(text, ["Vessel Type"], 160)
 
     # Superintendent visits - extract dates near the block.
     fields["technical_superintendent_dates"] = extract_dates_from_block(
@@ -416,12 +589,17 @@ def extract_piq_fields(doc: Optional[TextDoc]) -> Dict[str, Any]:
     fields["psc_block"] = find_line_after_keywords(text, ["last three Port State Control", "PSC inspection"], 1200)
 
     # Tank inspections
-    for key, labels in {
-        "cargo_tank_oldest_inspection": ["oldest inspection report for all cargo and slop tanks"],
-        "ballast_tank_oldest_inspection": ["oldest inspection report for all ballast tanks"],
-        "void_space_oldest_inspection": ["oldest inspection report for all void space", "void spaces"],
-    }.items():
-        snippet, d = find_first_date_near(text, labels)
+    tank_label_map = {
+        "cargo_tank_oldest_inspection": "oldest inspection report for all cargo and slop tanks",
+        "ballast_tank_oldest_inspection": "oldest inspection report for all ballast tanks",
+        "void_space_oldest_inspection": "oldest inspection report for all void spaces",
+    }
+    for key, label in tank_label_map.items():
+        # PIQ PDF text order often places the answer date immediately before the printed question.
+        d = extract_last_date_before_label(text, label, lookback_chars=260)
+        snippet = find_line_after_keywords(text, [label], 320)
+        if not d:
+            snippet, d = find_first_date_near(text, [label])
         fields[key] = d
         fields[key + "_snippet"] = snippet
 
@@ -482,6 +660,20 @@ def extract_dates_from_block(text: str, keywords: Iterable[str], max_dates: int 
         if len(dates) >= max_dates:
             break
     return dates
+
+
+def extract_last_date_before_label(text: str, label: str, lookback_chars: int = 260) -> Optional[date]:
+    n = normalize_text(text)
+    idx = n.lower().find(label.lower())
+    if idx < 0:
+        return None
+    block = n[max(0, idx - lookback_chars):idx]
+    dates = []
+    for m in DATE_RE.finditer(block):
+        d = parse_date_safe(m.group(0))
+        if d:
+            dates.append(d)
+    return dates[-1] if dates else None
 
 
 def collect_keyword_blocks(text: str, keywords: Iterable[str], max_blocks: int = 20, window_chars: int = 260) -> List[str]:
@@ -554,26 +746,37 @@ def run_all_rules(
 
 
 def rule_identity(hvpq: Dict[str, Any], piq: Dict[str, Any]) -> List[Finding]:
-    out = []
+    # Identity is only a guardrail. Do not clutter the ship register with successful identity checks.
+    # It should flag only a material discrepancy, not harmless suffixes like LR2 / product tanker.
+    out: List[Finding] = []
     hv_name = normalize_text(hvpq.get("vessel_name", ""))
     piq_name = normalize_text(piq.get("vessel_name", ""))
     if hv_name and piq_name:
-        score = fuzz.token_sort_ratio(hv_name, piq_name)
-        if score >= 90:
-            out.append(Finding("ID-001", "Identity", "Vessel name HVPQ vs PIQ", "PASS", "PASS", hv_name, piq_name, reason="Vessel names appear to match."))
-        else:
-            out.append(Finding("ID-001", "Identity", "Vessel name HVPQ vs PIQ", "FAIL", "CRITICAL", hv_name, piq_name, reason="Vessel names do not match.", recommended_action="Confirm correct HVPQ/PIQ documents have been uploaded."))
-    else:
-        out.append(Finding("ID-001", "Identity", "Vessel name HVPQ vs PIQ", "MANUAL CHECK", "HIGH", hv_name, piq_name, reason="Vessel name could not be extracted from one or both documents.", recommended_action="Manually verify document identity."))
+        different, score, reason = vessel_names_materially_different(hv_name, piq_name)
+        if different:
+            out.append(Finding(
+                "ID-001", "Identity", "Vessel name material mismatch", "FAIL", "CRITICAL",
+                hv_name, piq_name, reason=f"{reason} Match score {score}.",
+                recommended_action="Confirm correct HVPQ/PIQ documents have been uploaded."
+            ))
+    elif hv_name or piq_name:
+        out.append(Finding(
+            "ID-001", "Identity", "Vessel name extraction incomplete", "MANUAL CHECK", "MEDIUM",
+            hv_name, piq_name, reason="Vessel name could not be extracted from one document. This is not treated as a mismatch.",
+            recommended_action="Confirm both documents belong to the same vessel."
+        ))
 
     hv_date = hvpq.get("doc_date")
     piq_date = piq.get("doc_date")
     if hv_date and piq_date:
         delta = abs((hv_date - piq_date).days)
-        risk = "PASS" if delta <= 7 else "WARNING"
-        out.append(Finding("ID-002", "Identity", "Document date alignment", "PASS" if delta <= 7 else "WARNING", risk, fmt_date(hv_date), fmt_date(piq_date), reason=f"HVPQ/PIQ document date difference is {delta} days."))
-    else:
-        out.append(Finding("ID-002", "Identity", "Document date alignment", "MANUAL CHECK", "LOW", fmt_date(hv_date), fmt_date(piq_date), reason="Could not extract one or both document dates."))
+        if delta > 30:
+            out.append(Finding(
+                "ID-002", "Identity", "Document date gap", "WARNING", "MEDIUM",
+                fmt_date(hv_date), fmt_date(piq_date),
+                reason=f"HVPQ/PIQ document date difference is {delta} days. This may still be acceptable, but check latest version control.",
+                recommended_action="Confirm that the latest HVPQ and PIQ versions are being compared."
+            ))
     return out
 
 
@@ -582,10 +785,11 @@ def rule_piq_vs_hvpq_general(hvpq: Dict[str, Any], piq: Dict[str, Any]) -> List[
     hv_type = " ".join([normalize_text(hvpq.get("ship_type", "")), normalize_text(hvpq.get("ship_type_other", ""))]).strip()
     piq_type = normalize_text(piq.get("vessel_type", ""))
     if hv_type or piq_type:
-        if hv_type and piq_type and fuzz.partial_ratio(hv_type.lower(), piq_type.lower()) >= 65:
-            out.append(Finding("GEN-001", "PIQ vs HVPQ", "Vessel type consistency", "PASS", "PASS", hv_type, piq_type, reason="Vessel type broadly aligns."))
+        if hv_type and piq_type and vessel_type_broadly_compatible(hv_type, piq_type):
+            # Broadly aligned. Do not show pass item in the action register.
+            pass
         else:
-            out.append(Finding("GEN-001", "PIQ vs HVPQ", "Vessel type consistency", "MANUAL CHECK", "MEDIUM", hv_type, piq_type, reason="Vessel type wording differs or could not be matched. Product Carrier vs Products/Chemical Tanker may be acceptable but should be confirmed against IOPP/CoF/Annex II carriage.", recommended_action="Ask vessel/office to confirm correct vessel type wording and Annex II carriage intention."))
+            out.append(Finding("GEN-001", "PIQ vs HVPQ", "Vessel type consistency", "MANUAL CHECK", "MEDIUM", hv_type, piq_type, reason="Vessel type wording differs materially or could not be matched. Product Carrier vs Products/Chemical Tanker may be acceptable only when consistent with IOPP/CoF/Annex II carriage.", recommended_action="Ask vessel/office to confirm correct vessel type wording and Annex II carriage intention."))
 
     # Tank inspection dates in PIQ against HVPQ tank coating text presence.
     for key, label in [
@@ -733,10 +937,14 @@ def rule_survey_and_certificate_due(hvpq: Dict[str, Any], settings: Dict[str, An
     certs = hvpq.get("certificates", {})
     for cert, info in certs.items():
         dates = info.get("dates", [])
-        if len(dates) < 2:
+        # Be conservative: some rows such as Minimum Safe Manning have only an issue date and the
+        # next row's dates may be accidentally captured as false expiry dates.
+        if len(dates) < 2 or "minimum safe manning" in cert.lower():
             continue
-        # For certificate lines, expiry is often second date; this is generic and should be manually verified.
+        # For certificate lines, expiry is often second date; this remains generic. Ignore impossible ordering.
         expiry = dates[1]
+        if dates[0] and expiry <= dates[0]:
+            continue
         days = (expiry - ref_date).days
         if days < 0:
             risk, status = "CRITICAL", "FAIL"
@@ -1060,7 +1268,6 @@ def summarize_findings(df: pd.DataFrame) -> Dict[str, Any]:
         "High": int((df["risk"] == "HIGH").sum()),
         "Medium": int((df["risk"] == "MEDIUM").sum()),
         "Manual checks": int((df["manual_verification_required"] == "Yes").sum()),
-        "Pass": int((df["risk"] == "PASS").sum()),
         "Overall risk score": int(df["score"].sum()),
     }
 
@@ -1072,7 +1279,7 @@ def summarize_findings(df: pd.DataFrame) -> Dict[str, Any]:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Observation-driven, rule-based checks. Output is a targeted ship-verification register, not an automatic certification.")
+    st.caption("Observation-driven, rule-based mismatch checks. PASS/INFO items are hidden by default so the export stays suitable for ship verification.")
 
     with st.sidebar:
         st.header("Upload documents")
@@ -1087,6 +1294,7 @@ def main() -> None:
         ms_gap = st.number_input("Marine Superintendent max gap months", value=DEFAULT_MS_GAP_MONTHS, min_value=1.0, step=0.5)
         cert_warning = st.number_input("Certificate expiry warning days", value=DEFAULT_CERT_WARNING_DAYS, min_value=1, step=15)
         survey_warning = st.number_input("Survey/drydock due warning days", value=DEFAULT_SURVEY_WARNING_DAYS, min_value=1, step=30)
+        show_pass_checks = st.checkbox("Show PASS / INFO checks", value=False, help="Keep this off for ship-facing exports. Turn on only for debugging.")
         run_btn = st.button("Run checks", type="primary")
 
     if not run_btn:
@@ -1126,7 +1334,9 @@ def main() -> None:
             "survey_warning_days": survey_warning,
         }
         findings = run_all_rules(hvpq, piq, class_status, q88, settings, obs_docs)
-        df = findings_to_df(findings)
+        df_all = findings_to_df(findings)
+        show_pass = False
+        df = action_required_df(df_all, show_pass=show_pass_checks)
         summary = summarize_findings(df)
 
     st.subheader("Dashboard")
@@ -1146,9 +1356,13 @@ def main() -> None:
     st.dataframe(id_df, use_container_width=True, hide_index=True)
 
     st.subheader("Audit register")
-    risk_filter = st.multiselect("Filter risk", sorted(df["risk"].unique().tolist()) if not df.empty else [], default=sorted(df["risk"].unique().tolist()) if not df.empty else [])
-    view_df = df[df["risk"].isin(risk_filter)] if risk_filter and not df.empty else df
-    st.dataframe(view_df, use_container_width=True, hide_index=True)
+    if df.empty:
+        st.success("No actionable mismatch/manual-check items were generated under the current filters.")
+        view_df = df
+    else:
+        risk_filter = st.multiselect("Filter risk", sorted(df["risk"].unique().tolist()), default=sorted(df["risk"].unique().tolist()))
+        view_df = df[df["risk"].isin(risk_filter)] if risk_filter else df
+        st.dataframe(view_df, use_container_width=True, hide_index=True)
 
     excel_bytes = make_excel_download(df, summary)
     csv_bytes = df.to_csv(index=False).encode("utf-8")
