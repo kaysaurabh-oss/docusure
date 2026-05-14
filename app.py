@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import io, re, zipfile, xml.etree.ElementTree as ET
+import io, re, zipfile
 from dataclasses import dataclass, asdict
-from datetime import date, datetime
-from difflib import SequenceMatcher
+from datetime import date
 from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
@@ -16,18 +15,17 @@ try:
 except Exception:
     fitz = None
 
-APP_VERSION = "v7"
+APP_VERSION = "v8-extraction-first"
 
-# -------------------------
-# Data models
-# -------------------------
+# -----------------------------
+# Models
+# -----------------------------
 @dataclass
 class Field:
     value: str = ""
-    confidence: str = ""
     source: str = ""
-    method: str = ""
     evidence: str = ""
+    confidence: str = "HIGH"
 
 @dataclass
 class Finding:
@@ -39,932 +37,701 @@ class Finding:
     piq_value: str = ""
     class_value: str = ""
     q88_value: str = ""
-    xml_value: str = ""
     reason: str = ""
     required_action: str = ""
     evidence: str = ""
 
-PASS_STATUSES = {"PASS", "INFO"}
-ACTION_STATUSES = {"MISMATCH", "MANUAL CHECK", "MISSING", "WARNING"}
+# Month-name + ISO dates. Avoid numeric-only dates to stop qids becoming dates.
+DATE_RE = re.compile(r"(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}[./-][A-Za-z]{3,9}[./-]\d{4})", re.I)
 
-# Month-name based date patterns only. This intentionally avoids interpreting qids like 1.5.11 as dates.
-DATE_RE = re.compile(
-    r"(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|"
-    r"[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4}|"
-    r"\d{1,2}[./-][A-Za-z]{3,9}[./-]\d{4})",
-    re.I,
-)
-
-CERT_KEYWORDS = {
-    "safety_equipment_expiry": ["Safety Equipment Certificate", "Safety Equipment", "SEC"],
-    "safety_radio_expiry": ["Safety Radio Certificate", "Safety Radio", "SRC"],
-    "safety_construction_expiry": ["Safety Construction Certificate", "Safety Construction", "SCC"],
-    "loadline_expiry": ["Loadline Certificate", "Load Line", "International Loadline Certificate", "ILC"],
-    "iopp_expiry": ["International Oil Pollution Prevention Certificate", "IOPPC", "OPP (MARPOL Annex I)"],
-    "ibwmc_expiry": ["International Ballast Water Management Certificate", "IBWMC", "BWM"],
-    "smc_expiry": ["Safety Management Certificate", "ISM Safety Management Certificate", "SMC"],
-    "issc_expiry": ["International Ship Security Certificate", "ISSC"],
-    "doc_expiry": ["Document of Compliance", "DOC"],
-    "cof_chem_expiry": ["Certificate of Fitness (COF)", "Certificate of Fitness (Expiry", "Certificate of Fitness", "Chemicals in Bulk"],
-    "class_certificate_expiry": ["Class Certificate", "Certificate of Class (COC)", "Certificate of Class"],
-    "uscg_coc_expiry": ["USCG Certificate of Compliance", "USCGCOC", "USCG Certificate"],
-    "cofr_expiry": ["U.S. Certificate of Financial Responsibility", "COFR"],
-    "clc_oil_expiry": ["Civil Liability Convention Certificate (1992)", "CLC 1992", "Civil Liability Certificates"],
-    "bunker_clc_expiry": ["Civil Liability Convention 2001", "CLBC", "Bunker Oil Pollution"],
-    "wreck_removal_expiry": ["Wreck removal Convention Certificate", "WRC", "Removal of Wrecks"],
+CERT_ALIASES = {
+    "safety_equipment": ["Safety Equipment Certificate", "Safety Equipment Certificate (SEC)", "Cargo Ship Safety Equipment Certificate"],
+    "safety_radio": ["Safety Radio Certificate", "Safety Radio Certificate (SRC)", "Cargo Ship Safety Radio Certificate"],
+    "safety_construction": ["Safety Construction Certificate", "Safety Construction Certificate (SCC)", "Cargo Ship Safety Construction Certificate"],
+    "loadline": ["Loadline Certificate", "Load Line Certificate", "International Loadline Certificate", "International Loadline Certificate (ILC)"],
+    "iopp": ["International Oil Pollution Prevention Certificate", "International Oil Pollution Prevention Certificate (IOPPC)", "Oil Pollution Prevention Certificate(Form B)", "OPP (MARPOL Annex I)"],
+    "ibwmc": ["International Ballast Water Management Certificate", "International Ballast Water Management Certificate (IBWMC)", "Ballast Water Management Certificate"],
+    "smc": ["Safety Management Certificate", "ISM Safety Management Certificate", "Safety Management Certificate (SMC)"],
+    "doc": ["Document of Compliance", "Document of Compliance (DOC)"],
+    "issc": ["International Ship Security Certificate", "International Ship Security Certificate (ISSC)"],
+    "uscg_coc": ["USCG Certificate of Compliance", "USCG Certificate of Compliance(USCGCOC)", "USCG Requirement for Pollution Prevention"],
+    "cofr": ["U.S. Certificate of Financial Responsibility", "U.S. Certificate of Financial Responsibility - Expiry Date", "Certificate of Financial Responsibility", "COFR"],
+    "vgp": ["Vessel General Permit", "Vessel General Permit Issue date"],
+    "cof_chem": ["Certificate of Fitness (Expiry Dates) - Chemicals", "Certificate of Fitness (COF) (Chemical)", "Bulk Chemical Code Certificate", "Certificate of Fitness"],
+    "class_certificate": ["Class Certificate", "Certificate of Class (COC)", "Classification Certificate"],
+    "clc_oil": ["Civil Liability Convention Certificate (1992)", "Civil Liability Convention (CLC) 1992 Certificate", "Civil Liability Certificates"],
+    "clc_bunker": ["Civil Liability Convention 2001", "Civil Liability for Bunker Oil Pollution Damage Convention", "Bunker"],
+    "wreck_removal": ["Wreck removal Convention Certificate", "Liability for the Removal of Wrecks Certificate", "WRC"],
 }
 
-# Meaningful cross-source comparison map. PIQ and Class Status are not forced into non-overlapping fields.
-COMPARE_MAP = [
-    ("vessel_name", "Identity", "Vessel name", ["hvpq", "piq", "class", "q88"]),
-    ("imo_number", "Identity", "IMO number", ["hvpq", "class", "q88"]),
-    ("flag", "General", "Flag", ["hvpq", "class", "q88"]),
-    ("vessel_type", "General", "Vessel type", ["hvpq", "piq", "class", "q88"]),
-    ("class_society", "Class", "Class society", ["hvpq", "class", "q88"]),
-    ("class_notation", "Class", "Class notation", ["hvpq", "class", "q88"]),
-    ("conditions_of_class", "Class / Survey", "Open conditions of class", ["hvpq", "class", "q88"]),
-    ("memoranda_of_class", "Class / Survey", "Memoranda of class", ["hvpq", "class", "q88"]),
-    ("flag_dispensation", "Class / Survey", "Flag dispensation", ["hvpq"]),
-    ("last_drydock", "Class / Survey", "Last drydock", ["hvpq", "q88"]),
-    ("next_drydock_due", "Class / Survey", "Next drydock / docking survey due", ["hvpq", "class", "q88"]),
-    ("last_iws", "Class / Survey", "Last IWS / docking survey", ["hvpq", "class", "q88"]),
-    ("next_iws_due", "Class / Survey", "Next IWS / docking survey due", ["hvpq", "class", "q88"]),
-    ("last_special_survey", "Class / Survey", "Last special survey", ["hvpq", "class", "q88"]),
-    ("next_special_survey_due", "Class / Survey", "Next special survey due", ["hvpq", "class", "q88"]),
-    ("last_annual_survey", "Class / Survey", "Last annual survey", ["hvpq", "class"]),
-    ("last_intermediate_survey", "Class / Survey", "Last intermediate survey", ["hvpq", "class"]),
-    ("last_psc_date", "PSC", "Last PSC date", ["hvpq", "piq", "q88"]),
-    ("last_psc_port", "PSC", "Last PSC port", ["hvpq", "piq", "q88"]),
-    ("psc_detained", "PSC", "PSC detention status", ["hvpq", "piq"]),
-    ("incident_pollution_grounding_collision", "Incidents", "Pollution/grounding/collision/allision incident", ["hvpq", "piq"]),
-    ("incident_other", "Incidents", "Other incidents in past 12 months", ["hvpq", "piq"]),
-    ("foam_type", "Firefighting", "Foam type", ["hvpq", "q88"]),
-    ("foam_test_date", "Firefighting", "Foam test/supply date", ["hvpq", "q88"]),
-    ("cargo_pressure", "Pollution / Cargo", "Cargo piping pressure test pressure", ["hvpq", "q88"]),
-    ("bunker_pressure", "Pollution / Cargo", "Bunker piping pressure test pressure", ["hvpq", "q88"]),
-    ("overboard_blanks", "Pollution / Cargo", "Overboard discharge blanks/testing", ["hvpq", "q88"]),
-    ("sea_chest", "Pollution / Cargo", "Cargo sea chest / sea valves", ["hvpq", "q88"]),
-    ("cargo_tank_oldest_inspection", "Tank Inspection", "Oldest cargo/slop tank inspection", ["piq"]),
-    ("ballast_tank_oldest_inspection", "Tank Inspection", "Oldest ballast tank inspection", ["piq"]),
-    ("void_oldest_inspection", "Tank Inspection", "Oldest void inspection", ["piq"]),
-]
+CERT_ORDER = list(CERT_ALIASES.keys())
 
-CERT_COMPARE_KEYS = [
-    "safety_equipment_expiry", "safety_radio_expiry", "safety_construction_expiry", "loadline_expiry",
-    "iopp_expiry", "ibwmc_expiry", "smc_expiry", "issc_expiry", "doc_expiry", "cof_chem_expiry",
-    "class_certificate_expiry", "uscg_coc_expiry", "cofr_expiry", "clc_oil_expiry", "bunker_clc_expiry", "wreck_removal_expiry",
-]
-
-# -------------------------
-# Low-level helpers
-# -------------------------
-def read_pdf(uploaded_file) -> str:
-    if uploaded_file is None or fitz is None:
-        return ""
-    data = uploaded_file.read() if hasattr(uploaded_file, "read") else uploaded_file.getvalue()
-    doc = fitz.open(stream=data, filetype="pdf")
-    pages = []
-    for i, page in enumerate(doc, start=1):
-        pages.append(f"\n\n--- PAGE {i} ---\n" + page.get_text("text"))
-    return "\n".join(pages)
-
-def norm_space(s: str) -> str:
+# -----------------------------
+# Helpers
+# -----------------------------
+def norm_space(s: Any) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
-def clean_value(s: str) -> str:
-    s = norm_space(s)
-    s = re.sub(r"^[\s:;,.\-]+|[\s:;,.\-]+$", "", s)
-    return s
+def clean(s: Any) -> str:
+    return norm_space(s).strip(" :;,.—-")
 
-def setf(d: Dict[str, Field], key: str, value: Any, source: str, method: str, evidence: str, confidence: str="HIGH"):
-    if value is None:
-        return
-    value = str(value).strip()
-    if not value:
-        return
-    if key not in d or not d[key].value or (d[key].confidence != "HIGH" and confidence == "HIGH"):
-        d[key] = Field(clean_value(value), confidence, source, method, norm_space(evidence)[:1200])
+def pdf_text(uploaded) -> str:
+    if uploaded is None or fitz is None:
+        return ""
+    data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+    doc = fitz.open(stream=data, filetype="pdf")
+    pages = []
+    for i, p in enumerate(doc, start=1):
+        pages.append(f"\n--- PAGE {i} ---\n" + p.get_text("text"))
+    return "\n".join(pages)
 
-def find_dates(text: str) -> List[date]:
-    out = []
-    for m in DATE_RE.finditer(text or ""):
-        raw = m.group(0)
+def dates_in(s: str) -> List[date]:
+    out=[]
+    for m in DATE_RE.finditer(s or ""):
+        raw=m.group(0)
         try:
-            out.append(dateparser.parse(raw, dayfirst=True).date())
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+                out.append(date.fromisoformat(raw))
+            else:
+                out.append(dateparser.parse(raw, dayfirst=True).date())
         except Exception:
-            try:
-                out.append(dateparser.parse(raw.replace('.', ' '), dayfirst=True).date())
-            except Exception:
-                pass
+            pass
     return out
 
-def dstr(d: date) -> str:
-    return d.isoformat() if isinstance(d, date) else str(d or "")
+def dstr(d: date|str|None) -> str:
+    if isinstance(d, date): return d.isoformat()
+    return str(d or "")
 
-def extract_qblock(text: str, qid: str, max_chars: int=2500) -> str:
-    # Start at exact question id, stop at next question id of similar numeric structure.
-    pat = re.compile(rf"(?m)^\s*{re.escape(qid)}\b")
-    m = pat.search(text or "")
-    if not m:
-        # fallback when page extraction keeps qid inside a line
-        m = re.search(rf"{re.escape(qid)}\b", text or "")
-    if not m:
-        return ""
+def setf(d: Dict[str, Field], key: str, value: Any, source: str, evidence: str, confidence="HIGH"):
+    val = clean(value)
+    if not val:
+        return
+    if key not in d or not d[key].value or (d[key].confidence != "HIGH" and confidence == "HIGH"):
+        d[key] = Field(val, source, norm_space(evidence)[:1500], confidence)
+
+def block_between(text: str, start_pat: str, end_pat: Optional[str]=None, flags=re.I|re.S, max_chars=4000) -> str:
+    m = re.search(start_pat, text or "", flags)
+    if not m: return ""
     start = m.start()
-    rest = text[start:start+max_chars]
-    nxt = re.search(r"(?m)^\s*\d+(?:\.\d+){1,4}\b", rest[5:])
-    if nxt:
-        rest = rest[:5+nxt.start()]
-    return rest
+    sub = text[start:start+max_chars]
+    if end_pat:
+        e = re.search(end_pat, sub[len(m.group(0)):], flags)
+        if e:
+            sub = sub[:len(m.group(0))+e.start()]
+    return sub
 
-def page_text(text: str, page_no: int) -> str:
-    m = re.search(rf"--- PAGE {page_no} ---\n(.*?)(?=\n\n--- PAGE \d+ ---|\Z)", text, flags=re.S)
-    return m.group(1) if m else ""
-
-def answer_yesno(block: str) -> str:
-    # last yes/no in a short block usually is the answer, but avoid child questions where possible.
-    yn = re.findall(r"\b(Yes|No|Not applicable|N/A|NA)\b", block or "", flags=re.I)
-    if yn:
-        v = yn[-1]
-        return "Not applicable" if v.lower().startswith("not") else ("Yes" if v.lower()=="yes" else "No" if v.lower()=="no" else v.upper())
-    return ""
-
-def after_label(block: str, label_regex: str) -> str:
-    lines = [clean_value(x) for x in (block or "").splitlines() if clean_value(x)]
-    joined = " ".join(lines)
-    m = re.search(label_regex + r"\s*[:?]?\s*(.*?)(?:\s{2,}|$)", joined, flags=re.I)
-    if m and m.group(1):
-        return clean_value(m.group(1))
-    for i, ln in enumerate(lines):
-        if re.search(label_regex, ln, re.I):
-            tail = re.sub(label_regex, "", ln, flags=re.I).strip(" :?-")
-            if tail:
-                return clean_value(tail)
-            if i + 1 < len(lines):
-                return clean_value(lines[i+1])
-    return ""
-
-def sim(a: str, b: str) -> float:
-    return SequenceMatcher(None, norm_for_compare(a), norm_for_compare(b)).ratio()
-
-def norm_for_compare(v: str) -> str:
-    s = (v or "").lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    replacements = {
-        "nippon kaiji kyokai": "classnk",
-        "class nk": "classnk",
-        "nk ships": "classnk",
-        "classnk": "classnk",
-        "not applicable": "no",
-        "n a": "no",
-        "nil": "no",
-        "none": "no",
-        "double hull": "doublehull",
-        "classification society": "",
-        "1 classification society": "",
-        "type of ship purpose intended service": "",
-        "certificates sc se sf": "productchemical",
-        "oil chemical carrier": "productchemical",
-        "oil tanker chemical tanker": "productchemical",
-        "product carrier": "productchemical",
-        "products chemical tanker": "productchemical",
-        "oil chemical carrier": "productchemical",
-        "oil tanker chemical tanker": "productchemical",
-        "other product carrier": "productchemical",
-        "assuranceforeningen gard gjensidig": "gard",
-    }
-    s = norm_space(s)
-    for k, val in replacements.items():
-        s = s.replace(k, val)
-    return norm_space(s)
-
-def equivalent(a: str, b: str, field: str="") -> Tuple[bool, str]:
-    a0, b0 = clean_value(a), clean_value(b)
-    if not a0 or not b0:
-        return True, "one or both values missing; no mismatch assumed"
-    da, db = find_dates(a0), find_dates(b0)
-    if re.search(r"date|expiry|survey|iws|drydock", field, re.I) or (da and db):
-        if da and db:
-            return da[0] == db[0], f"date compare {dstr(da[0])} vs {dstr(db[0])}"
-    na, nb = norm_for_compare(a0), norm_for_compare(b0)
-    if na == nb:
-        return True, "normalized exact match"
-    if {na, nb} <= {"yes", "no", "not applicable", "na"}:
-        return na == nb, "yes/no compare"
-    # for vessel names allow suffixes like LR2
-    if field == "vessel_name":
-        if na in nb or nb in na or sim(a0, b0) > 0.78:
-            return True, "loose vessel-name match"
-        return False, "material vessel-name mismatch"
-    if field == "class_notation":
-        # Do not over-flag notation formatting differences. Require only major feature disagreement.
-        def has(tok, s): return tok in s
-        major = ["egcs", "sox", "esp", "eedi", "csr"]
-        disagreements = [t for t in major if has(t, na) != has(t, nb)]
-        return not disagreements, "major class-notation token compare"
-    if sim(a0, b0) >= 0.72:
-        return True, f"semantic/fuzzy match {sim(a0,b0):.2f}"
-    return False, f"values not equivalent after normalization ({na} vs {nb})"
-
-# -------------------------
-# Generic table parsers
-# -------------------------
-def cert_block(text: str) -> str:
-    start = re.search(r"Date Issued\s+Date Expires|2\.\s*CERTIFICATES|Current Statutory Certificates", text or "", re.I)
-    if not start:
-        return ""
-    end = re.search(r"\n\s*(Publications|2\.2\.1|3\.\s*CREW|Survey Status: Class|Documentation)\b", text[start.start():], re.I)
-    return text[start.start(): start.start()+end.start()] if end else text[start.start():start.start()+8000]
-
-def segment_between_keywords(block: str, start_patterns: List[str], all_patterns: List[List[str]]) -> str:
-    if not block:
-        return ""
-    low = block.lower()
-    positions = []
-    for pats in all_patterns:
-        best = None
-        for p in pats:
-            idx = low.find(p.lower())
-            if idx >= 0:
-                best = idx if best is None else min(best, idx)
-        if best is not None:
-            positions.append(best)
-    starts = []
-    for p in start_patterns:
-        idx = low.find(p.lower())
-        if idx >= 0:
-            starts.append(idx)
-    if not starts:
-        return ""
-    s = min(starts)
-    next_positions = [p for p in positions if p > s]
-    e = min(next_positions) if next_positions else min(len(block), s+800)
-    return block[s:e]
-
-def extract_hvpq_cert_dates(text: str, f: Dict[str, Field]):
-    block = cert_block(text)
-    allp = list(CERT_KEYWORDS.values())
-    for key, pats in CERT_KEYWORDS.items():
-        seg = segment_between_keywords(block, pats, allp)
-        if not seg:
-            continue
-        dates = find_dates(seg)
-        # HVPQ cert table order: Issued, Expires, Last Annual, Last Intermediate.
-        # In Q88 order differs; this function is HVPQ only.
-        if key == "cofr_expiry" and len(dates) >= 2:
-            expiry = dates[1]
-        elif len(dates) >= 2:
-            expiry = dates[1]
-        else:
-            continue
-        setf(f, key, dstr(expiry), "HVPQ", "certificate table row: expiry is 2nd date", seg)
-
-def extract_q88_cert_dates(text: str, f: Dict[str, Field]):
-    block = cert_block(text)
-    allp = list(CERT_KEYWORDS.values())
-    for key, pats in CERT_KEYWORDS.items():
-        seg = segment_between_keywords(block, pats, allp)
-        if not seg:
-            continue
-        dates = find_dates(seg)
-        # Q88 cert table order: Issued, Last Annual, Last Intermediate, Expires. Some rows: Issued, N/A, N/A, Expires.
-        if len(dates) >= 4:
-            expiry = dates[3]
-        elif len(dates) >= 2:
-            expiry = dates[-1]
-        else:
-            continue
-        setf(f, key, dstr(expiry), "Q88", "Q88 certificate table row: expiry is last date", seg)
-
-def extract_class_cert_dates(text: str, f: Dict[str, Field]):
-    block = cert_block(text)
-    # ClassNK table order: cert name, Final, --, Expiry Date, --, Applied.
-    class_map = {
-        "loadline_expiry": ["Load Line"],
-        "safety_construction_expiry": ["Safety Construction"],
-        "safety_equipment_expiry": ["Safety Equipment"],
-        "safety_radio_expiry": ["Safety Radio"],
-        "cof_chem_expiry": ["Chemicals in Bulk"],
-        "iopp_expiry": ["OPP (MARPOL Annex I)", "OPP"],
-        "ibwmc_expiry": ["BWM"],
-    }
-    allp = list(class_map.values()) + [["SPP (MARPOL Annex IV)"], ["APP (MARPOL Annex VI)"], ["EE"], ["Anti Fouling"], ["IHM"], ["Lifting Appliances"]]
-    for key, pats in class_map.items():
-        seg = segment_between_keywords(block, pats, allp)
-        dates = find_dates(seg)
-        if dates:
-            setf(f, key, dstr(dates[0]), "Class Status", "Class status statutory certificate expiry", seg)
-
-# -------------------------
-# HVPQ extractor
-# -------------------------
-def extract_hvpq_xml(xml_text: str) -> Dict[str, Field]:
-    f: Dict[str, Field] = {}
-    if not xml_text:
-        return f
-    try:
-        root = ET.fromstring(xml_text.encode("utf-8"))
-        ns = {"x":"https://www.ocimf-sire.org/schemas/XPQ6_Response_Schema_1.0.00.xsd"}
-        v = root.find(".//x:Vessel", ns) or root.find(".//Vessel")
-        if v is not None:
-            setf(f, "vessel_name", v.attrib.get("name",""), "HVPQ XML", "XML header", ET.tostring(v, encoding="unicode"))
-            setf(f, "imo_number", v.attrib.get("id",""), "HVPQ XML", "XML header", ET.tostring(v, encoding="unicode"))
-        doc = root.find(".//x:Document", ns) or root.find(".//Document")
-        if doc is not None:
-            setf(f, "document_exported", doc.attrib.get("exported",""), "HVPQ XML", "XML header", ET.tostring(doc, encoding="unicode"), "MEDIUM")
-    except Exception as e:
-        setf(f, "xml_parse_error", str(e), "HVPQ XML", "parse error", xml_text[:500], "LOW")
-    return f
-
-def first_nonempty_line_after(lines: List[str], token: str) -> str:
-    for i, ln in enumerate(lines):
-        if token.lower() in ln.lower():
-            for j in range(i+1, min(len(lines), i+4)):
-                if lines[j].strip(): return lines[j].strip()
-    return ""
-
-def extract_hvpq(text: str, xml_text: str="") -> Dict[str, Field]:
-    f: Dict[str, Field] = {}
-    lines = [clean_value(x) for x in (text or "").splitlines() if clean_value(x)]
-    head = text[:1200]
-    m = re.search(r"Harmonised Vessel Particulars Questionnaire v6\s+(.*?)\s+IMO/LR Number\s+(\d+)\s+([A-Z0-9 '.-]+)", head, re.S|re.I)
-    if m:
-        setf(f, "document_date", clean_value(m.group(1)), "HVPQ", "header", m.group(0))
-        setf(f, "imo_number", m.group(2), "HVPQ", "header", m.group(0))
-        setf(f, "vessel_name", m.group(3), "HVPQ", "header", m.group(0))
-
-    b = extract_qblock(text, "1.1.4", 1200)
-    m = re.search(r"\b1\s+Flag\s+([A-Za-z ]+)", b, re.I)
-    if m: setf(f,"flag",m.group(1),"HVPQ","qid 1.1.4",b)
-
-    b = extract_qblock(text, "1.1.8", 700)
-    m = re.search(r"Q1\.11[^?]*\?\s*([A-Za-z ()/-]+)", b, re.I)
-    if m: setf(f,"vessel_type",m.group(1),"HVPQ","qid 1.1.8",b)
-    b2 = extract_qblock(text, "1.1.9", 500)
-    m = re.search(r"If other,? then specify\s+(.+)", b2, re.I)
-    if m: setf(f,"vessel_type_other",m.group(1),"HVPQ","qid 1.1.9",b2)
-    if f.get("vessel_type", Field()).value.lower() == "other" and f.get("vessel_type_other"):
-        f["vessel_type"] = Field(f["vessel_type_other"].value, "HIGH", "HVPQ", "qid 1.1.8/1.1.9 combined", norm_space(b + "\n" + b2)[:1200])
-
-    b = extract_qblock(text, "1.5.1", 1100)
-    m = re.search(r"\b1\s+Classification Society\s+(.+?)\s+\b2\s+Is Classification", b, re.I|re.S)
-    if m:
-        val = m.group(1)
-        val = re.sub(r"^\s*1\s+Classification Society\s+", "", val, flags=re.I).strip()
-        setf(f,"class_society",val,"HVPQ","qid 1.5.1",b)
-
-    b = extract_qblock(text, "1.5.2", 1200)
-    m = re.search(r"List class notations\s+(.+?)(?:\s+2\s+Provide|\Z)", b, re.I|re.S)
-    if m: setf(f,"class_notation",m.group(1),"HVPQ","qid 1.5.2",b)
-
-    # Class and survey dates
-    for qid, keys in {
-        "1.5.4": ["last_drydock", "second_last_drydock", "next_drydock_due"],
-        "1.5.5": ["last_iws", "next_iws_due"],
-        "1.5.6": ["last_special_survey", "next_special_survey_due"],
-    }.items():
-        b = extract_qblock(text, qid, 1400)
-        dates = find_dates(b)
-        if qid == "1.5.6" and len(dates) >= 2:
-            # block also contains society name, next due is last date in the block
-            vals = [dates[0], dates[-1]]
-            for key, val in zip(keys, vals): setf(f,key,dstr(val),"HVPQ",f"qid {qid}",b)
-        else:
-            for key, val in zip(keys, dates): setf(f,key,dstr(val),"HVPQ",f"qid {qid}",b)
-
-    b = extract_qblock(text, "1.5.11", 300)
-    dates = find_dates(b)
-    if dates: setf(f,"last_annual_survey",dstr(dates[0]),"HVPQ","qid 1.5.11",b)
-    b = extract_qblock(text, "1.5.12", 300)
-    dates = find_dates(b)
-    if dates: setf(f,"last_intermediate_survey",dstr(dates[0]),"HVPQ","qid 1.5.12",b)
-
-    for qid, key in [("1.5.14","conditions_of_class"),("1.5.16","memoranda_of_class"),("1.5.18","flag_dispensation")]:
-        b = extract_qblock(text, qid, 700)
-        yn = answer_yesno(b)
-        if yn: setf(f,key,yn,"HVPQ",f"qid {qid}",b)
-
-    # Environmental
-    b = extract_qblock(text, "1.2.3", 1300)
-    m = re.search(r"provide CII rating\s+([A-Z])\b", b, re.I)
-    if m: setf(f,"cii_rating",m.group(1),"HVPQ","qid 1.2.3",b)
-    m = re.search(r"CII rating verified by Class, 3rd Party or Owner\?\s*(Class|3rd Party|Owner)", b, re.I)
-    if m: setf(f,"cii_verified_by",m.group(1),"HVPQ","qid 1.2.3",b)
-
-    # Incidents and PSC
-    b = extract_qblock(text, "1.9.3", 700)
-    yn = answer_yesno(b)
-    if yn: setf(f,"incident_pollution_grounding_collision",yn,"HVPQ","qid 1.9.3",b)
-    b = extract_qblock(text, "1.9.5", 1400)
-    yn = answer_yesno(b)
-    if yn: setf(f,"incident_other",yn,"HVPQ","qid 1.9.5",b)
-    if "Date Type of Incident" in b:
-        details = b.split("Date Type of Incident",1)[-1]
-        setf(f,"incident_details",details,"HVPQ","qid 1.9.6 table",b,"MEDIUM")
-
-    b = extract_qblock(text, "1.9.8", 1200)
-    dates = find_dates(b)
-    if dates: setf(f,"last_psc_date",dstr(dates[0]),"HVPQ","qid 1.9.8",b)
-    m = re.search(r"Port of last Port State Control Inspection\s+(.+?)\s+3\s+Has", b, re.I|re.S)
-    if m: setf(f,"last_psc_port",m.group(1),"HVPQ","qid 1.9.8",b)
-    m = re.search(r"detained during the last 36 months\?\s*(Yes|No)", b, re.I)
-    if m: setf(f,"psc_detained",m.group(1),"HVPQ","qid 1.9.8",b)
-
-    # Operational checks
-    for qid, key, label in [
-        ("5.3.1","foam_test_date","foam"), ("6.1.10","overboard_blanks","overboard"), ("6.1.8","sea_chest","sea chest"),
-        ("6.1.13","cargo_pressure","cargo pressure"), ("6.1.14","bunker_pressure","bunker pressure")]:
-        b = extract_qblock(text, qid, 1300)
-        if key == "foam_test_date":
-            dates = find_dates(b)
-            if dates: setf(f,key,dstr(dates[-1]),"HVPQ",f"qid {qid}",b)
-            m = re.search(r"If other, then specify\s+(.+?)\s+4\s+What", b, re.I|re.S)
-            if m: setf(f,"foam_type",m.group(1),"HVPQ",f"qid {qid}",b)
-        elif key in {"cargo_pressure", "bunker_pressure"}:
-            m = re.search(r"specify pressure\s+([0-9.]+\s*Bar)", b, re.I)
-            if m: setf(f,key,m.group(1),"HVPQ",f"qid {qid}",b)
-        elif key == "overboard_blanks":
-            yn = answer_yesno(b)
-            if yn: setf(f,key,yn,"HVPQ",f"qid {qid}",b)
-        elif key == "sea_chest":
-            m = re.search(r"What type of sea valves are fitted.*?\?\s*(.+)", b, re.I|re.S)
-            if m: setf(f,key,m.group(1),"HVPQ",f"qid {qid}",b)
-
-    extract_hvpq_cert_dates(text, f)
-    for k,v in extract_hvpq_xml(xml_text).items():
-        # XML header should improve identity, not override good PDF details unless PDF missing.
-        if k not in f or not f[k].value:
-            f[k] = v
-    return f
-
-# -------------------------
-# PIQ extractor
-# -------------------------
-def extract_piq(text: str) -> Dict[str, Field]:
-    f: Dict[str, Field] = {}
-    head = text[:900]
-    # PIQ header order from PDF extraction is "PIQ Report\nCHALLENGE POLLUX\nVessel Name\nDate\n14 May 2026"
-    m = re.search(r"PIQ Report\s+(.+?)\s+Vessel Name\s+Date\s+(.+?)\s+1\. General", head, re.S|re.I)
-    if m:
-        setf(f,"vessel_name",m.group(1),"PIQ","header",m.group(0))
-        setf(f,"document_date",re.split(r"--- PAGE", m.group(2))[0].strip(),"PIQ","header",m.group(0))
-    else:
-        m = re.search(r"Vessel Name\s+(.+?)\s+Date\s+(.+?)\s+1\. General", head, re.S|re.I)
-        if m:
-            setf(f,"vessel_name",m.group(1),"PIQ","header",m.group(0))
-            setf(f,"document_date",re.split(r"--- PAGE", m.group(2))[0].strip(),"PIQ","header",m.group(0))
-
-    b = extract_qblock(text, "1.1.1", 900)
-    m = re.search(r"1\.1\.1\.\s+(.+?)\s+Vessel Type", b, re.S|re.I)
-    if not m:
-        m = re.search(r"Vessel Type\s+(.+?)(?:\s+If the vessel|\Z)", b, re.S|re.I)
-    if m:
-        vt = clean_value(m.group(1))
-        vt = re.sub(r"\b(Yes|No)\b.*$", "", vt, flags=re.I).strip()
-        setf(f,"vessel_type",vt,"PIQ","qid 1.1.1",b)
-
-    b = extract_qblock(text, "2.1.1", 800)
-    dates = find_dates(b)
-    if dates: setf(f,"class_surveyor_last_visit",dstr(dates[0]),"PIQ","qid 2.1.1",b)
-    m = re.search(r"If Other, provide details\s+(.+)", b, re.I|re.S)
-    if m: setf(f,"class_surveyor_last_visit_purpose",m.group(1),"PIQ","qid 2.1.1",b)
-
-    # Superintendent visits
-    b = extract_qblock(text, "2.2.1001", 1400)
-    dates = find_dates(b)
-    if dates:
-        setf(f,"technical_superintendent_dates", ", ".join(dstr(x) for x in dates), "PIQ", "qid 2.2.1001", b)
-        # pairs: from/to for last, second, third
-        if len(dates) >= 2: setf(f,"technical_superintendent_last_to", dstr(dates[1]), "PIQ", "qid 2.2.1001", b)
-    b = extract_qblock(text, "2.2.1002", 1000)
-    dates = find_dates(b)
-    if dates:
-        setf(f,"marine_superintendent_dates", ", ".join(dstr(x) for x in dates), "PIQ", "qid 2.2.1002", b)
-        if len(dates) >= 2: setf(f,"marine_superintendent_last_to", dstr(dates[1]), "PIQ", "qid 2.2.1002", b)
-
-    for qid,key in [("2.3.3001","cargo_tank_oldest_inspection"),("2.3.3002","ballast_tank_oldest_inspection"),("2.3.3003","void_oldest_inspection")]:
-        b = extract_qblock(text, qid, 700)
-        dates = find_dates(b)
-        if dates: setf(f,key,dstr(dates[-1]),"PIQ",f"qid {qid}",b)
-        m = re.search(r"Required frequency.*?\?\s*(\d+)\s+months", b, re.I|re.S)
-        if m: setf(f,key+"_frequency_months",m.group(1),"PIQ",f"qid {qid}",b)
-
-    b = extract_qblock(text,"2.5.1002",1000)
-    yn = answer_yesno(b)
-    if yn: setf(f,"equipment_retrofitted",yn,"PIQ","qid 2.5.1002",b)
-    if "EGCS" in b.upper(): setf(f,"egcs_retrofit_mentioned","Yes","PIQ","qid 2.5.1002",b)
-
-    # PSC table: take Last row only: Last 03 January 2026 Chattogram , Bangladesh Indian Ocean MoU 0.00 No Yes
-    b = extract_qblock(text, "2.8.2", 1800)
-    m = re.search(r"Last\s+({d})\s+(.+?)\s+(?:Indian Ocean MoU|Tokyo MoU|US Coastguard|Paris MoU|USCG)\s+([0-9.]+)\s+(Yes|No)\s+(Yes|No)".format(d=DATE_RE.pattern), b, re.I|re.S)
-    if m:
-        dt = find_dates(m.group(1))[0]
-        setf(f,"last_psc_date",dstr(dt),"PIQ","qid 2.8.2 last row",b)
-        port = clean_value(re.sub(r",.*", "", m.group(2)))
-        setf(f,"last_psc_port",port,"PIQ","qid 2.8.2 last row",b)
-        setf(f,"psc_detained",m.group(4),"PIQ","qid 2.8.2 last row",b)
-        setf(f,"last_psc_deficiencies",m.group(3),"PIQ","qid 2.8.2 last row",b)
-
-    # Incident section: PIQ 5.7.*. If all specified incidents are No, flag nil, but compare broad HVPQ other incident separately.
-    sec = re.search(r"5\.7\. Safety Management(.*?)(?:\n\s*5\.8\.|\n\s*6\.|\Z)", text, re.S|re.I)
-    if sec:
-        block = sec.group(1)
-        setf(f,"piq_incident_section",block,"PIQ","section 5.7",block,"MEDIUM")
-        positives = re.findall(r"5\.7\.\d+\.\s+(Yes)", block, re.I)
-        if positives:
-            setf(f,"incident_other","Yes","PIQ","section 5.7 any Yes",block)
-        else:
-            setf(f,"incident_other","No","PIQ","section 5.7 all extracted incident answers appear No",block)
-        # specific pollution/grounding/collision items in 5.7 usually separate; broad group No if all these keywords No.
-        if re.search(r"pollution incident.*?No", block, re.S|re.I) and re.search(r"hard aground.*?No", block, re.S|re.I) and re.search(r"collision or allision.*?No", block, re.S|re.I):
-            setf(f,"incident_pollution_grounding_collision","No","PIQ","section 5.7 specific incident answers",block)
-    return f
-
-# -------------------------
-# Q88 extractor
-# -------------------------
-def q88_block(text: str, qnum: str, max_chars=1200) -> str:
-    """Return Q88 field block by line-based question number matching.
-    Handles Q88 PDF extraction where qid is often on its own line and the label/value follow on next lines.
-    """
-    lines = [clean_value(x) for x in (text or "").splitlines()]
-    start_idx = None
-    q_re = re.compile(rf"^{re.escape(qnum)}(?:\b|\s*$)", re.I)
-    next_re = re.compile(r"^\d+\.\d+[a-z]?(?:\b|\s*$)", re.I)
-    for i, ln in enumerate(lines):
-        if q_re.search(ln):
-            start_idx = i
-            break
-    if start_idx is None:
-        return ""
+def qblock(text: str, qid: str, max_lines=70) -> str:
+    lines=[clean(x) for x in (text or "").splitlines()]
+    start=None
+    for i,ln in enumerate(lines):
+        if ln == qid or ln.startswith(qid+" ") or ln.startswith(qid+"."):
+            start=i; break
+    if start is None:
+        pat=re.compile(rf"\b{re.escape(qid)}\b")
+        for i,ln in enumerate(lines):
+            if pat.search(ln): start=i; break
+    if start is None: return ""
     out=[]
-    for j in range(start_idx, min(len(lines), start_idx+80)):
-        if j > start_idx and next_re.search(lines[j]):
+    next_re=re.compile(r"^\d+(?:\.\d+){1,4}[a-z]?\.?$")
+    for j in range(start,min(len(lines),start+max_lines)):
+        if j>start and next_re.match(lines[j]):
             break
-        out.append(lines[j])
-    block = " ".join([x for x in out if x])
-    return block[:max_chars]
+        if lines[j]: out.append(lines[j])
+    return " ".join(out)
 
-def extract_q88(text: str) -> Dict[str, Field]:
-    f: Dict[str, Field] = {}
-    if not text: return f
-    # Header/general fields by explicit question numbers.
-    qmap = {
-        "vessel_name": ("1.2", r"Vessel.*?\(IMO number\)\s*(.+?)\s*\((\d+)\)"),
-        "flag": ("1.5", r"Flag/Port of Registry\s*(.+?)/(.*)"),
-        "vessel_type": ("1.8", r"IOPPC\)\s*(.+)"),
-        "class_society": ("1.18", r"Classification society\s*(.+?)(?:\s+1\.18a|\Z)"),
-        "class_notation": ("1.19", r"Class notation\s*(.+?)(?:\s+1\.20|\Z)"),
-        "conditions_of_class": ("1.20", r"open conditions.*?\b(Yes|No)\s*(?:1\.20a|$)"),
-        "memoranda_of_class": ("1.20a", r"Memoranda of Class.*?\b(Yes|No)\s*(?:1\.21|$)"),
+def yn_from_block(b: str) -> str:
+    vals=re.findall(r"\b(Yes|No|Not applicable|N/A|NA|Nil)\b", b or "", re.I)
+    if not vals: return ""
+    v=vals[-1].lower()
+    if v in {"n/a","na","not applicable","nil"}: return "No"
+    return "Yes" if v=="yes" else "No"
+
+def line_answer_after_label(text: str, label_regex: str, stop_regex: Optional[str]=None) -> str:
+    m=re.search(label_regex + r"\s*[:?]?\s*(.+)", text or "", re.I)
+    if m:
+        val=m.group(1)
+        if stop_regex:
+            val=re.split(stop_regex,val,flags=re.I)[0]
+        return clean(val)
+    return ""
+
+def norm_compare(s: str) -> str:
+    x=(s or "").lower()
+    x=re.sub(r"[^a-z0-9]+"," ",x)
+    x=norm_space(x)
+    reps={
+        "not applicable":"no", "n a":"no", "nil":"no", "none":"no",
+        "korean register of shipping":"korean register", "kr":"korean register",
+        "northstandard limitied":"northstandard limited",
+        "p i":"pi",
     }
-    for key,(qid,pat) in qmap.items():
-        b = q88_block(text,qid,1300)
-        if not b: continue
-        m = re.search(pat,b,re.S|re.I)
-        if m:
-            if key == "vessel_name":
-                setf(f,"vessel_name",m.group(1),"Q88",f"q88 {qid}",b)
-                setf(f,"imo_number",m.group(2),"Q88",f"q88 {qid}",b)
-            elif key == "flag":
-                setf(f,"flag",m.group(1),"Q88",f"q88 {qid}",b)
-            elif key in {"conditions_of_class", "memoranda_of_class"}:
-                yns = re.findall(r"\b(Yes|No)\b", b, flags=re.I)
-                setf(f,key,yns[-1] if yns else m.group(1),"Q88",f"q88 {qid}",b)
-            else:
-                val = m.group(1)
-                if key == "class_society": val = re.split(r"\s+1\.18a", val)[0]
-                setf(f,key,val,"Q88",f"q88 {qid}",b)
+    for k,v in reps.items(): x=x.replace(k,v)
+    return norm_space(x)
 
-    for qid, keys in {"1.23":["last_drydock"], "1.24":["next_drydock_due","next_annual_survey_due"], "1.25":["last_special_survey","next_special_survey_due"], "1.25a":["last_iws","next_iws_due"]}.items():
-        b = q88_block(text,qid,900)
-        dates = find_dates(b)
-        if qid == "1.23" and dates:
-            setf(f,"last_drydock",dstr(dates[0]),"Q88",f"q88 {qid}",b)
-        elif qid == "1.24" and dates:
-            setf(f,"next_drydock_due",dstr(dates[0]),"Q88",f"q88 {qid}",b)
-            if len(dates)>1: setf(f,"next_annual_survey_due",dstr(dates[1]),"Q88",f"q88 {qid}",b)
-        elif len(dates)>=2:
-            setf(f,keys[0],dstr(dates[0]),"Q88",f"q88 {qid}",b)
-            setf(f,keys[1],dstr(dates[1]),"Q88",f"q88 {qid}",b)
+def same_date(a: str, b: str) -> Optional[bool]:
+    da,db=dates_in(a),dates_in(b)
+    if da and db: return da[0]==db[0]
+    # ISO fields
+    try:
+        if re.match(r"\d{4}-\d{2}-\d{2}$", a) and re.match(r"\d{4}-\d{2}-\d{2}$", b):
+            return a==b
+    except Exception: pass
+    return None
 
-    # P&I and foam/cargo fields
-    b = q88_block(text,"1.14",1000)
-    if b:
-        m=re.search(r"P\s*&\s*I Club.*?:\s*(.+)",b,re.I|re.S)
-        if m: setf(f,"pni_club",m.group(1),"Q88","q88 1.14",b)
-    b = q88_block(text,"1.15",500)
-    dates=find_dates(b)
-    if dates: setf(f,"pni_expiry",dstr(dates[-1]),"Q88","q88 1.15",b)
+def equivalent(a: str,b: str, field="") -> bool:
+    if not a or not b: return True
+    sd=same_date(a,b)
+    if sd is not None: return sd
+    na,nb=norm_compare(a),norm_compare(b)
+    if na==nb: return True
+    if field=="vessel_name" and (na in nb or nb in na): return True
+    # Ship type is deliberately loose: different forms use different wording.
+    if field=="vessel_type":
+        family_words=["oil", "chemical", "product", "crude", "tanker", "carrier"]
+        ca={w for w in family_words if w in na}
+        cb={w for w in family_words if w in nb}
+        if ca & cb and not ({"gas","bulk"} & (ca|cb)):
+            return True
+    if field=="class_notation":
+        tokens=["iws","igs","cow","bwm","ihm","lg","vec","esp"]
+        a_tokens={t for t in tokens if t in na}
+        b_tokens={t for t in tokens if t in nb}
+        return len(a_tokens & b_tokens) >= min(3, len(a_tokens), len(b_tokens))
+    if len(na)>8 and len(nb)>8 and (na in nb or nb in na): return True
+    return False
 
-    # Q88 operational pages often use numbered rows; generic label extraction.
-    for label,key in [("foam", "foam_type"),("test", "foam_test_date"),("overboard", "overboard_blanks"),("sea chest", "sea_chest"), ("cargo piping", "cargo_pressure"), ("bunker piping", "bunker_pressure")]:
-        m = re.search(label + r".{0,200}", text, re.I|re.S)
-        if m:
-            seg = text[m.start():m.start()+600]
-            if key.endswith("date"):
-                dates=find_dates(seg)
-                if dates: setf(f,key,dstr(dates[0]),"Q88","keyword extraction",seg,"MEDIUM")
-            elif key.endswith("pressure"):
-                mm=re.search(r"([0-9.]+\s*Bar)",seg,re.I)
-                if mm: setf(f,key,mm.group(1),"Q88","keyword extraction",seg,"MEDIUM")
-            else:
-                # don't set low-quality broad fields unless answer is obvious yes/no/type
-                yn=re.search(r"\b(Yes|No|AR-AFFF\s*3\s*%|Screwdown)\b",seg,re.I)
-                if yn: setf(f,key,yn.group(1),"Q88","keyword extraction",seg,"MEDIUM")
-    extract_q88_cert_dates(text,f)
-    b = q88_block(text, "2.19", 600)
-    if b:
-        ds = find_dates(b)
-        if ds: f["cof_chem_expiry"] = Field(dstr(ds[-1]), "HIGH", "Q88", "q88 2.19 Certificate of Fitness", norm_space(b)[:1200])
-    b = q88_block(text, "2.11", 500)
-    if b:
-        ds = find_dates(b)
-        if ds: f["uscg_coc_expiry"] = Field(dstr(ds[-1]), "HIGH", "Q88", "q88 2.11 USCGCOC", norm_space(b)[:1200])
-    return f
+def cert_segment(text: str, aliases: List[str], all_aliases: List[str], max_chars=700) -> str:
+    # Normalize whitespace first so wrapped labels like "U.S. Certificate of\nFinancial Responsibility" are found.
+    norm = norm_space(text)
+    lower = norm.lower()
+    positions=[]
+    for a in aliases:
+        i=lower.find(norm_space(a).lower())
+        if i!=-1: positions.append(i)
+    if not positions: return ""
+    start=min(positions)
+    stop=start+max_chars
+    alias_lowers=[norm_space(x).lower() for x in aliases]
+    for a in all_aliases:
+        aa=norm_space(a).lower()
+        if aa in alias_lowers:
+            continue
+        j=lower.find(aa, start+5)
+        if j!=-1 and j<stop: stop=j
+    return norm[start:stop]
 
-# -------------------------
-# Class status extractor
-# -------------------------
-def extract_class_status(text: str) -> Dict[str, Field]:
-    f: Dict[str, Field] = {}
+def add_cert_field(fields: Dict[str, Field], key: str, prefix: str, issue: str, expiry: str, source: str, seg: str, annual="", intermediate=""):
+    if issue: setf(fields, f"cert_{key}_issue", issue, source, seg)
+    if expiry: setf(fields, f"cert_{key}_expiry", expiry, source, seg)
+    if annual: setf(fields, f"cert_{key}_annual", annual, source, seg)
+    if intermediate: setf(fields, f"cert_{key}_intermediate", intermediate, source, seg)
+
+# -----------------------------
+# HVPQ extraction
+# -----------------------------
+def extract_hvpq(text: str) -> Dict[str, Field]:
+    f={}
     if not text: return f
-    head = text[:2500]
-    m = re.search(r"Name of Ship:\s*\n?\s*(.+?)\s+(?:Class No|IMO No)", head, re.I|re.S)
-    if m: setf(f,"vessel_name",m.group(1),"Class Status","header",m.group(0))
-    m = re.search(r"IMO No\.\s*:?\s*(\d{7})", head, re.I)
-    if m: setf(f,"imo_number",m.group(1),"Class Status","header",m.group(0))
-    if re.search(r"NIPPON KAIJI KYOKAI|ClassNK|NK-SHIPS", text, re.I):
-        setf(f,"class_society","Nippon Kaiji Kyokai","Class Status","document source",head)
-    m = re.search(r"Flag:\s*([^\n]+)", text, re.I)
-    if m: setf(f,"flag",m.group(1),"Class Status","particulars",m.group(0))
-    m = re.search(r"Type of Ship -Purpose\(Intended Service\):\s*\n?\s*([^\n]+)", text, re.I)
+    m=re.search(r"Harmonised Vessel Particulars Questionnaire v6\s+([0-9]{1,2}\s+[A-Za-z]+\s+\d{4}).*?IMO/LR Number\s+(\d{7})\s+([A-Z0-9 '\-]+)", text, re.S)
     if m:
-        val = m.group(1)
-        if val.strip().startswith("-") or "Certificates" in val:
-            mm = re.search(r"SC/SE/SF:\s*([^\n]+)", text, re.I)
-            if mm: val = mm.group(1)
-        setf(f,"vessel_type",val,"Class Status","particulars",m.group(0))
-    m = re.search(r"Classification Character, Notations:\s*(.+?)\s+Descriptive Notes", text, re.I|re.S)
+        setf(f,"doc_date",dstr(dates_in(m.group(1))[0]),"HVPQ",m.group(0))
+        setf(f,"imo_number",m.group(2),"HVPQ",m.group(0))
+        setf(f,"vessel_name",m.group(3),"HVPQ",m.group(0))
+    # General fields using qblocks
+    for qid,key in [("1.1.4","flag"),("1.1.5","port_registry"),("1.1.6","call_sign"),("1.1.10","mmsi"),("1.1.8","vessel_type"),("1.1.9","vessel_type_other"),("1.1.13","pni_club")]:
+        b=qblock(text,qid,45)
+        if not b: continue
+        if key=="flag":
+            m=re.search(r"1 Flag\s+(.+?)(?:\s+2 Has|$)", b, re.I)
+            if m: setf(f,key,re.sub(r"^\?\s*", "", m.group(1)),"HVPQ",b)
+        elif key=="vessel_type":
+            m=re.search(r"IOPPC\)?\s*(Oil Tanker|Other|Product Carrier|Chemical Tanker|.+?)(?:\s+1\.1\.9|$)", b, re.I)
+            if m: setf(f,key,m.group(1),"HVPQ",b)
+        elif key=="vessel_type_other":
+            m=re.search(r"specify\s+(.+?)(?:\s+1\.1\.10|$)", b, re.I)
+            if m: setf(f,key,m.group(1),"HVPQ",b)
+        elif key=="pni_club":
+            m=re.search(r"If other, then specify\s+(.+?)(?:\s+3 Amount|$)", b, re.I)
+            if m: setf(f,key,m.group(1),"HVPQ",b)
+    # Owner/operator
+    b=qblock(text,"1.3.1",90)
+    m=re.search(r"1 Name\s+(.+?)(?:\s+2 Full|$)",b,re.I)
+    if m: setf(f,"registered_owner",m.group(1),"HVPQ",b)
+    b=qblock(text,"1.3.2",90)
+    m=re.search(r"1 Name\s+(.+?)(?:\s+2 Full|$)",b,re.I)
+    if m: setf(f,"technical_operator",m.group(1),"HVPQ",b)
+    # Energy
+    b=qblock(text,"1.2.3",80)
+    m=re.search(r"provide CII rating\s+([A-E])",b,re.I)
+    if m: setf(f,"cii_rating",m.group(1),"HVPQ",b)
+    m=re.search(r"CII rating verified by Class, 3rd Party or Owner\??\s*(Class|Owner|3rd Party)",b,re.I)
+    if m: setf(f,"cii_verified_by",m.group(1),"HVPQ",b)
+    # Classification/surveys
+    b=qblock(text,"1.5.1",80)
+    m=re.search(r"1 Classification Society\s+(.+?)(?:\s+2 Is|$)",b,re.I)
     if m:
-        val = m.group(1)
-        # If layout puts the heading before the actual notation, also grab the NS*/MNS* lines above the heading.
-        mm = re.search(r"(NS\*.*?MNS\*)\s*Classification Character, Notations", text, re.I|re.S)
-        if mm: val = mm.group(1)
-        setf(f,"class_notation",val,"Class Status","particulars",m.group(0))
-
-    # Survey status page. Dates extracted per row.
-    def row(name: str, max_len=500) -> str:
-        mm = re.search(re.escape(name) + r"(.{0,"+str(max_len)+r"})", text, re.I|re.S)
-        return name + (mm.group(1) if mm else "")
-    for name,last_key,due_key in [
-        ("Special Survey","last_special_survey","next_special_survey_due"),
-        ("Annual Survey","last_annual_survey",None),
-        ("Intermediate Survey","last_intermediate_survey",None),
-        ("Docking Survey","last_iws","next_iws_due"),
-    ]:
-        seg=row(name,450)
-        dates=find_dates(seg)
-        # ClassNK Survey Status order is: Last Date, Due Date, Range/Postponed.
-        if dates:
-            setf(f,last_key,dstr(dates[0]),"Class Status",f"Survey Status row: {name}",seg)
-            if due_key and len(dates)>=2:
-                setf(f,due_key,dstr(dates[1]),"Class Status",f"Survey Status row: {name}",seg)
-    # Drydock in HVPQ generally equivalent to Docking Survey in Class Status
-    if f.get("last_iws"):
-        setf(f,"last_drydock",f["last_iws"].value,"Class Status","Docking Survey used as class docking survey last date",f["last_iws"].evidence,"MEDIUM")
-    if f.get("next_iws_due"):
-        setf(f,"next_drydock_due",f["next_iws_due"].value,"Class Status","Docking Survey used as class docking survey due date",f["next_iws_due"].evidence,"MEDIUM")
-
-    # Conditions and notes
-    m = re.search(r"Condition of Class\s*(Nil\.|None|No|.+?)\s*Note", text, re.I|re.S)
-    if m:
-        v=m.group(1)
-        setf(f,"conditions_of_class", "No" if re.search(r"Nil|None|No",v,re.I) else v, "Class Status", "Condition of Class", m.group(0))
-    m = re.search(r"\bNote\s*(Nil\.|None|No|.+?)\s*2\. Installation", text, re.I|re.S)
-    if m:
-        v=m.group(1)
-        setf(f,"memoranda_of_class", "No" if re.search(r"Nil|None|No",v,re.I) else v, "Class Status", "Class Note", m.group(0))
-    extract_class_cert_dates(text,f)
+        val=re.sub(r"^1\s+Classification Society\s+", "", m.group(1), flags=re.I)
+        setf(f,"class_society",val,"HVPQ",b)
+    b=qblock(text,"1.5.2",120)
+    m=re.search(r"List class notations\s+(.+?)(?:\s+2 Provide|$)",b,re.I)
+    if m: setf(f,"class_notation",m.group(1),"HVPQ",b)
+    b=qblock(text,"1.5.4",80); ds=dates_in(b)
+    if len(ds)>=1: setf(f,"last_drydock",dstr(ds[0]),"HVPQ",b)
+    if len(ds)>=3: setf(f,"next_drydock_due",dstr(ds[2]),"HVPQ",b)
+    b=qblock(text,"1.5.5",50); ds=dates_in(b)
+    if len(ds)>=1: setf(f,"last_iws",dstr(ds[0]),"HVPQ",b)
+    if len(ds)>=2: setf(f,"next_iws_due",dstr(ds[1]),"HVPQ",b)
+    b=qblock(text,"1.5.6",100); ds=dates_in(b)
+    if len(ds)>=1: setf(f,"last_special_survey",dstr(ds[0]),"HVPQ",b)
+    if len(ds)>=2: setf(f,"next_special_survey_due",dstr(ds[-1]),"HVPQ",b)
+    b=qblock(text,"1.5.11",25); ds=dates_in(b)
+    if ds: setf(f,"last_annual_survey",dstr(ds[0]),"HVPQ",b)
+    b=qblock(text,"1.5.12",25); ds=dates_in(b)
+    if ds: setf(f,"last_intermediate_survey",dstr(ds[0]),"HVPQ",b)
+    for qid,key in [("1.5.14","conditions_of_class"),("1.5.16","memoranda_of_class"),("1.5.18","flag_dispensation")]:
+        b=qblock(text,qid,35); yn=yn_from_block(b)
+        if yn: setf(f,key,yn,"HVPQ",b)
+    # Incidents/PSC
+    b=qblock(text,"1.9.3",45); yn=yn_from_block(b)
+    if yn: setf(f,"incident_pollution_grounding_collision",yn,"HVPQ",b)
+    b=qblock(text,"1.9.5",70); yn=yn_from_block(b)
+    if yn: setf(f,"incident_other",yn,"HVPQ",b)
+    b=qblock(text,"1.9.8",80); ds=dates_in(b)
+    if ds: setf(f,"last_psc_date",dstr(ds[0]),"HVPQ",b)
+    m=re.search(r"Port of last Port State Control Inspection\s+(.+?)(?:\s+3 Has|$)",b,re.I)
+    if m: setf(f,"last_psc_port",m.group(1),"HVPQ",b)
+    m=re.search(r"detained.*?\?\s*(Yes|No)",b,re.I)
+    if m: setf(f,"psc_detained",m.group(1),"HVPQ",b)
+    # Certificates section
+    cert_text=block_between(text, r"2\.1\.5\s*Certificate dates|Date Issued\s+Date Expires", r"2\.2\.1\s*Publications|Publications", max_chars=7000)
+    if not cert_text:
+        cert_text=block_between(text, r"Date Issued\s+Date Expires", r"Publications", max_chars=7000)
+    all_aliases=[a for v in CERT_ALIASES.values() for a in v]
+    for key, aliases in CERT_ALIASES.items():
+        seg=cert_segment(cert_text, aliases, all_aliases, 900)
+        if not seg: continue
+        ds=dates_in(seg)
+        if not ds: continue
+        if key=="vgp":
+            # HVPQ sometimes carries issue date + next date; keep both.
+            issue=dstr(ds[0]); expiry=dstr(ds[-1]) if len(ds)>1 else ""
+        else:
+            issue=dstr(ds[0])
+            expiry=dstr(ds[1]) if len(ds)>1 else ""
+        annual=dstr(ds[2]) if len(ds)>2 else ""
+        inter=dstr(ds[3]) if len(ds)>3 else ""
+        add_cert_field(f,key,"cert",issue,expiry,"HVPQ",seg,annual,inter)
+    # Publications section for targeted check.
+    pubs=block_between(text, r"2\.2\.1\s*Publications|Publications\s+Edition Number", r"3\s+Crew|3\.1\.1", max_chars=4500)
+    if pubs: setf(f,"publications_block","Present","HVPQ",pubs,"MEDIUM")
     return f
 
-# -------------------------
-# Observation library and checklist
-# -------------------------
+# -----------------------------
+# PIQ extraction
+# -----------------------------
+def extract_piq(text: str) -> Dict[str, Field]:
+    f={}
+    if not text: return f
+    m=re.search(r"PIQ Report\s+(?:Vessel Name\s+)?([A-Z0-9 '\-]+)\s+Date\s+([0-9]{1,2}\s+[A-Za-z]+\s+\d{4})",text,re.S)
+    if m:
+        setf(f,"vessel_name",m.group(1),"PIQ",m.group(0))
+        setf(f,"doc_date",dstr(dates_in(m.group(2))[0]),"PIQ",m.group(0))
+    # PIQ table extraction is layout-driven: answer often appears before the label in PyMuPDF text.
+    b=block_between(text, r"1\.1\.1\.", r"2\. Certification|2\.1\.", max_chars=900)
+    m=re.search(r"1\.1\.1\.\s*([^\n]+)\s+Vessel Type", b, re.I)
+    if not m:
+        m=re.search(r"Vessel Type\s+([^\n]+)", b, re.I)
+    if m:
+        vt=clean(m.group(1))
+        vt=re.sub(r"\b(Yes|No)\b.*$", "", vt, flags=re.I).strip()
+        setf(f,"vessel_type",vt,"PIQ",b)
+    if re.search(r"Annex II.*?\bYes\b",b,re.I|re.S): setf(f,"annex_ii_carriage","Yes","PIQ",b)
+
+    # Superintendent sections: use block_between so decimal numbers like 59.00 do not stop extraction.
+    b=block_between(text, r"2\.2\.1001\.", r"Has a Marine Superintendent|2\.2\.1002\.", max_chars=1800); ds=dates_in(b)
+    if ds:
+        setf(f,"technical_superintendent_dates",", ".join(dstr(x) for x in ds),"PIQ",b)
+    b=block_between(text, r"2\.2\.1002\.", r"2\.3\. Structural|2\.3\.3001", max_chars=1800); ds=dates_in(b)
+    if ds: setf(f,"marine_superintendent_dates",", ".join(dstr(x) for x in ds),"PIQ",b)
+    for qid,key in [("2.3.3001","cargo_tank_oldest_inspection"),("2.3.3002","ballast_tank_oldest_inspection"),("2.3.3003","void_oldest_inspection")]:
+        b=qblock(text,qid,70); ds=dates_in(b)
+        if ds: setf(f,key,dstr(ds[-1]),"PIQ",b)
+        m=re.search(r"Required frequency.*?(\d+)\s+months",b,re.I)
+        if m: setf(f,key+"_freq",m.group(1),"PIQ",b)
+    b=qblock(text,"2.5.1002",80); yn=yn_from_block(b)
+    if yn: setf(f,"equipment_retrofitted",yn,"PIQ",b)
+    if b: setf(f,"equipment_retrofit_details",b,"PIQ",b,"MEDIUM")
+    b=qblock(text,"2.5.1003",100); yn=yn_from_block(b)
+    if yn: setf(f,"equipment_replaced",yn,"PIQ",b)
+    b=qblock(text,"2.8.2",120)
+    # Extract last row after 'Last'.
+    m=re.search(r"Last\s+((?:\d{1,2}\s+[A-Za-z]+\s+\d{4}|[A-Za-z]+\s+\d{1,2},\s*\d{4}))\s+(.+?)\s+(?:Indian Ocean MoU|Tokyo MoU|US Coastguard|USCG|Paris MoU|Korean MoU|Black Sea MoU).*?\s(Yes|No)\s+(Yes|No)",b,re.I|re.S)
+    if m:
+        setf(f,"last_psc_date",dstr(dates_in(m.group(1))[0]),"PIQ",b)
+        setf(f,"last_psc_port",clean(re.sub(r",.*","",m.group(2))),"PIQ",b)
+        setf(f,"psc_detained",m.group(3),"PIQ",b)
+    sec=re.search(r"5\.7\..*?(?:6\. |6\.|$)",text,re.I|re.S)
+    if sec:
+        bb=sec.group(0)
+        positives=re.findall(r"5\.7\.\d+\..{0,180}?\bYes\b",bb,re.I|re.S)
+        setf(f,"incident_other","Yes" if positives else "No","PIQ",bb)
+        setf(f,"incident_pollution_grounding_collision","No" if not positives else "Yes","PIQ",bb)
+    else:
+        # If incident section not extracted, do not assume mismatch; leave blank.
+        pass
+    return f
+
+# -----------------------------
+# Q88 extraction
+# -----------------------------
+def extract_q88(text: str) -> Dict[str, Field]:
+    f={}
+    if not text: return f
+    b=qblock(text,"1.2",30); m=re.search(r"name.*?\(?IMO number\)?.*?([A-Za-z0-9 '\-]+)\s*\((\d{7})\)",b,re.I)
+    if m: setf(f,"vessel_name",m.group(1),"Q88",b); setf(f,"imo_number",m.group(2),"Q88",b)
+    b=qblock(text,"1.5",25); m=re.search(r"Flag/Port of Registry\s+(.+?)/(.+)",b,re.I)
+    if m: setf(f,"flag",m.group(1),"Q88",b); setf(f,"port_registry",m.group(2),"Q88",b)
+    b=qblock(text,"1.8",40); m=re.search(r"IOPPC\).*?\s+(Other\s*\(.+?\)|Oil Tanker|Chemical Tanker|.+?)(?:\s+1\.8a|$)",b,re.I)
+    if m: setf(f,"vessel_type",m.group(1),"Q88",b)
+    b=qblock(text,"1.10",80)
+    # First name line after 'IMO Number'
+    m=re.search(r"IMO Number\s+(.+?)(?:\s+c/o|\s+\d+|\s+Tel:|$)",b,re.I)
+    if m: setf(f,"registered_owner",m.group(1),"Q88",b)
+    b=qblock(text,"1.14",80); m=re.search(r"P\s*&\s*I Club.*?\s+(NorthStandard Limited|Northstandard Limitied|.+?)(?:\s+If other|\s+1\.15|$)",b,re.I)
+    if m: setf(f,"pni_club",m.group(1),"Q88",b)
+    b=qblock(text,"1.18",25); m=re.search(r"Classification society\s+(.+?)(?:\s+1\.18a|$)",b,re.I)
+    if m: setf(f,"class_society",m.group(1),"Q88",b)
+    b=qblock(text,"1.19",90); m=re.search(r"Class notation\s+(.+?)(?:\s+1\.20|$)",b,re.I)
+    if m: setf(f,"class_notation",m.group(1),"Q88",b)
+    for qid,key in [("1.20","conditions_of_class"),("1.20a","memoranda_of_class")]:
+        b=qblock(text,qid,35); yn=yn_from_block(b)
+        if yn: setf(f,key,yn,"Q88",b)
+    for qid,keys in [("1.23",("last_drydock",None)),("1.24",("next_drydock_due","next_annual_survey_due")),("1.25",("last_special_survey","next_special_survey_due")),("1.25a",("last_iws","next_iws_due"))]:
+        b=qblock(text,qid,45); ds=dates_in(b)
+        if ds:
+            setf(f,keys[0],dstr(ds[0]),"Q88",b)
+            if keys[1] and len(ds)>1: setf(f,keys[1],dstr(ds[1]),"Q88",b)
+            elif keys[1] and len(ds)==1: setf(f,keys[1],"", "Q88", b)
+        elif qid=="1.25a" and b:
+            setf(f,"last_iws", clean(re.sub(r".*due:","",b,flags=re.I)), "Q88", b, "LOW")
+    # Q88 certificates: extract by numbered blocks 2.x when possible.
+    qcert={
+        "2.1":"safety_equipment","2.2":"safety_radio","2.3":"safety_construction","2.4":"loadline","2.5":"iopp",
+        "2.6":"issc","2.9":"smc","2.10":"doc","2.11":"uscg_coc","2.12":"clc_oil","2.13":"clc_bunker",
+        "2.14":"wreck_removal","2.15":"cofr","2.16":"class_certificate","2.19":"cof_chem","2.23":"ship_sanitation"
+    }
+    for qid,key in qcert.items():
+        b=qblock(text,qid,45); ds=dates_in(b)
+        if ds:
+            # Q88 order: issue, annual, intermediate, expiry; but if only two dates, second is expiry.
+            issue=dstr(ds[0])
+            if len(ds)>=4: annual,inter,expiry=dstr(ds[1]),dstr(ds[2]),dstr(ds[3])
+            elif len(ds)==3: annual,inter,expiry=dstr(ds[1]),"",dstr(ds[2])
+            elif len(ds)==2: annual,inter,expiry="","",dstr(ds[1])
+            else: annual,inter,expiry="","",""
+            add_cert_field(f,key,"cert",issue,expiry,"Q88",b,annual,inter)
+    # Q88 environmental section often uses 10.10 rather than HVPQ numbering.
+    b=qblock(text,"10.10",70) or block_between(text,r"Does the vessel have a CII Rating number",max_chars=900)
+    if b:
+        m=re.search(r"Yes,\s*([A-E])", b, re.I) or re.search(r"CII rating[: ]+([A-E])", b, re.I)
+        if m: setf(f,"cii_rating",m.group(1),"Q88",b)
+        m=re.search(r"verified by Class, 3rd Party or Owner\??\s*(Class|Owner|3rd Party)", b, re.I)
+        if m: setf(f,"cii_verified_by",m.group(1),"Q88",b)
+    # Search CII in whole text as a fallback. If the verification question is present but blank, rating is still captured and basis left blank.
+    m=re.search(r"CII Rating number.*?Yes,\s*([A-E]).{0,250}?verified by Class, 3rd Party or Owner\??\s*(Class|Owner|3rd Party)?",text,re.I|re.S)
+    if m:
+        setf(f,"cii_rating",m.group(1),"Q88",m.group(0))
+        if m.group(2): setf(f,"cii_verified_by",m.group(2),"Q88",m.group(0))
+    return f
+
+# -----------------------------
+# Class Status extraction
+# -----------------------------
+def extract_class(text: str) -> Dict[str, Field]:
+    f={}
+    if not text: return f
+    if re.search(r"KOREAN REGISTER",text,re.I): setf(f,"class_society","Korean Register","Class Status",text[:400])
+    elif re.search(r"NIPPON KAIJI KYOKAI|NK-SHIPS",text,re.I): setf(f,"class_society","Nippon Kaiji Kyokai","Class Status",text[:400])
+    m=re.search(r"Ship Name\s+([A-Z0-9 '\-]+).*?IMO No\.\s*(\d{7})",text,re.I|re.S)
+    if m: setf(f,"vessel_name",m.group(1),"Class Status",m.group(0)); setf(f,"imo_number",m.group(2),"Class Status",m.group(0))
+    m=re.search(r"Flag\s+([A-Z ]+?)\s+IMO Number",text,re.I|re.S)
+    if m: setf(f,"flag",m.group(1),"Class Status",m.group(0))
+    m=re.search(r"Class Notation\s+(.+?)\s+Owner",text,re.I|re.S)
+    if m: setf(f,"class_notation",m.group(1),"Class Status",m.group(0))
+    m=re.search(r"Type of Ship.*?:\s*([^\n]+)",text,re.I)
+    if m: setf(f,"vessel_type",m.group(1),"Class Status",m.group(0))
+    m=re.search(r"\nOwner\s+([^\n]+?)\s*\nManager", text, re.I)
+    if not m:
+        m=re.search(r"\nOwner\s+([A-Z0-9 .,&'\-]+)", text, re.I)
+    if m: setf(f,"registered_owner",m.group(1),"Class Status",m.group(0))
+    # Class KR certificates: segment by labels, first date is issue, second date expiry.
+    all_aliases=[a for v in CERT_ALIASES.values() for a in v]
+    for key,aliases in CERT_ALIASES.items():
+        seg=cert_segment(text, aliases, all_aliases, 550)
+        if not seg: continue
+        ds=dates_in(seg)
+        if ds:
+            issue=dstr(ds[0])
+            # KR VGP row normally has issue only and a dash for expiry; do not convert next document row into expiry.
+            expiry="" if key=="vgp" else (dstr(ds[1]) if len(ds)>1 else "")
+            add_cert_field(f,key,"cert",issue,expiry,"Class Status",seg)
+    # KR survey rows from Class Surveys section.
+    class_survey_section=block_between(text,r"Class Surveys",r"Cargo Handling Appliances|Statutory Surveys",max_chars=1800)
+    def survey_row(name):
+        seg=block_between(class_survey_section, re.escape(name), r"(?:Special Survey|Intermediate Survey|Annual Survey|Docking Survey|No\.1 Propeller|No\.1 Aux|Due :)", max_chars=450)
+        if not seg:
+            m=re.search(re.escape(name)+r"(.{0,300})",class_survey_section,re.I|re.S)
+            seg=name+(m.group(1) if m else "")
+        return seg
+    for name,lastkey,nextkey in [("Special Survey","last_special_survey","next_special_survey_due"),("Annual Survey","last_annual_survey","next_annual_survey_due"),("Intermediate Survey","last_intermediate_survey","next_intermediate_survey_due"),("Docking Survey","last_drydock","next_drydock_due")]:
+        seg=survey_row(name); ds=dates_in(seg)
+        if len(ds)>=1: setf(f,lastkey,dstr(ds[0]),"Class Status",seg)
+        if len(ds)>=2: setf(f,nextkey,dstr(ds[1]),"Class Status",seg)
+    # Conditions/Notes
+    m=re.search(r"Condition of Class / Statutory Condition\s+Conditions\s+(.+?)(?:\n|14-May|\d{1,2}-[A-Za-z]+-\d{4})",text,re.I|re.S)
+    if m:
+        v=m.group(1); setf(f,"conditions_of_class","No" if re.search(r"Nil|None|No",v,re.I) else v,"Class Status",m.group(0))
+    m=re.search(r"Actionable Note\s+Notes\s+(.+?)(?:\n|14-May|\d{1,2}-[A-Za-z]+-\d{4})",text,re.I|re.S)
+    if m:
+        v=m.group(1); setf(f,"memoranda_of_class","No" if re.search(r"Nil|None|No",v,re.I) else v,"Class Status",m.group(0))
+    return f
+
+# -----------------------------
+# Rules
+# -----------------------------
+def values(f: Dict[str,Field], key: str) -> str:
+    return f.get(key, Field()).value
+
+def evidence(*fields: Field) -> str:
+    return "\n---\n".join([f"{x.source}: {x.evidence}" for x in fields if x and x.evidence])
+
+def add_finding(rows, area, check, status, risk, reason, action, hvpq="", piq="", cls="", q88="", ev=""):
+    rows.append(Finding(area,check,status,risk,hvpq,piq,cls,q88,reason,action,ev))
+
+def compare_field(rows, key, area, label, hvpq, other, other_name, risk="HIGH", manual_for_type=False):
+    h=hvpq.get(key,Field()); o=other.get(key,Field())
+    if not h.value or not o.value: return
+    if equivalent(h.value,o.value,key): return
+    if manual_for_type:
+        add_finding(rows,area,label+f": HVPQ vs {other_name}","MANUAL CHECK","MEDIUM",f"Wording differs but may be acceptable depending certificate/Form B basis.","Verify wording against IOPP/COF/class and make HVPQ/PIQ/Q88 consistent.",hvpq=h.value, **({"piq":o.value} if other_name=="PIQ" else {"q88":o.value} if other_name=="Q88" else {"cls":o.value}), ev=evidence(h,o))
+    else:
+        add_finding(rows,area,label+f": HVPQ vs {other_name}","MISMATCH",risk,"Extracted values differ after normalization.","Verify latest source and correct HVPQ/Q88/PIQ as applicable.",hvpq=h.value, **({"piq":o.value} if other_name=="PIQ" else {"q88":o.value} if other_name=="Q88" else {"cls":o.value}), ev=evidence(h,o))
+
+def run_rules(hvpq,piq,cls,q88,asof: date) -> List[Finding]:
+    rows=[]
+    # 1 superintendent strict rules
+    for key,label,max_months in [("technical_superintendent_dates","Technical Superintendent visit gap",7),("marine_superintendent_dates","Marine Superintendent visit gap",12)]:
+        fld=piq.get(key,Field())
+        ds=dates_in(fld.value)
+        # Dates appear as from/to pairs: last-from,last-to,second-from,second-to...
+        pairs=[]
+        for i in range(0,len(ds)-1,2):
+            pairs.append((ds[i],ds[i+1]))
+        # sort chronological by from date
+        pairs=sorted(pairs,key=lambda x:x[0])
+        for (prev_from,prev_to),(next_from,next_to) in zip(pairs,pairs[1:]):
+            gap_days=(next_from-prev_to).days
+            allowed=(prev_to+relativedelta(months=max_months))
+            if next_from>allowed:
+                add_finding(rows,"Management Oversight",label,"MISMATCH","CRITICAL",f"Gap from {prev_to} to {next_from} is {gap_days} days, exceeding strict {max_months}-month rule.","Office/vessel to provide explanation and schedule/record corrective inspection where required.",piq=fld.value,ev=fld.evidence)
+    # 2 vessel type as manual only, not high mismatch
+    compare_field(rows,"vessel_type","General","Vessel type wording",hvpq,piq,"PIQ",manual_for_type=True)
+    compare_field(rows,"vessel_type","General","Vessel type wording",hvpq,q88,"Q88",manual_for_type=True)
+    # 3 owner / P&I
+    compare_field(rows,"registered_owner","Ownership","Registered owner",hvpq,q88,"Q88",risk="MEDIUM")
+    compare_field(rows,"registered_owner","Ownership","Registered owner",hvpq,cls,"CLASS",risk="MEDIUM")
+    compare_field(rows,"pni_club","Insurance","P&I club spelling / naming",hvpq,q88,"Q88",risk="MEDIUM")
+    if "limitied" in values(hvpq,"pni_club").lower():
+        add_finding(rows,"Insurance","P&I club spelling appears incorrect in HVPQ","MANUAL CHECK","MEDIUM","HVPQ appears to contain a spelling error in the P&I club name.","Correct spelling/name style in HVPQ after checking P&I certificate/Q88.",hvpq=values(hvpq,"pni_club"),q88=values(q88,"pni_club"),ev=evidence(hvpq.get("pni_club"),q88.get("pni_club")))
+    # 4 Certificate comparisons targeted
+    cert_labels={
+        "cofr":"COFR", "iopp":"IOPPC", "vgp":"Vessel General Permit", "doc":"DOC", "class_certificate":"Class Certificate",
+        "safety_equipment":"Safety Equipment", "safety_radio":"Safety Radio", "safety_construction":"Safety Construction", "loadline":"Loadline",
+        "cof_chem":"Certificate of Fitness - Chemical", "uscg_coc":"USCG COC", "smc":"SMC", "issc":"ISSC", "ibwmc":"IBWMC",
+        "clc_oil":"CLC Oil", "clc_bunker":"CLC Bunker", "wreck_removal":"Wreck Removal"
+    }
+    for ckey,lab in cert_labels.items():
+        # compare expiry against Q88/Class
+        for src,name in [(q88,"Q88"),(cls,"CLASS")]:
+            if ckey=="uscg_coc" and name=="CLASS":
+                continue
+            hk=f"cert_{ckey}_expiry"; ok=f"cert_{ckey}_expiry"
+            if values(hvpq,hk) and values(src,ok) and not equivalent(values(hvpq,hk),values(src,ok),hk):
+                risk="CRITICAL" if ckey=="cofr" and dates_in(values(hvpq,hk)) and dates_in(values(hvpq,hk))[0] < asof else "HIGH"
+                add_finding(rows,"Certificates",f"{lab} expiry: HVPQ vs {name}","MISMATCH",risk,"Certificate expiry differs; HVPQ may be outdated.","Verify latest certificate/Class/Q88 and correct HVPQ.",hvpq=values(hvpq,hk), q88=values(src,ok) if name=="Q88" else "", cls=values(src,ok) if name=="CLASS" else "", ev=evidence(hvpq.get(hk),src.get(ok)))
+        # compare issue date against Class for selected statutory certificates
+        if ckey in {"iopp","vgp","class_certificate","safety_equipment","safety_radio","safety_construction","loadline","ibwmc","cof_chem"}:
+            hk=f"cert_{ckey}_issue"; ck=f"cert_{ckey}_issue"
+            if values(hvpq,hk) and values(cls,ck) and not equivalent(values(hvpq,hk),values(cls,ck),hk):
+                add_finding(rows,"Certificates",f"{lab} issue date: HVPQ vs CLASS","MISMATCH","HIGH","Certificate issue date differs from Class Status. This can mean HVPQ is not updated after reissue/renewal.","Verify latest certificate issue date and update HVPQ if Class Status is current.",hvpq=values(hvpq,hk),cls=values(cls,ck),ev=evidence(hvpq.get(hk),cls.get(ck)))
+    # explicit expiry overdue check for HVPQ certs
+    for key,field in hvpq.items():
+        if key.startswith("cert_") and key.endswith("_expiry"):
+            ds=dates_in(field.value)
+            if ds and ds[0] < asof:
+                add_finding(rows,"Certificates",key.replace("cert_","").replace("_expiry","").upper()+" expired in HVPQ","MISMATCH","CRITICAL",f"HVPQ shows expiry {ds[0]}, before document/as-of date {asof}.","Update HVPQ with valid certificate or confirm certificate status.",hvpq=field.value,ev=field.evidence)
+    # DOC date sequence sanity
+    if values(hvpq,"cert_doc_issue") and values(hvpq,"cert_doc_annual"):
+        di=dates_in(values(hvpq,"cert_doc_issue")); da=dates_in(values(hvpq,"cert_doc_annual"))
+        if di and da and da[0] < di[0]:
+            add_finding(rows,"Certificates","DOC endorsement date appears inconsistent","MANUAL CHECK","HIGH","HVPQ DOC annual/endorsement date appears earlier than DOC issue date.","Verify latest DOC and endorsement details; correct HVPQ if table entry is stale/wrong.",hvpq=f"Issue {values(hvpq,'cert_doc_issue')}; annual {values(hvpq,'cert_doc_annual')}",ev=evidence(hvpq.get('cert_doc_issue'),hvpq.get('cert_doc_annual')))
+    # IWS next due missing
+    if values(hvpq,"last_iws") and not values(hvpq,"next_iws_due"):
+        add_finding(rows,"Class / Survey","IWS next due blank in HVPQ","MANUAL CHECK","HIGH","HVPQ declares last IWS but next IWS due is blank.","Verify if IWS remains applicable after renewal/drydock and update HVPQ/Q88 if required.",hvpq=values(hvpq,"last_iws"),ev=evidence(hvpq.get('last_iws')))
+    if values(q88,"last_iws") and not values(q88,"next_iws_due"):
+        add_finding(rows,"Class / Survey","IWS next due blank in Q88","MANUAL CHECK","HIGH","Q88 declares last IWS but next IWS due is blank.","Verify and update Q88 if applicable.",q88=values(q88,"last_iws"),ev=evidence(q88.get('last_iws')))
+    # Surveys compare: do not compare last_iws vs class docking blindly; only due dates where relevant.
+    for key,label in [("next_drydock_due","Next drydock/docking survey due"),("next_special_survey_due","Next special survey due")]:
+        compare_field(rows,key,"Class / Survey",label,hvpq,cls,"CLASS",risk="HIGH")
+        compare_field(rows,key,"Class / Survey",label,hvpq,q88,"Q88",risk="HIGH")
+    # CII verification basis
+    if values(hvpq,"cii_rating") and values(q88,"cii_rating") and values(hvpq,"cii_rating") == values(q88,"cii_rating") and values(hvpq,"cii_verified_by") and not values(q88,"cii_verified_by"):
+        add_finding(rows,"Environmental","Q88 CII verification basis blank","MANUAL CHECK","MEDIUM","Q88 appears to carry CII rating but verification basis was not extracted/populated while HVPQ has verification basis.","Verify Q88 CII verification basis and update if blank.",hvpq=f"{values(hvpq,'cii_rating')} / {values(hvpq,'cii_verified_by')}",q88=values(q88,"cii_rating"),ev=evidence(hvpq.get('cii_verified_by'),q88.get('cii_rating')))
+    # Incidents nil confirmation
+    hinc=values(hvpq,"incident_other") or values(hvpq,"incident_pollution_grounding_collision")
+    pinc=values(piq,"incident_other")
+    if (not hinc or norm_compare(hinc)=="no") and (not pinc or norm_compare(pinc)=="no"):
+        add_finding(rows,"Incidents","No incidents declared","MANUAL CHECK","MEDIUM","No incidents appear declared in HVPQ/PIQ from extracted sections. Positive nil confirmation is still required.","Ship/office to confirm no reportable machinery, navigation, mooring, pollution, security, injury or operational incidents occurred in the last 12 months.",hvpq=hinc,piq=pinc)
+    elif hinc and pinc and not equivalent(hinc,pinc,"incident"):
+        add_finding(rows,"Incidents","Incident declaration HVPQ vs PIQ","MISMATCH","HIGH","HVPQ and PIQ incident declaration differs.","Align incident declaration after office/vessel verification.",hvpq=hinc,piq=pinc,ev=evidence(hvpq.get('incident_other'),piq.get('incident_other')))
+    # PIQ tank due checks
+    for key,label in [("cargo_tank_oldest_inspection","Cargo/slop tank inspection sequence"),("ballast_tank_oldest_inspection","Ballast tank inspection sequence"),("void_oldest_inspection","Void space inspection sequence")]:
+        old=values(piq,key); freq=values(piq,key+"_freq") or "12"
+        if old:
+            ds=dates_in(old)
+            if ds:
+                due=ds[0]+relativedelta(months=int(float(freq)))
+                risk="HIGH" if due < asof else "MEDIUM"
+                status="MISMATCH" if due < asof else "MANUAL CHECK"
+                add_finding(rows,"Tank Inspection",label+" due calculation",status,risk,f"Oldest date {ds[0]} with {freq}-month frequency gives due {due}.","Vessel to verify current inspection sequence and update PIQ if any tank/void inspection is outside sequence.",piq=f"Oldest {old}; freq {freq}; due {due}",ev=evidence(piq.get(key)))
+    # Publications targeted check if HVPQ has stale-looking values
+    if "publications_block" in hvpq:
+        ev=hvpq["publications_block"].evidence
+        stale=[]
+        for item in ["COLREGS", "USCG Regulations", "Oil Transfer Procedures", "International Medical Guide", "MFAG"]:
+            if re.search(item, ev, re.I): stale.append(item)
+        if stale:
+            add_finding(rows,"Publications","Publication editions targeted verification","MANUAL CHECK","MEDIUM","HVPQ publication section should be verified against latest onboard publication list/SMS controlled list.","Ship to confirm listed editions are current and update HVPQ where outdated/blank/NA.",hvpq="; ".join(stale),ev=ev)
+    # MOC/retrofit targeted
+    if values(piq,"equipment_retrofitted")=="Yes" or values(piq,"equipment_replaced")=="Yes":
+        add_finding(rows,"Management of Change","PIQ retrofit/replacement declared - verify HVPQ/class/cert updates","MANUAL CHECK","MEDIUM","PIQ declares equipment retrofit/replacement. Associated HVPQ fields, certificates and class status should reflect latest condition.","Ship/office to verify MOC evidence, certificate reissue, Class survey and HVPQ update.",piq=values(piq,"equipment_retrofit_details"),ev=evidence(piq.get('equipment_retrofit_details')))
+    # De-duplicate similar rows
+    seen=set(); unique=[]
+    for r in rows:
+        k=(r.area,r.check,r.hvpq_value,r.piq_value,r.class_value,r.q88_value)
+        if k not in seen:
+            seen.add(k); unique.append(r)
+    risk_order={"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3}
+    unique.sort(key=lambda r:(risk_order.get(r.risk,9),r.area,r.check))
+    return unique
+
+# -----------------------------
+# Observation/checklist
+# -----------------------------
 def parse_obs_excel(uploaded) -> pd.DataFrame:
     if uploaded is None: return pd.DataFrame()
     try:
-        df = pd.read_excel(uploaded)
+        df=pd.read_excel(uploaded)
     except Exception:
         return pd.DataFrame()
-    df.columns = [str(c).strip() for c in df.columns]
     if df.empty: return df
-    # Robust row text join. pandas versions differ in how DataFrame.agg handles string-callables.
-    # Using apply with explicit conversion avoids TypeError on Streamlit Cloud / pandas 3.x.
-    joined = df.fillna("").astype(str).apply(lambda row: " ".join([str(v) for v in row.tolist()]), axis=1)
-    qids = joined.str.extract(r"((?:\d+\.){1,4}\d+)")[0]
-    df["detected_qid"] = qids
-    def fam(s):
-        x=s.lower()
-        if any(w in x for w in ["incident", "ground", "blackout", "injury", "collision", "allision"]): return "Incident declaration"
-        if any(w in x for w in ["certificate", "expiry", "issued", "annual", "intermediate"]): return "Certificate/date accuracy"
-        if any(w in x for w in ["class", "condition", "memoranda", "dispensation", "dry dock", "iws"]): return "Class/survey"
-        if any(w in x for w in ["mooring", "brake", "rope", "tail", "winch", "bitt", "fairlead", "chock"]): return "Mooring"
-        if any(w in x for w in ["tank", "coating", "void", "ballast"]): return "Tank/structural"
-        if any(w in x for w in ["foam", "fire", "lifeboat", "rescue"]): return "Firefighting/LSA"
-        if any(w in x for w in ["piping", "overboard", "sea chest", "scupper", "pressure"]): return "Pollution/cargo"
-        if any(w in x for w in ["diagram", "manifold", "arrangement"]): return "Diagrams"
+    df.columns=[str(c).strip() for c in df.columns]
+    joined=df.fillna("").astype(str).apply(lambda r:" ".join(r.tolist()),axis=1)
+    df["row_text"]=joined
+    def fam(x):
+        y=x.lower()
+        if any(w in y for w in ["incident","injury","ground","collision","allision"]): return "Incident declaration"
+        if any(w in y for w in ["certificate","expiry","issued","endorsement","cofr"]): return "Certificate/date accuracy"
+        if any(w in y for w in ["class","condition","memoranda","dry dock","iws","survey"]): return "Class/survey"
+        if any(w in y for w in ["mooring","brake","rope","tail","winch","fairlead","chock"]): return "Mooring"
+        if any(w in y for w in ["tank","coating","void","ballast"]): return "Tank/structural"
+        if any(w in y for w in ["foam","fire","lifeboat","rescue"]): return "Firefighting/LSA"
+        if any(w in y for w in ["piping","overboard","sea chest","scupper","pressure"]): return "Pollution/cargo"
+        if any(w in y for w in ["diagram","manifold","arrangement"]): return "Diagrams"
         return "Other HVPQ accuracy"
-    df["family"] = joined.map(fam)
+    df["family"]=joined.map(fam)
     return df
 
-def targeted_checklist(obs: pd.DataFrame) -> pd.DataFrame:
-    base = [
-        ("PIQ/HVPQ", "Incident declaration", "Confirm HVPQ 1.9.3/1.9.5 and PIQ 5.7 answers reflect all incidents in previous 12 months. If nil, vessel must positively confirm nil."),
-        ("PIQ/HVPQ", "PSC", "Confirm last 3 PSC inspections in PIQ and last PSC in HVPQ are updated: date, port, MOU, deficiencies, detention, OCIMF entry."),
-        ("Class Status", "Class/certificates", "Verify HVPQ/Q88 certificate expiry dates against latest Class Status and certificates."),
-        ("Class Status", "COC/MOC/dispensation", "Verify Conditions of Class, Memoranda/Notes of Class and flag/class dispensations are correctly declared."),
-        ("PIQ", "Superintendent visits", "Verify Technical Superintendent gap <=7 months and Marine Superintendent gap <=12 months; any exceedance must be explained/actioned."),
-        ("PIQ", "Tank inspections", "Verify cargo/slop, ballast and void inspection sequence dates and due dates against tank inspection records."),
-        ("HVPQ/Q88", "Mooring", "Verify mooring winch details, brake test date, brake holding capacity/rendering load, split drum, rope/tail certificates and end-for-end/discard records."),
-        ("HVPQ/Q88", "Cargo/pollution", "Verify cargo/bunker pressure test, overboard blanks/testing, sea chest, scupper plugs and cargo system details."),
-        ("HVPQ/Q88", "Firefighting", "Verify foam type/test certificate date, fixed systems, sample locker systems and rescue boat/davit declarations."),
-        ("HVPQ/Q88", "Diagrams", "Verify mooring layout, manifold layout, fairlead/chock/bitt and bow mooring arrangement diagrams are attached/current."),
+def checklist(obs: pd.DataFrame) -> pd.DataFrame:
+    rows=[
+        ["PIQ/HVPQ","Incident declaration","Confirm nil incidents or declare all reportable machinery/navigation/mooring/pollution/security/injury/operational incidents in last 12 months."],
+        ["Class Status","Certificates","Check COFR, IOPP, VGP, Class, SEC/SRC/SCC/Loadline/COF/SMC/ISSC issue and expiry dates against latest certificates/Class Status."],
+        ["Class Status","COC/MOC/Notes","Confirm Conditions of Class, statutory conditions, actionable notes, memoranda/notes and dispensations are declared correctly."],
+        ["PIQ","Superintendent visits","Check Technical Superintendent gap <=7 months and Marine Superintendent gap <=12 months; any exceedance to be explained/actioned."],
+        ["PIQ","Tank inspections","Check cargo/slop, ballast and void inspection sequence dates against tank inspection records."],
+        ["HVPQ/Q88","Mooring","Verify brake test date, BHC/rendering load, split drum, mooring rope/tail certificates, end-for-end/discard and diagrams."],
+        ["HVPQ/Q88","Cargo/pollution","Verify cargo/bunker pressure test, overboard blanks/testing, sea chest/scupper and cargo system declarations."],
+        ["HVPQ/Q88","Firefighting/LSA","Verify foam type/test date, fixed systems, sample locker systems, rescue boat/davit and LSA certificates."],
+        ["HVPQ","Publications","Verify publication editions against onboard controlled publication list."],
     ]
-    rows = [{"source":s,"area":a,"ship_check":c,"priority":"Targeted"} for s,a,c in base]
     if obs is not None and not obs.empty and "family" in obs:
-        counts=obs["family"].value_counts().to_dict()
-        for fam,cnt in counts.items():
-            rows.append({"source":"Observation library","area":fam,"ship_check":f"Historical observation family appears {cnt} time(s). Include this area in targeted ship verification.","priority":"Observation-driven"})
-    return pd.DataFrame(rows)
+        for fam,cnt in obs["family"].value_counts().items():
+            rows.append(["Observation library",fam,f"Historical observations contain {cnt} item(s) in this family. Include in ship verification."])
+    return pd.DataFrame(rows,columns=["Source","Area","Targeted check"])
 
-# -------------------------
-# Rules/comparison
-# -------------------------
-def compare_pair(field: str, label: str, area: str, a_name: str, a: Field, b_name: str, b: Field) -> Optional[Finding]:
-    if not a.value or not b.value:
-        return None
-    ok, reason = equivalent(a.value, b.value, field)
-    if ok:
-        return None
-    risk = "CRITICAL" if field in {"imo_number", "psc_detained", "incident_pollution_grounding_collision"} else "HIGH"
-    values = {"hvpq_value":"", "piq_value":"", "class_value":"", "q88_value":""}
-    for nm, fld in [(a_name,a), (b_name,b)]:
-        key = {"hvpq":"hvpq_value", "piq":"piq_value", "class":"class_value", "q88":"q88_value"}.get(nm, "hvpq_value")
-        values[key] = fld.value
-    return Finding(area, f"{label}: {a_name.upper()} vs {b_name.upper()}", "MISMATCH", risk,
-                   **values, reason=reason,
-                   required_action="Verify against source evidence and correct the declaration if needed.",
-                   evidence=f"{a_name.upper()}: {a.evidence}\n{b_name.upper()}: {b.evidence}")
+def fields_df(srcname, fields):
+    return pd.DataFrame([{"source":srcname,"field":k,"value":v.value,"confidence":v.confidence,"evidence":v.evidence[:400]} for k,v in sorted(fields.items())])
 
-def add_missing_source_checks(hvpq, piq, cls, q88) -> List[Finding]:
-    out=[]
-    # CII verified by Owner is a warning/manual check, not a mismatch.
-    if hvpq.get("cii_verified_by", Field()).value.lower() == "owner":
-        out.append(Finding("Environmental", "CII verification basis", "MANUAL CHECK", "MEDIUM",
-            hvpq_value=f"CII {hvpq.get('cii_rating', Field()).value}; verified by Owner",
-            reason="CII value is declared but verification basis is Owner. Inspectors often expect supporting latest CII/SEEMP evidence.",
-            required_action="Vessel/office to verify latest CII/AER evidence and confirm HVPQ entry is current.",
-            evidence=hvpq.get("cii_verified_by", Field()).evidence))
-    return out
-
-def run_comparison(hvpq: Dict[str, Field], piq: Dict[str, Field], cls: Dict[str, Field], q88: Dict[str, Field]) -> List[Finding]:
-    srcs={"hvpq":hvpq,"piq":piq,"class":cls,"q88":q88}
-    findings=[]
-    for field, area, label, allowed_sources in COMPARE_MAP:
-        # Only compare HVPQ against other docs, except PIQ-only checks below. Do not compare Q88 vs Class etc.
-        if "hvpq" in allowed_sources and hvpq.get(field, Field()).value:
-            for other in allowed_sources:
-                if other == "hvpq": continue
-                fnd = compare_pair(field,label,area,"hvpq",hvpq[field],other,srcs[other].get(field, Field()))
-                if fnd: findings.append(fnd)
-    # Certificates: HVPQ vs Class/Q88 only when both extracted confidently.
-    for key in CERT_COMPARE_KEYS:
-        hv = hvpq.get(key, Field())
-        if not hv.value: continue
-        label = key.replace("_", " ").replace("expiry", "expiry").title()
-        for other, odict in [("class",cls),("q88",q88)]:
-            if key in odict and odict[key].value:
-                fnd = compare_pair(key,label,"Certificates","hvpq",hv,other,odict[key])
-                if fnd: findings.append(fnd)
-    # Incident nil/declared mismatch HVPQ vs PIQ specific
-    h_inc = hvpq.get("incident_other", Field()).value
-    p_inc = piq.get("incident_other", Field()).value
-    if h_inc and p_inc and norm_for_compare(h_inc) != norm_for_compare(p_inc):
-        findings.append(Finding("Incidents","Other incident declaration: HVPQ vs PIQ","MISMATCH","HIGH",
-            hvpq_value=h_inc, piq_value=p_inc,
-            reason="HVPQ and PIQ do not appear aligned on previous-12-month incident declaration.",
-            required_action="Ship/office to confirm incident history and update both HVPQ and PIQ consistently.",
-            evidence=f"HVPQ: {hvpq.get('incident_other').evidence}\nPIQ: {piq.get('piq_incident_section', Field()).evidence}"))
-    if h_inc.lower()=="no" and (not p_inc or p_inc.lower()=="no"):
-        findings.append(Finding("Incidents","No incidents declared","MANUAL CHECK","MEDIUM",
-            hvpq_value=h_inc, piq_value=p_inc,
-            reason="No incidents appear declared. Positive confirmation is required because incident non-reporting is a recurring observation category.",
-            required_action="Ask vessel/office to confirm no reportable incidents in previous 12 months before submission."))
-
-    # Superintendent rule: deterministic PIQ-only
-    for key, label, max_months in [("technical_superintendent_last_to","Technical Superintendent inspection gap",7),("marine_superintendent_last_to","Marine Superintendent inspection gap",12)]:
-        val=piq.get(key, Field()).value
-        docdate=piq.get("document_date", Field()).value or hvpq.get("document_date", Field()).value
-        if val:
-            try:
-                last=dateparser.parse(val).date(); today=dateparser.parse(docdate, dayfirst=True).date() if docdate else date.today()
-                due=last+relativedelta(months=max_months)
-                if today>due:
-                    findings.append(Finding("Management Oversight",label,"MISMATCH","CRITICAL",piq_value=f"Last to: {val}; due by: {dstr(due)}; document date: {dstr(today)}",reason=f"Gap exceeds strict {max_months}.0 month rule.",required_action="Arrange/justify superintendent visit and correct PIQ if needed.",evidence=piq.get(key).evidence))
-            except Exception:
-                pass
-    # Tank inspection due calculations PIQ-only, always manual/targeted
-    for dk,label in [("cargo_tank_oldest_inspection","Cargo/slop tank"),("ballast_tank_oldest_inspection","Ballast tank"),("void_oldest_inspection","Void space")]:
-        if dk in piq:
-            freq=int(float(piq.get(dk+"_frequency_months", Field("12")).value or 12))
-            try:
-                d=dateparser.parse(piq[dk].value).date(); due=d+relativedelta(months=freq)
-                findings.append(Finding("Tank Inspection",f"{label} inspection sequence due calculation","MANUAL CHECK","MEDIUM",piq_value=f"Oldest date: {dstr(d)}; frequency: {freq} months; next due: {dstr(due)}",reason="PIQ tank inspection sequence should be verified against latest tank inspection records.",required_action="Ship to confirm latest tank inspection records and update PIQ if sequence changed.",evidence=piq[dk].evidence))
-            except Exception: pass
-    findings.extend(add_missing_source_checks(hvpq,piq,cls,q88))
-    # Deduplicate exact check/source/value combos
-    seen=set(); uniq=[]
-    for f in findings:
-        key=(f.area,f.check,f.hvpq_value,f.piq_value,f.class_value,f.q88_value)
-        if key not in seen:
-            seen.add(key); uniq.append(f)
-    return uniq
-
-# -------------------------
-# UI and exports
-# -------------------------
-def fields_df(name: str, d: Dict[str, Field]) -> pd.DataFrame:
-    return pd.DataFrame([{ "source_doc": name, "field": k, **asdict(v)} for k,v in sorted(d.items())])
-
-def make_excel(findings: List[Finding], checklist: pd.DataFrame, extracted: pd.DataFrame, obs: pd.DataFrame) -> bytes:
-    bio=io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        pd.DataFrame([asdict(x) for x in findings]).to_excel(writer,index=False,sheet_name="Findings")
-        checklist.to_excel(writer,index=False,sheet_name="Ship Checklist")
-        extracted.to_excel(writer,index=False,sheet_name="Extracted Fields")
-        if obs is not None and not obs.empty:
-            obs.to_excel(writer,index=False,sheet_name="Observation Library")
-    return bio.getvalue()
-
+# -----------------------------
+# Streamlit
+# -----------------------------
 def main():
-    st.set_page_config(page_title=f"HVPQ / PIQ Checker {APP_VERSION}", layout="wide")
-    st.title(f"HVPQ / PIQ Vetting Observation Checker {APP_VERSION}")
-    st.caption("Extraction-first. HVPQ/Q88 mapped by section. Class Status limited to certificates, survey status, COC/MOC/notes. No mismatch if extraction is missing.")
+    st.set_page_config(page_title="HVPQ / PIQ Checker v8", layout="wide")
+    st.title("HVPQ / PIQ Vetting Observation Checker v8")
+    st.caption("Extraction-first. Source-aware. No broad class/Q88 fuzzy mismatches. Designed to produce targeted ship/office verification checks.")
     with st.sidebar:
-        hvpq_file=st.file_uploader("HVPQ PDF", type=["pdf"])
-        piq_file=st.file_uploader("PIQ PDF", type=["pdf"])
-        class_file=st.file_uploader("Class Status PDF", type=["pdf"])
-        q88_file=st.file_uploader("Q88 PDF", type=["pdf"])
-        xml_file=st.file_uploader("HVPQ XML optional", type=["xml"])
-        obs_file=st.file_uploader("HVPQ observation Excel optional", type=["xlsx"])
-        inc_obs_file=st.file_uploader("Incident observation Excel optional", type=["xlsx"])
-        show_extraction_debug=st.checkbox("Show raw text debug", False)
-        run=st.button("Run extraction and checks", type="primary")
-    if not run:
-        st.info("Upload documents and run checks.")
-        return
-    hvpq_text=read_pdf(hvpq_file) if hvpq_file else ""
-    piq_text=read_pdf(piq_file) if piq_file else ""
-    class_text=read_pdf(class_file) if class_file else ""
-    q88_text=read_pdf(q88_file) if q88_file else ""
-    xml_text=xml_file.getvalue().decode("utf-8", errors="ignore") if xml_file else ""
-    hvpq=extract_hvpq(hvpq_text, xml_text)
-    piq=extract_piq(piq_text)
-    cls=extract_class_status(class_text)
-    q88=extract_q88(q88_text)
-    obs=pd.concat([parse_obs_excel(obs_file), parse_obs_excel(inc_obs_file)], ignore_index=True) if (obs_file or inc_obs_file) else pd.DataFrame()
-    checklist=targeted_checklist(obs)
-    findings=run_comparison(hvpq,piq,cls,q88)
+        st.header("Upload documents")
+        hvpq_file=st.file_uploader("HVPQ PDF",type=["pdf"])
+        piq_file=st.file_uploader("PIQ PDF",type=["pdf"])
+        class_file=st.file_uploader("Class Status PDF",type=["pdf"])
+        q88_file=st.file_uploader("Q88 PDF",type=["pdf"])
+        obs_file=st.file_uploader("Observation library Excel (optional)",type=["xlsx","xls"])
+        asof=st.date_input("As-of / review date", value=date.today())
+        show_evidence=st.checkbox("Show evidence column",value=False)
+    hvpq_txt=pdf_text(hvpq_file)
+    piq_txt=pdf_text(piq_file)
+    cls_txt=pdf_text(class_file)
+    q88_txt=pdf_text(q88_file)
+    hvpq=extract_hvpq(hvpq_txt)
+    piq=extract_piq(piq_txt)
+    cls=extract_class(cls_txt)
+    q88=extract_q88(q88_txt)
+    # Use document date as as-of when available and user didn't change? Keep user input but default today. Findings use selected.
+    findings=run_rules(hvpq,piq,cls,q88,asof)
     df=pd.DataFrame([asdict(x) for x in findings])
-    extracted=pd.concat([fields_df("HVPQ",hvpq), fields_df("PIQ",piq), fields_df("Class Status",cls), fields_df("Q88",q88)], ignore_index=True)
-
-    st.subheader("Actionable mismatch / manual-check register")
+    if not show_evidence and not df.empty:
+        df_show=df.drop(columns=["evidence"])
+    else:
+        df_show=df
     c1,c2,c3,c4=st.columns(4)
-    c1.metric("Actionable rows", len(df))
-    c2.metric("Critical", int((df['risk'].eq('CRITICAL')).sum()) if not df.empty else 0)
-    c3.metric("High", int((df['risk'].eq('HIGH')).sum()) if not df.empty else 0)
-    c4.metric("Manual/Medium", int((df['risk'].isin(['MEDIUM','MANUAL CHECK'])).sum()) if not df.empty else 0)
-    tabs=st.tabs(["Findings", "Extracted fields", "Ship checklist", "Observation library", "Debug"])
+    c1.metric("Actionable rows",len(df))
+    c2.metric("Critical",int((df["risk"]=="CRITICAL").sum()) if not df.empty else 0)
+    c3.metric("High",int((df["risk"]=="HIGH").sum()) if not df.empty else 0)
+    c4.metric("Manual/Medium",int((df["status"]=="MANUAL CHECK").sum()) if not df.empty else 0)
+    tabs=st.tabs(["Findings","Extracted fields","Ship checklist","Observation library","Debug text"])
     with tabs[0]:
-        if df.empty: st.success("No actionable mismatch found from extracted fields. Review extracted fields/checklist before sending to vessel.")
-        else: st.dataframe(df, use_container_width=True, height=540)
+        st.subheader("Actionable mismatch / manual-check register")
+        st.dataframe(df_show,use_container_width=True,height=520)
+        if not df.empty:
+            bio=io.BytesIO()
+            with pd.ExcelWriter(bio,engine="openpyxl") as writer:
+                df.to_excel(writer,index=False,sheet_name="Findings")
+                pd.concat([fields_df("HVPQ",hvpq),fields_df("PIQ",piq),fields_df("Class",cls),fields_df("Q88",q88)],ignore_index=True).to_excel(writer,index=False,sheet_name="Extracted fields")
+                checklist(parse_obs_excel(obs_file)).to_excel(writer,index=False,sheet_name="Ship checklist")
+            st.download_button("Download Excel register",bio.getvalue(),"hvpq_piq_v8_register.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with tabs[1]:
-        st.dataframe(extracted, use_container_width=True, height=620)
+        st.dataframe(pd.concat([fields_df("HVPQ",hvpq),fields_df("PIQ",piq),fields_df("Class",cls),fields_df("Q88",q88)],ignore_index=True),use_container_width=True,height=600)
     with tabs[2]:
-        st.dataframe(checklist, use_container_width=True, height=420)
+        st.dataframe(checklist(parse_obs_excel(obs_file)),use_container_width=True,height=600)
     with tabs[3]:
-        if obs.empty: st.caption("No observation library uploaded.")
-        else: st.dataframe(obs, use_container_width=True, height=500)
+        obs=parse_obs_excel(obs_file)
+        if obs.empty: st.info("No observation Excel uploaded or no rows read.")
+        else: st.dataframe(obs,use_container_width=True,height=600)
     with tabs[4]:
-        if show_extraction_debug:
-            st.text_area("HVPQ text preview", hvpq_text[:5000], height=200)
-            st.text_area("PIQ text preview", piq_text[:5000], height=200)
-            st.text_area("Class Status text preview", class_text[:5000], height=200)
-            st.text_area("Q88 text preview", q88_text[:5000], height=200)
-        else:
-            st.caption("Enable 'Show raw text debug' in sidebar to inspect extraction text.")
-    st.download_button("Download Excel register", data=make_excel(findings, checklist, extracted, obs), file_name="hvpq_piq_vetting_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.write("Text lengths", {"hvpq":len(hvpq_txt),"piq":len(piq_txt),"class":len(cls_txt),"q88":len(q88_txt)})
+        with st.expander("HVPQ text sample"): st.text(hvpq_txt[:5000])
+        with st.expander("Class text sample"): st.text(cls_txt[:5000])
+        with st.expander("Q88 text sample"): st.text(q88_txt[:5000])
 
 if __name__ == "__main__":
     main()
