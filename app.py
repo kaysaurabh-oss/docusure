@@ -759,7 +759,9 @@ def parse_obs_excel(uploaded) -> pd.DataFrame:
         return pd.DataFrame()
     df.columns = [str(c).strip() for c in df.columns]
     if df.empty: return df
-    joined = df.astype(str).agg(" ".join, axis=1)
+    # Robust row text join. pandas versions differ in how DataFrame.agg handles string-callables.
+    # Using apply with explicit conversion avoids TypeError on Streamlit Cloud / pandas 3.x.
+    joined = df.fillna("").astype(str).apply(lambda row: " ".join([str(v) for v in row.tolist()]), axis=1)
     qids = joined.str.extract(r"((?:\d+\.){1,4}\d+)")[0]
     df["detected_qid"] = qids
     def fam(s):
