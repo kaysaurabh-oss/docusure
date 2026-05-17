@@ -20,7 +20,7 @@ from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
 APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v15"
-APP_SUBTITLE = "Extraction-first HVPQ, Q88 and PIQ review with observation-informed reasons and rule-based validation checks."
+APP_SUBTITLE = "Extraction-first HVPQ, Q88 and PIQ review with repeat-observation risk used only as supporting reason, not as generic manual workload."
 
 # ----------------------------- Data models -----------------------------
 
@@ -2293,6 +2293,32 @@ DEFAULT_COMPARISON_RULES_TEXT = 'I will give you 2 documents to analyze HVPQ (PD
 
 RULE_QIDS = ["1.1.13.4", "1.5.1.2", "1.5.4.1", "1.5.6.1", "1.5.11", "1.5.12", "1.9.1", "1.9.2", "3.2.1", "3.3.4", "5.3.1.4", "7.1.1", "7.1.3", "7.1.4.5", "9.6.2", "10.1.4", "10.1.7", "10.9.1", "PIQ 1.1.1", "PIQ 3.2.1", "PIQ 3.2.2", "PIQ 3.2.5", "PIQ 3.2.6", "PIQ 3.2.7", "PIQ 2.2.1001", "PIQ 2.2.1002", "PIQ 2.3.3001", "PIQ 2.3.3002", "PIQ 2.8.2", "PIQ 5.7.1001-1029"]
 
+def _normalise_qid_token(token: str) -> str:
+    """Normalise HVPQ-like question numbers and reject dates/loose Q88 line numbers.
+
+    The observation Excel often contains dates such as 05.02.2027 or Q88-style
+    two-part numbers such as 1.11. These must not become HVPQ manual checks.
+    For this checker we only treat three-part numeric references as HVPQ question
+    references, e.g. 2.1.5, 7.1.3, 10.1.4, 2.2.1001.
+    """
+    t = str(token).strip().strip(".,;:()[]{}")
+    parts = t.split(".")
+    if len(parts) != 3:
+        return ""
+    if not all(p.isdigit() for p in parts):
+        return ""
+    a, b, c = [int(p) for p in parts]
+    # HVPQ chapters are normally 1-13. This removes random values but keeps 10.1.4 etc.
+    if not (1 <= a <= 13):
+        return ""
+    # Reject obvious dates in dd.mm.yyyy / mm.dd.yyyy form.
+    if 1900 <= c <= 2100 and 1 <= a <= 31 and 1 <= b <= 12:
+        return ""
+    # Reject improbable month/year-looking values even with leading zero.
+    if len(parts[2]) == 4 and c >= 1900:
+        return ""
+    return f"{a}.{b}.{c}"
+
 def extract_qids_from_obs(obs_df: pd.DataFrame) -> set:
     qids=set()
     if obs_df is None or obs_df.empty:
@@ -2302,20 +2328,29 @@ def extract_qids_from_obs(obs_df: pd.DataFrame) -> set:
     except Exception:
         return qids
     for s in joined:
-        for m in re.findall(r"\b(?:\d{1,2}\.\d{1,2}(?:\.\d{1,4})?)\b", str(s)):
-            qids.add(m)
+        # Require three components. This intentionally ignores Q88-style 1.11 / 1.15
+        # because the observation library is used only to prioritise HVPQ correction checks.
+        for m in re.findall(r"\b\d{1,2}\.\d{1,2}\.\d{1,4}\b", str(s)):
+            q=_normalise_qid_token(m)
+            if q:
+                qids.add(q)
     return qids
 
 def obs_reason_for(qno: str, obs_qids: set) -> str:
     if not qno or not obs_qids:
         return ""
     qno_s=str(qno)
-    q_tokens=set(re.findall(r"\d{1,2}\.\d{1,2}(?:\.\d{1,4})?", qno_s))
-    if qno_s in obs_qids or q_tokens.intersection(obs_qids):
-        return "High repeat-observation area from uploaded observation library; this item has been prioritized for HVPQ accuracy review."
+    tokens=set()
+    for m in re.findall(r"\b\d{1,2}\.\d{1,2}\.\d{1,4}\b", qno_s):
+        q=_normalise_qid_token(m)
+        if q:
+            tokens.add(q)
+    if tokens.intersection(obs_qids):
+        return "Similar issues have appeared in the uploaded observation history, so this HVPQ item is prioritised for correction/review."
     for q in obs_qids:
-        if q and (q in qno_s or qno_s.startswith(q)):
-            return "High repeat-observation area from uploaded observation library; this item has been prioritized for HVPQ accuracy review."
+        for t in tokens:
+            if t.startswith(q + ".") or q.startswith(t + "."):
+                return "Similar issues have appeared in the uploaded observation history, so this HVPQ item is prioritised for correction/review."
     return ""
 
 def concise_check_name(text_in: str) -> str:
@@ -2432,11 +2467,11 @@ def build_hvpq_checks_v15(fields: List[FieldRecord], findings: List[Finding], re
     for row in [_hvpq_ops_row(fields, ref_date, "Brake testing", "mooring.brake_test_date", 12, "10.1.4", "Mooring", "Latest brake test date found in HVPQ/Q88 text"), _hvpq_ops_row(fields, ref_date, "Mooring ropes age / visible date", "mooring.ropes.latest_visible_date", 60, "10.1.7", "Mooring", "Latest rope/tail visible date found; verify every rope individually")]:
         if row["Priority"] != "Manual":
             add_row(row["Priority"], row["Question / Section"], row["Area"], row["Check"], row["Status"], row["HVPQ value"], row["Reference source"], row["Reference value"], row["Finding / interpretation"], row["Action requested"])
-    covered_q=set(str(r.get("Question / Section","")) for r in rows)
-    for q in sorted(obs_qids):
-        if not q or any(q in c for c in covered_q):
-            continue
-        add_row("Manual", q, "Observation-informed HVPQ review", f"HVPQ question {q}", "Manual confirmation", "See HVPQ", "Observation library", "High repeat observation", "High repeat-observation area from uploaded observation library. The app could not reliably confirm the exact answer/validity from extracted data; manual check is preferred.", "Vessel/office to verify this HVPQ question and update HVPQ if blank, stale or inconsistent with evidence.")
+    # Observation-library question numbers are deliberately not converted into standalone
+    # manual checks. They are used only to strengthen the reason for an actual HVPQ
+    # issue/blank/mismatch already detected above. This avoids discouraging users with
+    # hundreds of generic repeat-observation rows when the extracted HVPQ entry appears
+    # present and not doubtful.
     cols=["Priority","Question / Section","Area","Check","Status","HVPQ value","Reference source","Reference value","Finding / interpretation","Action requested"]
     df=pd.DataFrame(rows)
     if df.empty: return pd.DataFrame(columns=cols)
@@ -2564,7 +2599,7 @@ def main():
         run_btn = st.button("Run checks", type="primary")
 
     if not run_btn:
-        st.info("Upload HVPQ, PIQ, Q88, Class Status and observation sheets where available, then click **Run checks**. The output is split into HVPQ checks, Q88 checks, PIQ checks and repeat-observation question checks.")
+        st.info("Upload HVPQ, PIQ, Q88, Class Status and observation sheets where available, then click **Run checks**. The output is split into HVPQ checks, Q88 checks and PIQ checks; observation history is used only as a supporting reason for actual doubtful items.")
         return
 
     settings = {"show_low": show_low}
@@ -2626,7 +2661,7 @@ def main():
     st.info(summary["manual"])
 
     xlsx = make_excel_v15(hvpq_checks_df, q88_checks_df, piq_checks_df)
-    st.download_button("Download Excel check register", xlsx, file_name="hvpq_piq_q88_check_register_v15.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download Excel check register", xlsx, file_name="hvpq_piq_q88_check_register_v16.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     tabs = st.tabs(["HVPQ Checks", "Q88 Value Add", "PIQ Checks", "Advanced Extraction"])
     with tabs[0]:
