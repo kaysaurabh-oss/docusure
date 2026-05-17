@@ -19,8 +19,8 @@ from openpyxl.utils import get_column_letter
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
-APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v13"
-APP_SUBTITLE = "Simple review dashboard with HVPQ correction register, vessel action list, Q88 value-add checks, and manual-confirmation coverage."
+APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v14"
+APP_SUBTITLE = "Extraction-first document review with separate HVPQ, Q88, PIQ and repeat-observation check registers."
 
 # ----------------------------- Data models -----------------------------
 
@@ -547,6 +547,7 @@ def extract_hvpq(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     cert_end = next((i for i,l in enumerate(lines[cert_start+1:], cert_start+1) if re.search(r"Publications", l, re.I)), len(lines)) if cert_start >= 0 else -1
     cert_lines = lines[cert_start:cert_end] if cert_start >= 0 else []
     fields += parse_cert_rows_from_sequence(cert_lines, source, cert_order="hvpq")
+    add_section_and_operational_fields(fields, source, text)
     return dedupe_fields(fields)
 
 
@@ -665,6 +666,8 @@ def extract_q88(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
             if tail and tail.lower() != line.lower():
                 add_field(fields, source, "environment.cii_verified_by", tail, raw=line)
 
+    add_section_and_operational_fields(fields, source, text)
+
     # Certificate special: P&I coverage/expiration contains expiry only
     for line in lines:
         m = re.search(r"1\.15\s+P\s*&\s*I Club pollution liability coverage/expiration date:\s*(.+)$", line, re.I)
@@ -689,6 +692,12 @@ def extract_piq(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     if m:
         add_field(fields, source, "vessel.name", m.group(1), raw=m.group(0))
         add_field(fields, source, "piq.date", m.group(2), label="PIQ date", raw=m.group(0))
+    else:
+        # Many PIQs extract header as: PIQ Report / VESSEL / Vessel Name / Date / date
+        m2 = re.search(r"PIQ Report\s+([A-Z0-9 '\-]{3,80})\s+Vessel Name\s+Date\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.I)
+        if m2:
+            add_field(fields, source, "vessel.name", clean_text(m2.group(1)), raw=m2.group(0))
+            add_field(fields, source, "piq.date", m2.group(2), label="PIQ date", raw=m2.group(0))
     add_field(fields, source, "vessel.type", find_value_after_label(lines, r"^Vessel Type\b"))
     ann = find_value_after_label(lines, r"Annex II cargo")
     add_field(fields, source, "piq.annex_ii_carried_or_intended", ann, label="Annex II carried/intended")
@@ -727,14 +736,43 @@ def extract_piq(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     add_field(fields, source, "moc.equipment_replaced_details", window_after(lines, r"Equipment replaced", 8), label="Equipment replaced details")
     add_field(fields, source, "moc.equipment_decommissioned", find_value_after_label(lines, r"Equipment decommissioned"))
 
+    # More PIQ extraction: audits, assessments, training and key yes/no declarations.
+    piq_extra_patterns = [
+        ("piq.static_nav_assessment", r"Static navigational assessment conducted"),
+        ("piq.dynamic_nav_assessment_shore", r"Dynamic navigational assessment conducted by a member"),
+        ("piq.dynamic_nav_assessment_third_party", r"Dynamic navigational assessment conducted by a third party"),
+        ("piq.remote_nav_assessment", r"Unannounced remote navigational assessment"),
+        ("piq.cargo_audit", r"Comprehensive cargo audit"),
+        ("piq.engineering_audit", r"Comprehensive engineering audit"),
+        ("piq.mooring_anchoring_audit", r"Comprehensive mooring and anchoring audit"),
+        ("piq.behavioural_competency", r"Behavioural Competency Assessment programme"),
+        ("piq.brm_training", r"BTM/BRM training course attendance"),
+        ("piq.cargo_simulator", r"shore based cargo simulation course attended"),
+        ("piq.sms_language", r"Primary Language"),
+        ("piq.working_language", r"Common working language"),
+    ]
+    for fid, patt in piq_extra_patterns:
+        val = find_value_after_label(lines, patt)
+        if not val:
+            win = window_after(lines, patt, 5)
+            m = re.search(r"\b(Yes|No|English|Not applicable|NA)\b", win, re.I)
+            val = m.group(1) if m else ""
+        add_field(fields, source, fid, val, label=fid, raw=window_after(lines, patt, 5))
+
     # PSC block
-    psc_win = window_after(lines, r"last three Port State Control", 20)
+    psc_win = window_after(lines, r"last three Port State Control", 45)
     add_field(fields, source, "psc.block", psc_win, label="PSC block", raw=psc_win)
-    m = re.search(r"Last\s+" + DATE_RE.pattern + r"\s+([^,]+)", psc_win, re.I)
+    m = re.search(r"Last\s+" + DATE_RE.pattern + r"\s+([^|\n]+?)(?:\s+(?:US Coastguard|Tokyo MoU|Indian Ocean MoU|Paris MoU|Vina Del Mar|Black Sea MoU|Mediterranean MoU)|\s+\d+\.\d+|$)", psc_win, re.I)
     if m:
         dates = extract_dates(m.group(0))
         if dates: add_field(fields, source, "psc.last_date", dates[0], raw=psc_win)
-        add_field(fields, source, "psc.last_port", m.group(1), raw=psc_win)
+        # Port extraction from full PSC table is handled by the robust fallback below.
+    # robust fallback for extracted PSC tables
+    m2 = re.search(r"Last\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+(.+?)\s+(US Coastguard|Tokyo MoU|Indian Ocean MoU|Paris MoU|Vina Del Mar|Black Sea MoU|Mediterranean MoU)", psc_win, re.I)
+    if m2:
+        if not first_field(fields, source, "psc.last_date"):
+            add_field(fields, source, "psc.last_date", m2.group(1), raw=psc_win)
+        add_field(fields, source, "psc.last_port", clean_text(m2.group(2)), raw=psc_win)
 
     # Incidents: PIQ incident section often later, extract yes/no if visible
     for kw, fid in [
@@ -1625,6 +1663,87 @@ def raw_text_for_source(page_cache: Dict[str, List[Tuple[int, str]]], source: st
     return "\n".join(t for _, t in page_cache.get(source, []))
 
 
+def section_text_by_qid(text: str, qid: str, max_chars: int = 2600) -> str:
+    """Return text around an HVPQ-style question number. Conservative helper for vessel-facing checks."""
+    if not text or not qid:
+        return ""
+    m = re.search(r"(?<!\d)" + re.escape(qid) + r"(?!\d)", text)
+    if not m:
+        return ""
+    start = max(0, m.start())
+    end = min(len(text), start + max_chars)
+    snippet = text[start:end]
+    # stop at a later question number when it is not simply a subline very close to start
+    nxt = re.search(r"\n\s*\d{1,2}\.\d{1,2}(?:\.\d{1,4})?\b", snippet[len(qid)+120:])
+    if nxt:
+        snippet = snippet[:len(qid)+120+nxt.start()]
+    return clean_text(snippet)
+
+
+def latest_date_in_text(text: str) -> str:
+    dates = []
+    for d in extract_dates(text or ""):
+        pd_dt = parse_date_any(d)
+        if pd_dt:
+            dates.append((pd_dt, d))
+    if not dates:
+        return ""
+    dates.sort(reverse=True)
+    return dates[0][1]
+
+
+def all_dates_in_text(text: str) -> List[date]:
+    out = []
+    for d in extract_dates(text or ""):
+        pd_dt = parse_date_any(d)
+        if pd_dt:
+            out.append(pd_dt)
+    return out
+
+
+def add_section_and_operational_fields(fields: List[FieldRecord], source: str, text: str):
+    """Add raw section snippets and best-effort operational dates for mooring/brake/ropes/tails.
+    These are deliberately marked as deterministic/manual-grade fields; rules will not overclaim if absent.
+    """
+    if not text:
+        return
+    qids = ["10.1.4", "10.1.7", "7.1.1", "7.1.3", "2.1.5", "1.9.8", "5.3.1", "5.3.2", "6.1.13", "6.1.14"]
+    for q in qids:
+        sec = section_text_by_qid(text, q)
+        if sec:
+            add_field(fields, source, f"section.{q}", sec, label=f"Section {q}", raw=sec, confidence="section-snippet")
+    # Brake test: look around brake test keywords, fall back to HVPQ 10.1.4 section
+    brake_windows = []
+    for m in re.finditer(r"brake\s+test|brake\s+holding|BHC|rendering", text, re.I):
+        brake_windows.append(text[max(0, m.start()-800):min(len(text), m.end()+1800)])
+    if not brake_windows:
+        sec = section_text_by_qid(text, "10.1.4")
+        if sec:
+            brake_windows.append(sec)
+    if brake_windows:
+        joined = " ".join(brake_windows[:3])
+        dt = latest_date_in_text(joined)
+        if dt:
+            add_field(fields, source, "mooring.brake_test_date", dt, label="Latest brake test date found", raw=clean_text(joined[:1600]), confidence="best-effort")
+        add_field(fields, source, "mooring.brake_section", clean_text(joined[:2000]), label="Brake/mooring section", raw=clean_text(joined[:2000]), confidence="section-snippet")
+    # Rope / tail windows
+    rope_windows = []
+    for m in re.finditer(r"mooring\s+rope|rope\s+certificate|date\s+of\s+installation|end[- ]?for[- ]?end|tail|pennant", text, re.I):
+        rope_windows.append(text[max(0, m.start()-700):min(len(text), m.end()+1700)])
+    if not rope_windows:
+        sec = section_text_by_qid(text, "10.1.7")
+        if sec:
+            rope_windows.append(sec)
+    if rope_windows:
+        joined = " ".join(rope_windows[:4])
+        dates = all_dates_in_text(joined)
+        if dates:
+            # Store newest visible installation/service date; summary will use this only as a broad confidence check.
+            newest = max(dates)
+            add_field(fields, source, "mooring.ropes.latest_visible_date", newest.isoformat(), label="Latest rope/tail visible date", raw=clean_text(joined[:1800]), confidence="best-effort")
+        add_field(fields, source, "mooring.ropes_section", clean_text(joined[:2200]), label="Rope/tail section", raw=clean_text(joined[:2200]), confidence="section-snippet")
+
+
 def hvpq_qid_status_df(obs_df: pd.DataFrame, hvpq_text: str) -> pd.DataFrame:
     base_cols = ["Priority", "Question No.", "Topic", "HVPQ check status", "What vessel/office should check", "HVPQ evidence excerpt", "Observation basis / example"]
     obs_pin = observation_pinpoint_rows(obs_df)
@@ -1954,6 +2073,219 @@ def style_priority_dataframe(df: pd.DataFrame):
         return [''] * len(row)
     return df.style.apply(row_style, axis=1)
 
+
+# ----------------------------- v14 source-specific registers -----------------------------
+
+def status_rank(status: str) -> int:
+    s = str(status).lower()
+    if any(x in s for x in ["critical", "not satisfactory", "issue", "mismatch", "overdue", "expired"]): return 0
+    if any(x in s for x in ["manual", "could not", "review", "blank"]): return 1
+    if any(x in s for x in ["in order", "ok", "checked"]): return 2
+    return 3
+
+
+def _ok_or_manual_date(label: str, source: str, field_id: str, fields: List[FieldRecord], ref_date: date, months: int, qno: str, area: str) -> Dict[str, str]:
+    val = first_field(fields, source, field_id)
+    d = parse_date_any(val)
+    if not d:
+        return {"Priority":"Manual", "Question / Section":qno, "Area":area, "Check":label, "Status":"Could not reliably check", "Document value":val or "Not extracted/blank", "Reference value":"", "Finding / interpretation":f"{label} date was not reliably extracted.", "Action requested":"Vessel/office to verify supporting record and update HVPQ/PIQ/Q88 if blank or stale."}
+    due = d + relativedelta(months=months)
+    if due >= ref_date:
+        return {"Priority":"OK", "Question / Section":qno, "Area":area, "Check":label, "Status":"In order", "Document value":str(val), "Reference value":f"Due not before {due.isoformat()}", "Finding / interpretation":f"{label} appears within {months} months as of {ref_date.isoformat()}.", "Action requested":"No correction indicated from extracted data; keep evidence ready onboard."}
+    return {"Priority":"High", "Question / Section":qno, "Area":area, "Check":label, "Status":"Not satisfactory", "Document value":str(val), "Reference value":f"Due {due.isoformat()}", "Finding / interpretation":f"{label} appears older than permitted {months}-month interval.", "Action requested":"Verify latest record. If no newer record exists, complete/arrange check and update HVPQ/PIQ/Q88."}
+
+
+def cert_validity_rows(fields: List[FieldRecord], ref_date: date) -> List[Dict[str, str]]:
+    rows=[]
+    cert_keys=set()
+    for f in fields:
+        m=re.match(r"cert\.([^.]+)\.expiry$", f.field_id)
+        if m and f.source in ["HVPQ","CLASS"]:
+            cert_keys.add(m.group(1))
+    expired=[]; valid=[]; manual=[]
+    for key in sorted(cert_keys):
+        # Class Status is reference/authority when available, else HVPQ.
+        cval = first_field(fields,"CLASS",f"cert.{key}.expiry")
+        hval = first_field(fields,"HVPQ",f"cert.{key}.expiry")
+        use = cval or hval
+        d=parse_date_any(use)
+        label=key.upper().replace('_',' ')
+        if not d:
+            manual.append(label); continue
+        if d < ref_date:
+            expired.append((label,use,cval,hval))
+        else:
+            valid.append(label)
+        if cval and hval and parse_date_any(cval) and parse_date_any(hval) and parse_date_any(cval)!=parse_date_any(hval):
+            rows.append({"Priority":"High", "Question / Section":"2.1.5", "Area":"Certificates", "Check":f"{label} expiry mismatch HVPQ vs Class Status", "Status":"Not satisfactory", "Document value":hval, "Reference value":cval, "Finding / interpretation":"HVPQ certificate expiry differs from Class Status. Class Status is the reference for certificate/survey dates.", "Action requested":"Verify latest certificate/Class Status and correct HVPQ if stale/wrong."})
+    if expired:
+        for label,use,cval,hval in expired:
+            rows.append({"Priority":"Critical", "Question / Section":"2.1.5", "Area":"Certificates", "Check":f"{label} certificate validity", "Status":"Not satisfactory", "Document value":hval or use, "Reference value":cval or use, "Finding / interpretation":"Certificate expiry appears before the review date.", "Action requested":"Verify certificate immediately and update HVPQ/Q88 as applicable."})
+    elif valid:
+        rows.append({"Priority":"OK", "Question / Section":"2.1.5", "Area":"Certificates", "Check":"Certificate validity", "Status":"In order", "Document value":f"{len(valid)} certificate expiry date(s) checked", "Reference value":"Class Status where available, otherwise HVPQ", "Finding / interpretation":"No expired certificate detected from extracted certificate expiry dates.", "Action requested":"Keep latest certificates/Class Status ready for inspection."})
+    if manual:
+        rows.append({"Priority":"Manual", "Question / Section":"2.1.5", "Area":"Certificates", "Check":"Certificate rows not fully extracted", "Status":"Could not reliably check", "Document value":", ".join(manual[:20]), "Reference value":"", "Finding / interpretation":"Some certificate expiry dates were not reliably extracted.", "Action requested":"Manually verify those certificate dates against Class Status/latest certificates."})
+    return rows
+
+
+def build_piq_checks(fields: List[FieldRecord], findings: List[Finding], ref_date: date) -> pd.DataFrame:
+    rows=[]
+    # TS / MS intervals from findings and explicit OK rows if no breach.
+    mgmt_findings=[f for f in findings if f.area == "Management Oversight"]
+    for f in mgmt_findings:
+        rows.append({"Priority":f.risk, "Question / Section":qno_for_finding(f), "Area":f.area, "Check":f.check, "Status":f.status, "Document value":f.piq_value, "Reference value":"TS max 7 months / MS max 12 months", "Finding / interpretation":f.reason, "Action requested":f.action})
+    if any(f.field_id.startswith("superintendent.technical") for f in fields) and not any("Technical" in f.check and f.risk.upper() in ["CRITICAL","HIGH"] for f in mgmt_findings):
+        rows.append({"Priority":"OK", "Question / Section":"PIQ 2.2.1001", "Area":"Management Oversight", "Check":"Technical Superintendent visit interval", "Status":"In order", "Document value":first_field(fields,"PIQ","superintendent.technical.raw")[:350], "Reference value":"Maximum gap 7 months", "Finding / interpretation":"No breach detected from extracted Technical Superintendent visit rows.", "Action requested":"No correction indicated; keep visit reports available."})
+    if any(f.field_id.startswith("superintendent.marine") for f in fields) and not any("Marine" in f.check and f.risk.upper() in ["CRITICAL","HIGH"] for f in mgmt_findings):
+        rows.append({"Priority":"OK", "Question / Section":"PIQ 2.2.1002", "Area":"Management Oversight", "Check":"Marine Superintendent visit interval", "Status":"In order", "Document value":first_field(fields,"PIQ","superintendent.marine.raw")[:350], "Reference value":"Maximum gap 12 months", "Finding / interpretation":"No breach detected from extracted Marine Superintendent visit rows.", "Action requested":"No correction indicated; keep visit reports available."})
+    # Tank intervals
+    for title, old_fid, freq_fid, qno in [("Cargo/slop tank inspections", "tank.cargo_slop.oldest", "tank.cargo_slop.freq_months", "PIQ 2.3.3001"), ("Ballast tank inspections", "tank.ballast.oldest", "tank.ballast.freq_months", "PIQ 2.3.3002"), ("Void space inspections", "tank.void.oldest", "tank.void.freq_months", "PIQ 2.3.3003")]:
+        old = parse_date_any(first_field(fields,"PIQ",old_fid)); freq = first_field(fields,"PIQ",freq_fid)
+        months=12
+        try: months=int(float(freq)) if freq else 12
+        except Exception: pass
+        if old:
+            due=old+relativedelta(months=months)
+            rows.append({"Priority":"OK" if due>=ref_date else "High", "Question / Section":qno, "Area":"Tank inspection", "Check":title, "Status":"In order" if due>=ref_date else "Not satisfactory", "Document value":str(first_field(fields,"PIQ",old_fid)), "Reference value":f"Frequency {months} months; due {due.isoformat()}", "Finding / interpretation":f"Oldest inspection date is {'within' if due>=ref_date else 'outside'} the required interval.", "Action requested":"No correction indicated; keep inspection records ready." if due>=ref_date else "Verify completed tank inspection sequence and update PIQ/supporting records."})
+        else:
+            rows.append({"Priority":"Manual", "Question / Section":qno, "Area":"Tank inspection", "Check":title, "Status":"Could not reliably check", "Document value":"Not extracted/blank", "Reference value":"Expected frequency/date in PIQ", "Finding / interpretation":"Oldest inspection date could not be reliably extracted.", "Action requested":"Manually check PIQ 2.3.3001-3003 and tank inspection records."})
+    # MOC/retrofit, PSC, incidents, PIQ general fields/blanks
+    for f in findings:
+        if f.piq_value and f.area not in ["Management Oversight", "Tank Inspection"] and f.risk.upper() in ["CRITICAL","HIGH","MEDIUM"]:
+            rows.append({"Priority":f.risk, "Question / Section":qno_for_finding(f), "Area":f.area, "Check":f.check, "Status":f.status, "Document value":f.piq_value, "Reference value":f.hvpq_value or f.q88_value or f.class_value, "Finding / interpretation":f.reason, "Action requested":f.action})
+    for fid, label, qno in [("piq.static_nav_assessment","Static navigational assessment","PIQ 3.2.1"),("piq.dynamic_nav_assessment_shore","Dynamic navigational assessment - shore staff","PIQ 3.2.2"),("piq.cargo_audit","Comprehensive cargo audit","PIQ 3.2.5"),("piq.engineering_audit","Comprehensive engineering audit","PIQ 3.2.6"),("piq.mooring_anchoring_audit","Comprehensive mooring/anchoring audit","PIQ 3.2.7"),("moc.retrofit","MOC retrofit declaration","PIQ 2.5.1002"),("psc.last_date","Last PSC declaration","PIQ 2.8.2")]:
+        val=first_field(fields,"PIQ",fid)
+        rows.append({"Priority":"OK" if val else "Manual", "Question / Section":qno, "Area":"PIQ completeness", "Check":label, "Status":"Checked" if val else "Could not reliably check", "Document value":val, "Reference value":"", "Finding / interpretation":"PIQ value was extracted for review." if val else "PIQ value was not reliably extracted or may be blank.", "Action requested":"Verify entry is current and supported by evidence."})
+    df=pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["Priority","Question / Section","Area","Check","Status","Document value","Reference value","Finding / interpretation","Action requested"])
+    df=df.drop_duplicates()
+    df["_rank"]=df["Priority"].map(lambda x: {"Critical":0,"CRITICAL":0,"High":1,"HIGH":1,"Medium":2,"MEDIUM":2,"Manual":3,"OK":4}.get(str(x),5))
+    return df.sort_values(["_rank","Area","Question / Section"]).drop(columns="_rank")
+
+
+def build_hvpq_checks(fields: List[FieldRecord], findings: List[Finding], ref_date: date) -> pd.DataFrame:
+    rows=[]
+    for f in findings:
+        if f.risk.upper() not in ["CRITICAL","HIGH","MEDIUM"]: continue
+        # HVPQ target items: all class/cert/q88/hvpq mismatches and blanks, except pure PIQ operational rows handled separately.
+        if f.hvpq_value or f.class_value or (f.area in ["Certificates","Class / Survey","Classification","Blank / Missing","Environment","Ownership / Operation","Insurance","Vessel Type"]):
+            rows.append({"Priority":f.risk,"Question / Section":qno_for_finding(f),"Area":f.area,"Check":f.check,"Status":f.status,"HVPQ value":f.hvpq_value,"Reference source":"Class Status" if f.class_value else ("Q88" if f.q88_value else "PIQ/manual"),"Reference value":f.class_value or f.q88_value or f.piq_value,"Finding / interpretation":f.reason,"Action requested":f.action})
+    # Certificate validity positive / mismatch rows
+    for r in cert_validity_rows(fields, ref_date):
+        rows.append({"Priority":r["Priority"],"Question / Section":r["Question / Section"],"Area":r["Area"],"Check":r["Check"],"Status":r["Status"],"HVPQ value":r["Document value"],"Reference source":"Class Status/latest certificate","Reference value":r["Reference value"],"Finding / interpretation":r["Finding / interpretation"],"Action requested":r["Action requested"]})
+    # HVPQ operational recurring checks
+    rows.append(_hvpq_ops_row(fields, ref_date, "Brake testing", "mooring.brake_test_date", 12, "10.1.4", "Mooring", "Latest brake test date found in HVPQ/Q88 text"))
+    rows.append(_hvpq_ops_row(fields, ref_date, "Mooring ropes age / visible date", "mooring.ropes.latest_visible_date", 60, "10.1.7", "Mooring", "Latest rope/tail visible date found; verify every rope individually"))
+    # Tails are harder; do not overclaim unless tail text is present.
+    tail_sec = first_field(fields,"HVPQ","mooring.ropes_section") or first_field(fields,"Q88","mooring.ropes_section")
+    if re.search(r"tail|pennant", tail_sec, re.I):
+        rows.append(_hvpq_ops_row(fields, ref_date, "Tails within 18 months of installation", "mooring.ropes.latest_visible_date", 18, "10.1.7", "Mooring", "Tail/pennant keyword found; verify each tail date individually"))
+    else:
+        rows.append({"Priority":"Manual","Question / Section":"10.1.7","Area":"Mooring","Check":"Tails within 18 months of installation","Status":"Could not reliably check","HVPQ value":"Tail/pennant details not reliably extracted","Reference source":"Vessel records","Reference value":"","Finding / interpretation":"The app could not confirm tail installation/service dates from extracted text.","Action requested":"Vessel to confirm tail certificates/installation dates and whether all tails are within the applicable service interval."})
+    df=pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["Priority","Question / Section","Area","Check","Status","HVPQ value","Reference source","Reference value","Finding / interpretation","Action requested"])
+    df=df.drop_duplicates()
+    df["_rank"]=df["Priority"].map(lambda x: {"Critical":0,"CRITICAL":0,"High":1,"HIGH":1,"Medium":2,"MEDIUM":2,"Manual":3,"OK":4}.get(str(x),5))
+    return df.sort_values(["_rank","Area","Question / Section"]).drop(columns="_rank")
+
+
+def _hvpq_ops_row(fields, ref_date, label, fid, months, qno, area, interp):
+    val = first_field(fields,"HVPQ",fid) or first_field(fields,"Q88",fid)
+    source = "HVPQ" if first_field(fields,"HVPQ",fid) else ("Q88" if first_field(fields,"Q88",fid) else "")
+    d=parse_date_any(val)
+    if not d:
+        return {"Priority":"Manual","Question / Section":qno,"Area":area,"Check":label,"Status":"Could not reliably check","HVPQ value":val or "Not extracted/blank","Reference source":"Vessel records","Reference value":"","Finding / interpretation":f"{label} could not be reliably verified from extracted HVPQ/Q88 text.","Action requested":"Vessel/office to verify supporting records and update HVPQ if blank/stale/wrong."}
+    due=d+relativedelta(months=months)
+    ok=due>=ref_date
+    return {"Priority":"OK" if ok else "High","Question / Section":qno,"Area":area,"Check":label,"Status":"In order" if ok else "Not satisfactory","HVPQ value":val,"Reference source":source,"Reference value":f"Due not before {due.isoformat()} for {months}-month check","Finding / interpretation":interp + ("; appears in order from extracted date." if ok else "; appears outside expected interval."),"Action requested":"Keep evidence ready onboard." if ok else "Verify latest record and update HVPQ if stale/wrong."}
+
+
+def build_q88_checks(fields: List[FieldRecord], findings: List[Finding]) -> pd.DataFrame:
+    rows=[]
+    for f in findings:
+        if f.q88_value and f.risk.upper() in ["CRITICAL","HIGH","MEDIUM"]:
+            rows.append({"Priority":f.risk,"Question / Section":qno_for_finding(f),"Area":f.area,"Check":f.check,"Status":f.status,"Q88 value":f.q88_value,"HVPQ value":f.hvpq_value,"Class/PIQ reference":f.class_value or f.piq_value,"Finding / interpretation":f.reason,"Action requested":"Q88 is value-add only. Verify source evidence; if Q88 is correct and HVPQ is stale, correct HVPQ. If Q88 is wrong, update Q88."})
+    for fid,label,qno in [("environment.cii_verified_by","CII verification basis","1.2.3 / Q88 CII"),("cert.cofr.expiry","COFR expiry","Q88 2.x"),("cert.pni_cover.expiry","P&I cover expiry","Q88 1.15"),("classification.conditions_of_class","Conditions of Class","Q88 1.20"),("classification.memo_of_class","Memoranda of Class","Q88 1.20a")]:
+        val=first_field(fields,"Q88",fid)
+        rows.append({"Priority":"OK" if val else "Manual","Question / Section":qno,"Area":"Q88 completeness","Check":label,"Status":"Checked" if val else "Could not reliably check / blank","Q88 value":val,"HVPQ value":first_field(fields,"HVPQ",fid),"Class/PIQ reference":first_field(fields,"CLASS",fid),"Finding / interpretation":"Q88 value was extracted for cross-check." if val else "Q88 value was not reliably extracted or appears blank.","Action requested":"Verify Q88 entry if used for chartering/vetting consistency."})
+    df=pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["Priority","Question / Section","Area","Check","Status","Q88 value","HVPQ value","Class/PIQ reference","Finding / interpretation","Action requested"])
+    df=df.drop_duplicates()
+    df["_rank"]=df["Priority"].map(lambda x: {"Critical":0,"CRITICAL":0,"High":1,"HIGH":1,"Medium":2,"MEDIUM":2,"Manual":3,"OK":4}.get(str(x),5))
+    return df.sort_values(["_rank","Area","Question / Section"]).drop(columns="_rank")
+
+
+def build_repeat_obs_checks(obs_qid_df: pd.DataFrame) -> pd.DataFrame:
+    if obs_qid_df is None or obs_qid_df.empty:
+        return pd.DataFrame(columns=["Priority","Question / Section","Topic","HVPQ check status","What to check","HVPQ evidence excerpt","Observation basis"])
+    df=obs_qid_df.rename(columns={"Question No.":"Question / Section","What vessel/office should check":"What to check","Observation basis / example":"Observation basis"}).copy()
+    df["Priority"] = df["HVPQ check status"].astype(str).apply(lambda x: "Manual" if re.search(r"could not|not found|manual", x, re.I) else "Targeted check")
+    return df[["Priority","Question / Section","Topic","HVPQ check status","What to check","HVPQ evidence excerpt","Observation basis"]]
+
+
+def build_summary_paragraphs(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, piq_df: pd.DataFrame, obs_df: pd.DataFrame) -> Dict[str,str]:
+    def collect_ok(df, n=8):
+        if df is None or df.empty: return []
+        ok = df[df["Status"].astype(str).str.contains("in order|checked", case=False, na=False)] if "Status" in df.columns else pd.DataFrame()
+        return [f"{r.get('Area','')}: {r.get('Check','')}" for _,r in ok.head(n).iterrows()]
+    def collect_bad(df, n=8):
+        if df is None or df.empty: return []
+        textcols = [c for c in ["Priority","Status"] if c in df.columns]
+        mask = pd.Series(False, index=df.index)
+        for c in textcols:
+            mask = mask | df[c].astype(str).str.contains("Critical|High|Medium|Manual|not satisfactory|could not|blank|mismatch|overdue|expired", case=False, na=False)
+        bad = df[mask]
+        return [f"{r.get('Area', r.get('Topic',''))}: {r.get('Check', r.get('What to check',''))}" for _,r in bad.head(n).iterrows()]
+    ok_items = collect_ok(hvpq_df) + collect_ok(piq_df) + collect_ok(q88_df, 4)
+    bad_items = collect_bad(hvpq_df) + collect_bad(piq_df) + collect_bad(q88_df) + collect_bad(obs_df, 4)
+    ok_txt = "; ".join(ok_items[:12]) if ok_items else "No positive 'in order' conclusion was generated where extraction was insufficient. Such items are listed as manual checks instead."
+    bad_txt = "; ".join(bad_items[:14]) if bad_items else "No critical/high/manual gap was generated from the mapped checks."
+    obs_count = 0 if obs_df is None or obs_df.empty else len(obs_df)
+    return {
+        "checked": "The review separately checked HVPQ correction items, Q88 value-add consistency, PIQ operational declarations, and repeat-observation question numbers from the observation sheet. Class Status was used only as the authority/reference for certificate and survey dates plus Conditions/Memoranda/dispensations.",
+        "ok": "Items appearing in order from extracted data include: " + ok_txt,
+        "bad": "Items requiring correction/review/manual confirmation include: " + bad_txt,
+        "obs": f"Repeat-observation coverage generated {obs_count} HVPQ question-level check row(s). These are targeted checks, not automatic defects; vessel/office should verify supporting evidence for each question.",
+    }
+
+
+def make_excel_v14(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, piq_df: pd.DataFrame, obs_df: pd.DataFrame) -> bytes:
+    bio=io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        sheets=[("HVPQ Checks", hvpq_df), ("Q88 Checks", q88_df), ("PIQ Checks", piq_df), ("Repeat Obs Questions", obs_df)]
+        for name, df in sheets:
+            df.to_excel(writer, index=False, sheet_name=name)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes="A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font=Font(bold=True, color="FFFFFF")
+                cell.fill=PatternFill("solid", fgColor="1F4E78")
+                cell.alignment=Alignment(wrap_text=True, vertical="center")
+            for row in ws.iter_rows(min_row=2):
+                pr = str(row[0].value).upper() if row and row[0].value is not None else ""
+                fill = None
+                if "CRITICAL" in pr or "HIGH" in pr:
+                    fill=PatternFill("solid", fgColor="FCE4D6")
+                elif "MEDIUM" in pr or "MANUAL" in pr:
+                    fill=PatternFill("solid", fgColor="EAF2F8")
+                elif "OK" in pr:
+                    fill=PatternFill("solid", fgColor="E2F0D9")
+                for cell in row:
+                    cell.alignment=Alignment(wrap_text=True, vertical="top")
+                    if fill: cell.fill=fill
+            widths={"A":14,"B":18,"C":22,"D":34,"E":18,"F":42,"G":42,"H":44,"I":54,"J":54}
+            for idx, col in enumerate(ws.columns, start=1):
+                letter=get_column_letter(idx)
+                max_len=max((len(str(c.value)) if c.value is not None else 0) for c in col)
+                ws.column_dimensions[letter].width=min(max(widths.get(letter, 12), min(max_len+2, 55)), 62)
+            for r in range(2, min(ws.max_row, 300)+1):
+                ws.row_dimensions[r].height=55
+    return bio.getvalue()
+
 # ----------------------------- Streamlit app -----------------------------
 
 def main():
@@ -1979,14 +2311,14 @@ def main():
         run_btn = st.button("Run checks", type="primary")
 
     if not run_btn:
-        st.info("Upload HVPQ, PIQ, Class Status and Q88 where available, then click **Run checks**. HVPQ is treated as the correction target; Class Status is used only for certificate/survey dates and Conditions/Memoranda; Q88 is shown separately as value-add.")
+        st.info("Upload HVPQ, PIQ, Q88, Class Status and observation sheets where available, then click **Run checks**. The output is split into HVPQ checks, Q88 checks, PIQ checks and repeat-observation question checks.")
         return
 
     settings = {"show_low": show_low}
     all_fields: List[FieldRecord] = []
     page_cache = {}
 
-    with st.spinner("Extracting mapped fields and running verification rules..."):
+    with st.spinner("Extracting structured data and building source-specific registers..."):
         if hvpq_file:
             pages = extract_pdf_pages(hvpq_file); page_cache["HVPQ"] = pages
             all_fields += extract_hvpq(pages)
@@ -2008,113 +2340,63 @@ def main():
         obs_df = pd.concat([parse_obs_excel(obs_file), parse_obs_excel(inc_obs_file)], ignore_index=True) if (obs_file or inc_obs_file) else pd.DataFrame()
         all_fields = dedupe_fields(all_fields)
 
-    # Keep the extracted table out of the main workflow. It is available only in Advanced Review.
-    edited_fields = all_fields
-
-    findings = run_rules(edited_fields, ref_date_input, settings, obs_df)
+    findings = run_rules(all_fields, ref_date_input, settings, obs_df)
     if not show_low:
         findings = [f for f in findings if f.risk.upper() != "LOW"]
-    findings_df = df_from_findings(findings)
     hvpq_text = raw_text_for_source(page_cache, "HVPQ")
     obs_qid_df = hvpq_qid_status_df(obs_df, hvpq_text)
-    coverage_df = build_coverage_matrix(edited_fields, findings, obs_df, hvpq_text)
-    manual_df = make_manual_unchecked(coverage_df, obs_qid_df)
-    hvpq_register_df = make_hvpq_correction_register(findings)
-    q88_value_add_df = make_q88_value_add(findings)
-    vessel_actions_df = make_vessel_action_checklist(findings, obs_df, hvpq_text)
-    repeat_summary_df = build_major_repeat_summary(obs_qid_df)
-    summary = build_human_review_summary(edited_fields, findings, coverage_df, manual_df, obs_qid_df, ref_date_input)
+    repeat_obs_df = build_repeat_obs_checks(obs_qid_df)
+    hvpq_checks_df = build_hvpq_checks(all_fields, findings, ref_date_input)
+    q88_checks_df = build_q88_checks(all_fields, findings)
+    piq_checks_df = build_piq_checks(all_fields, findings, ref_date_input)
+    summary = build_summary_paragraphs(hvpq_checks_df, q88_checks_df, piq_checks_df, repeat_obs_df)
 
+    # Summary metrics
+    def count_bad(df):
+        if df is None or df.empty or "Priority" not in df.columns: return 0
+        return int(df["Priority"].astype(str).str.contains("Critical|High|Medium|Manual", case=False, na=False).sum())
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Critical / High", _risk_n(findings, "CRITICAL") + _risk_n(findings, "HIGH"))
-    c2.metric("HVPQ correction rows", len(hvpq_register_df))
-    c3.metric("Manual confirmations", len(manual_df))
-    c4.metric("Observation Q checks", len(obs_qid_df))
+    c1.metric("HVPQ checks", len(hvpq_checks_df))
+    c2.metric("Q88 checks", len(q88_checks_df))
+    c3.metric("PIQ checks", len(piq_checks_df))
+    c4.metric("Repeat obs Q checks", len(repeat_obs_df))
 
-    tabs = st.tabs(["Review Dashboard", "Vessel Register", "HVPQ / PIQ Issues", "Manual Confirmation", "Q88 Value Add", "Coverage", "Advanced Review"])
+    st.subheader("Office review summary")
+    st.markdown(summary["checked"])
+    st.success(summary["ok"])
+    if count_bad(hvpq_checks_df)+count_bad(q88_checks_df)+count_bad(piq_checks_df)+count_bad(repeat_obs_df):
+        st.warning(summary["bad"])
+    else:
+        st.success(summary["bad"])
+    st.info(summary["obs"])
 
+    xlsx = make_excel_v14(hvpq_checks_df, q88_checks_df, piq_checks_df, repeat_obs_df)
+    st.download_button("Download Excel check register", xlsx, file_name="hvpq_piq_q88_check_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    tabs = st.tabs(["HVPQ Checks", "Q88 Checks", "PIQ Checks", "Repeat Observation Questions", "Advanced Extraction"])
     with tabs[0]:
-        st.subheader("Review dashboard")
-        st.markdown("""
-        This dashboard is meant to give the reviewer confidence that the uploaded documents were checked in a controlled way.  
-        **HVPQ is the main document to correct. Class Status is used as the authority only for certificate/survey dates and Conditions/Memoranda. Q88 is treated as a value-add cross-check and is shown separately.**
-        """)
-        st.success(summary["checked"] + "\n\n" + summary["ok"])
-        if findings_df.empty or not any(r in findings_df.get("risk", pd.Series(dtype=str)).astype(str).str.upper().tolist() for r in ["CRITICAL", "HIGH"]):
-            st.info(summary["issues"])
-        else:
-            st.error(summary["issues"])
-        if manual_df.empty:
-            st.success(summary["manual"])
-        else:
-            st.warning(summary["manual"] + " These items are included in the Vessel Register / Manual Confirmation tabs.")
-        st.info(summary["obs"])
-
-        st.markdown("### Major repeat-finding checks from observation sheet")
-        if repeat_summary_df.empty:
-            st.caption("No repeat-finding question-number checks generated. Upload observation sheets with HVPQ question numbers to activate this section.")
-        else:
-            st.dataframe(style_priority_dataframe(repeat_summary_df), use_container_width=True, height=360)
-
-        st.markdown("### Top action items")
-        top_actions = vessel_actions_df.head(12) if not vessel_actions_df.empty else pd.DataFrame()
-        if top_actions.empty:
-            st.success("No action item generated from the mapped checks. Review Manual Confirmation if any document was not uploaded or not reliably extracted.")
-        else:
-            st.dataframe(style_priority_dataframe(top_actions), use_container_width=True, height=420)
-
+        st.subheader("HVPQ checks — main correction register")
+        st.caption("HVPQ is the document to correct. Class Status is used as authority for certificate/survey dates; Q88 is only value-add.")
+        st.dataframe(style_priority_dataframe(hvpq_checks_df), use_container_width=True, height=680)
     with tabs[1]:
-        st.subheader("Vessel register — clear action list to send to vessel/office")
-        st.caption("This combines confirmed mismatches, blank/not-extracted mapped entries, no-incident confirmation, and observation-led targeted checks. Class Status values are shown only as reference where relevant.")
-        st.dataframe(style_priority_dataframe(vessel_actions_df), use_container_width=True, height=620)
-
+        st.subheader("Q88 checks — value-add consistency")
+        st.caption("Q88 is not authoritative by itself. Use this to identify Q88/HVPQ blanks or mismatches requiring review.")
+        st.dataframe(style_priority_dataframe(q88_checks_df), use_container_width=True, height=680)
     with tabs[2]:
-        st.subheader("HVPQ / PIQ issues and correction register")
-        st.caption("Use this as the office correction register. HVPQ is the correction target. PIQ mismatches/blanks are shown where operational declarations need alignment.")
-        st.dataframe(style_priority_dataframe(hvpq_register_df), use_container_width=True, height=620)
-
+        st.subheader("PIQ checks — operational declarations and intervals")
+        st.caption("Includes PIQ superintendent intervals, tank inspection cycles, MOC/retrofit, PSC, incidents and key PIQ extraction completeness checks.")
+        st.dataframe(style_priority_dataframe(piq_checks_df), use_container_width=True, height=680)
     with tabs[3]:
-        st.subheader("Manual confirmation / could not reliably check")
-        st.caption("These rows are deliberately shown so the reviewer knows what the app could not verify with confidence. They should be checked manually before closing the review.")
-        if manual_df.empty:
-            st.success("No manual-confirmation row generated from the current upload.")
-        else:
-            st.dataframe(style_priority_dataframe(manual_df), use_container_width=True, height=620)
-
+        st.subheader("Repeat-observation question checks")
+        st.caption("Generated from question numbers found in the observation Excel. These rows are targeted checks, not automatic defects.")
+        st.dataframe(style_priority_dataframe(repeat_obs_df), use_container_width=True, height=680)
     with tabs[4]:
-        st.subheader("Q88 value-add mismatches / blanks")
-        st.caption("Q88 is not the authority. Use this tab to spot Q88/HVPQ inconsistencies, blanks and stale entries, then verify against source evidence before correcting HVPQ.")
-        if q88_value_add_df.empty:
-            st.success("No Q88 value-add mismatch detected from mapped fields.")
-        else:
-            st.dataframe(style_priority_dataframe(q88_value_add_df), use_container_width=True, height=560)
+        st.subheader("Advanced extraction review")
+        st.caption("For troubleshooting extraction only. This is not intended as the main user workflow.")
+        st.dataframe(df_from_fields(all_fields), use_container_width=True, height=600)
+        if st.checkbox("Show raw detailed findings"):
+            st.dataframe(df_from_findings(findings), use_container_width=True, height=600)
 
-    with tabs[5]:
-        st.subheader("Coverage — what was checked vs what needs manual confirmation")
-        st.caption("This is the confidence matrix. Items marked 'Could not reliably check' are also carried into Manual Confirmation/Vessel Register where applicable.")
-        st.dataframe(style_priority_dataframe(coverage_df), use_container_width=True, height=560)
-        st.markdown("### Observation-library HVPQ question checks")
-        if obs_qid_df.empty:
-            st.info("No exact HVPQ question-number checks generated from the observation Excel.")
-        else:
-            st.dataframe(style_priority_dataframe(obs_qid_df), use_container_width=True, height=460)
-
-    with tabs[6]:
-        st.subheader("Advanced review / audit trail")
-        st.caption("Kept out of the main workflow to avoid confusing users. Use only for troubleshooting extraction.")
-        with st.expander("Show extracted structured fields"):
-            st.dataframe(df_from_fields(edited_fields), use_container_width=True, height=500)
-        with st.expander("Show raw page text"):
-            src = st.selectbox("Source", list(page_cache.keys()) or ["None"])
-            if src != "None":
-                page_no = st.number_input("Page", min_value=1, max_value=max([p for p, _ in page_cache[src]]), value=1)
-                txt = dict(page_cache[src]).get(page_no, "")
-                st.text_area("Extracted page text", txt, height=500)
-        with st.expander("Show JSON output"):
-            st.json({"findings": [asdict(f) for f in findings], "fields": [asdict(f) for f in edited_fields], "coverage": coverage_df.to_dict(orient="records")})
-
-    xlsx = make_excel(findings, edited_fields, vessel_actions_df, obs_qid_df, coverage_df, manual_df, q88_value_add_df, hvpq_register_df)
-    st.download_button("Download Excel register", xlsx, file_name="hvpq_piq_q88_class_verification_register_v13.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if __name__ == "__main__":
     main()
