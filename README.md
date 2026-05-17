@@ -1,16 +1,14 @@
-# HVPQ / PIQ / Q88 / Class Status Checker v17
+# HVPQ / PIQ / Q88 / Class Status Checker v18
 
 Extraction-first Streamlit checker for SIRE/HVPQ preparation.
 
-## What changed in v17
+## Main v18 change
 
-- HVPQ remains the main document to correct.
-- Class Status is used as the authority for certificate/survey dates and Conditions/Memoranda/dispensations.
-- Q88 is used only as value-add cross-check, not as an authority by itself.
-- PIQ is extracted and checked as an operational declaration document.
-- Tank coating checks are now table-aware: the app checks **Date of last coating inspection** and does not use the original coating date.
-- Observation-history questions are not converted into bulk manual checks. They are used only to strengthen reasons where a real HVPQ issue, mismatch, stale date or uncertainty is found.
-- Output is split into three user-facing registers: HVPQ Checks, Q88 Value Add, PIQ Checks.
+- Removed external upload controls for HVPQ observation library Excel, incident observation library Excel, and Comparison Rules TXT.
+- Observation history and validation rules are now embedded as a machine-readable knowledge base inside the app.
+- Observations are used only as priority signals. The app does not create a defect unless extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, expired, or logically doubtful.
+- Observation priorities are sorted by repeat count, with highest-repeat HVPQ question numbers first.
+- Tank coating logic remains table-aware: it checks the date of last coating inspection, not the original coating/application date.
 
 ## Run
 
@@ -19,12 +17,8 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Optional local LLM extraction assist
+## Bundled files
 
-Install Ollama and pull a model, for example:
-
-```bash
-ollama pull qwen2.5:14b
-```
-
-Then enable the local LLM extraction option in the sidebar.
+- `app.py` - complete Streamlit app with embedded rule base.
+- `embedded_knowledge_base.json` - same knowledge base exported separately for review/version control.
+- `requirements.txt` - Python package requirements.
