@@ -19,8 +19,8 @@ from openpyxl.utils import get_column_letter
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
-APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v15"
-APP_SUBTITLE = "Extraction-first HVPQ, Q88 and PIQ review with repeat-observation risk used only as supporting reason, not as generic manual workload."
+APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v17"
+APP_SUBTITLE = "Structured extraction-first review: HVPQ is the correction document; Class Status is certificate/survey authority; Q88 is value-add; PIQ is operational declaration cross-check."
 
 # ----------------------------- Data models -----------------------------
 
@@ -227,6 +227,72 @@ def add_field(fields: List[FieldRecord], source: str, field_id: str, value: Any,
         return
     fields.append(FieldRecord(source=source, field_id=field_id, label=label or FIELD_LABELS.get(field_id, field_id), value=val, date_value=iso_date(val), raw=clean_text(raw)[:800], confidence=confidence))
 
+
+
+
+def add_structured_date_list(fields: List[FieldRecord], source: str, field_id: str, dates: List[date], label: str, raw: str = "", confidence: str = "table-aware"):
+    """Store structured list-style date extraction: oldest/newest/count plus the readable list."""
+    if not dates:
+        return
+    unique = sorted(set(dates))
+    value = "; ".join(d.isoformat() for d in unique)
+    add_field(fields, source, field_id, value, label=label, raw=raw, confidence=confidence)
+    add_field(fields, source, field_id + ".oldest", unique[0].isoformat(), label=label + " - oldest", raw=raw, confidence=confidence)
+    add_field(fields, source, field_id + ".newest", unique[-1].isoformat(), label=label + " - newest", raw=raw, confidence=confidence)
+    add_field(fields, source, field_id + ".count", str(len(unique)), label=label + " - count", raw=raw, confidence=confidence)
+
+
+def parse_table_dates_by_last_inspection(section: str) -> List[date]:
+    """Return inspection dates from HVPQ/Q88 tank coating tables.
+
+    The table normally has two dates per row: original coating date and last
+    inspection date. The rule must use the SECOND date before Annual/frequency,
+    not the original coating date.
+    """
+    if not section:
+        return []
+    txt = clean_text(section)
+    date_pat = r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})"
+    pairs = re.findall(date_pat + r"\s+" + date_pat + r"\s+(?:Annual|12\s*months?|[0-9]+\s*months?)", txt, flags=re.I)
+    out=[]
+    for _, insp in pairs:
+        d=parse_date_any(insp)
+        if d:
+            out.append(d)
+    return out
+
+
+def extract_hvpq_tank_coating_fields(fields: List[FieldRecord], source: str, text: str):
+    """Extract HVPQ tank coating inspection dates table-aware."""
+    cargo_sec = section_text_by_qid(text, "7.1.1")
+    ballast_sec = section_text_by_qid(text, "7.1.3")
+    if cargo_sec:
+        dates = parse_table_dates_by_last_inspection(cargo_sec)
+        if dates:
+            add_structured_date_list(fields, source, "tank.cargo_hvpq.last_inspection_dates", dates, "Cargo/slop tank last coating inspection dates", raw=cargo_sec)
+            add_field(fields, source, "tank.cargo_hvpq.freq_months", "12", label="Cargo/slop tank coating inspection frequency", raw=cargo_sec, confidence="table-aware")
+        else:
+            add_field(fields, source, "tank.cargo_hvpq.extraction_issue", "Cargo tank table found but last inspection dates were not reliably parsed", label="Cargo tank coating extraction issue", raw=cargo_sec, confidence="manual-needed")
+    if ballast_sec:
+        dates = parse_table_dates_by_last_inspection(ballast_sec)
+        if dates:
+            add_structured_date_list(fields, source, "tank.ballast_hvpq.last_inspection_dates", dates, "Ballast tank last coating inspection dates", raw=ballast_sec)
+            add_field(fields, source, "tank.ballast_hvpq.freq_months", "12", label="Ballast tank coating inspection frequency", raw=ballast_sec, confidence="table-aware")
+        else:
+            add_field(fields, source, "tank.ballast_hvpq.extraction_issue", "Ballast tank table found but last inspection dates were not reliably parsed", label="Ballast tank coating extraction issue", raw=ballast_sec, confidence="manual-needed")
+
+
+def extract_q88_coating_fields(fields: List[FieldRecord], source: str, text: str):
+    """Extract Q88 coating inspection dates as a value-add cross-check."""
+    cargo_m = re.search(r"Cargo tanks:(.*?)(?:Ballast tanks:|Tank anodes|7\.|8\.|Inert Gas|Cargo Pumps|$)", text, flags=re.I|re.S)
+    ballast_m = re.search(r"Ballast tanks:(.*?)(?:Tank anodes|7\.|8\.|Inert Gas|Cargo Pumps|$)", text, flags=re.I|re.S)
+    for name, fid, m in [("Cargo/slop tank", "tank.cargo_q88.last_inspection_dates", cargo_m), ("Ballast tank", "tank.ballast_q88.last_inspection_dates", ballast_m)]:
+        if not m:
+            continue
+        sec=m.group(1)
+        dates=parse_table_dates_by_last_inspection(sec)
+        if dates:
+            add_structured_date_list(fields, source, fid, dates, f"Q88 {name} coating inspection dates", raw=sec, confidence="table-aware")
 
 def first_field(fields: List[FieldRecord], source: str, field_id: str) -> str:
     for f in fields:
@@ -548,6 +614,7 @@ def extract_hvpq(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     cert_lines = lines[cert_start:cert_end] if cert_start >= 0 else []
     fields += parse_cert_rows_from_sequence(cert_lines, source, cert_order="hvpq")
     add_section_and_operational_fields(fields, source, text)
+    extract_hvpq_tank_coating_fields(fields, source, text)
     return dedupe_fields(fields)
 
 
@@ -667,6 +734,7 @@ def extract_q88(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
                 add_field(fields, source, "environment.cii_verified_by", tail, raw=line)
 
     add_section_and_operational_fields(fields, source, text)
+    extract_q88_coating_fields(fields, source, text)
 
     # Certificate special: P&I coverage/expiration contains expiry only
     for line in lines:
@@ -2245,7 +2313,7 @@ def build_summary_paragraphs(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, piq_df
     obs_count = 0 if obs_df is None or obs_df.empty else len(obs_df)
     return {
         "checked": "The review separately checked HVPQ correction items, Q88 value-add consistency, PIQ operational declarations, and repeat-observation question numbers from the observation sheet. Class Status was used only as the authority/reference for certificate and survey dates plus Conditions/Memoranda/dispensations.",
-        "ok": "Items appearing in order from extracted data include: " + ok_txt,
+        "ok": "From the extracted data, the following checks appear in order: " + ok_txt,
         "bad": "Items requiring correction/review/manual confirmation include: " + bad_txt,
         "obs": f"Repeat-observation coverage generated {obs_count} HVPQ question-level check row(s). These are targeted checks, not automatic defects; vessel/office should verify supporting evidence for each question.",
     }
@@ -2396,15 +2464,19 @@ def add_v15_validation_findings(findings: List[Finding], fields: List[FieldRecor
     else:
         add_finding(findings, area="Firefighting", check="Foam test / supply date", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason="HVPQ 5.3.1.4 could not be reliably checked from extracted text.", action="Vessel to confirm latest foam supply/test analysis date is within 1 year.")
 
-    for q, label in [("7.1.1","Cargo tank coating inspection dates"),("7.1.3","Ballast tank coating inspection dates")]:
-        sec=first_field(fields,"HVPQ",f"section.{q}") or ""
-        dates=all_dates_in_text(sec)
-        if dates:
-            oldest=min(dates); due=oldest+relativedelta(months=12)
+    # Tank coating inspection dates: table-aware check. Uses the last inspection date column, not original coating date.
+    for fid, q, label in [("tank.cargo_hvpq.last_inspection_dates", "7.1.1", "Cargo/slop tank coating inspection dates"), ("tank.ballast_hvpq.last_inspection_dates", "7.1.3", "Ballast tank coating inspection dates")]:
+        oldest = parse_date_any(first_field(fields, "HVPQ", fid + ".oldest"))
+        count = first_field(fields, "HVPQ", fid + ".count")
+        if oldest:
+            due = oldest + relativedelta(months=12)
             if due < ref_date:
-                add_finding(findings, area="Tank inspection", check=label, status="MISMATCH", risk="HIGH", hvpq_value=f"Oldest visible date {oldest.isoformat()}", reason=f"HVPQ {q} visible coating inspection date appears outside 12-month annual frequency.", action="Verify every tank entry and update HVPQ if any coating inspection is overdue/stale.")
+                add_finding(findings, area="Tank inspection", check=label, status="MISMATCH", risk="HIGH", hvpq_value=f"Oldest inspection date {oldest.isoformat()} from {count or '?'} parsed entries", reason=f"HVPQ {q} last coating inspection date appears outside the 12-month annual frequency. The check used the inspection-date column, not the original coating date.", action="Verify every tank entry and update HVPQ if any coating inspection is overdue/stale.")
         else:
-            add_finding(findings, area="Tank inspection", check=label, status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason=f"HVPQ {q} coating inspection table could not be reliably checked. Manual check is preferred.", action="Vessel to verify all coating inspection dates against stated frequency.")
+            if first_field(fields, "HVPQ", f"section.{q}"):
+                add_finding(findings, area="Tank inspection", check=label, status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Table found, last-inspection column not reliably parsed", reason=f"HVPQ {q} table was located, but the last coating inspection dates could not be reliably separated from original coating dates. Manual check is preferred.", action="Vessel to verify the last coating inspection date column against the stated frequency.")
+            else:
+                add_finding(findings, area="Tank inspection", check=label, status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Section not reliably extracted", reason=f"HVPQ {q} was not reliably located for tank coating inspection validation.", action="Vessel to verify all coating inspection dates against stated frequency.")
 
     anode_sec=section_text_by_qid(hvpq_raw, "7.1.4")
     if anode_sec and not re.search(r"\b([1-9][0-9]?(?:\.\d+)?)\s*%", anode_sec):
@@ -2467,6 +2539,13 @@ def build_hvpq_checks_v15(fields: List[FieldRecord], findings: List[Finding], re
     for row in [_hvpq_ops_row(fields, ref_date, "Brake testing", "mooring.brake_test_date", 12, "10.1.4", "Mooring", "Latest brake test date found in HVPQ/Q88 text"), _hvpq_ops_row(fields, ref_date, "Mooring ropes age / visible date", "mooring.ropes.latest_visible_date", 60, "10.1.7", "Mooring", "Latest rope/tail visible date found; verify every rope individually")]:
         if row["Priority"] != "Manual":
             add_row(row["Priority"], row["Question / Section"], row["Area"], row["Check"], row["Status"], row["HVPQ value"], row["Reference source"], row["Reference value"], row["Finding / interpretation"], row["Action requested"])
+    # Positive tank coating checks: only show if extraction is reliable and no overdue issue was found.
+    for fid, qno, label in [("tank.cargo_hvpq.last_inspection_dates", "7.1.1", "Cargo/slop tank coating inspection dates"), ("tank.ballast_hvpq.last_inspection_dates", "7.1.3", "Ballast tank coating inspection dates")]:
+        oldest = parse_date_any(first_field(fields, "HVPQ", fid + ".oldest"))
+        count = first_field(fields, "HVPQ", fid + ".count")
+        if oldest and oldest + relativedelta(months=12) >= ref_date:
+            add_row("OK", qno, "Tank inspection", label, "In order", f"Oldest last-inspection date {oldest.isoformat()} from {count or '?'} parsed entries", "HVPQ table", "Annual frequency", "The HVPQ tank coating table was read using the last-inspection-date column, and the oldest parsed inspection date is within 12 months.", "No action required unless vessel knows any individual tank inspection is missing from HVPQ.")
+
     # Observation-library question numbers are deliberately not converted into standalone
     # manual checks. They are used only to strengthen the reason for an actual HVPQ
     # issue/blank/mismatch already detected above. This avoids discouraging users with
@@ -2533,9 +2612,9 @@ def build_summary_paragraphs_v15(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, pi
     manual_text="; ".join(manual) if manual else "No major manual confirmation gap was generated."
     return {
         "checked": "The review checked HVPQ as the main correction document, used Class Status only as the reference for certificate/survey dates and Conditions/Memoranda/dispensations, checked Q88 as value-add information, and reviewed PIQ operational declarations, superintendent intervals, tank inspection cycles, PSC, MOC and incident declarations.",
-        "ok": "Items appearing in order from extracted data include: " + ok_text,
-        "bad": "Items needing correction or review include: " + bad_text,
-        "manual": "Items that could not be reliably checked and should be manually confirmed include: " + manual_text,
+        "ok": "From the extracted data, the following checks appear in order: " + ok_text,
+        "bad": "The following items need correction or review: " + bad_text,
+        "manual": "The following items could not be confirmed reliably and are included for manual confirmation: " + manual_text,
     }
 
 
@@ -2661,7 +2740,7 @@ def main():
     st.info(summary["manual"])
 
     xlsx = make_excel_v15(hvpq_checks_df, q88_checks_df, piq_checks_df)
-    st.download_button("Download Excel check register", xlsx, file_name="hvpq_piq_q88_check_register_v16.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download Excel check register", xlsx, file_name="hvpq_piq_q88_check_register_v17.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     tabs = st.tabs(["HVPQ Checks", "Q88 Value Add", "PIQ Checks", "Advanced Extraction"])
     with tabs[0]:
