@@ -1,26 +1,38 @@
-# HVPQ / PIQ / Q88 / Class Status Checker v12
+# HVPQ / PIQ / Q88 / Class Status Checker v13
 
-Extraction-first Streamlit app for HVPQ correction and vessel-ready verification.
+Extraction-first Streamlit app for pre-vetting HVPQ/PIQ/Q88/Class Status verification.
 
-## v12 changes
-- Removed Office Summary from Excel export.
-- Added Coverage Matrix so users know what was checked and what could not be reliably checked.
-- Added Manual Checks sheet for extraction gaps/uncertain items.
-- HVPQ is treated as the main correction document.
-- Class Status is treated as the authoritative source for certificate, class and survey dates where available.
-- Q88 mismatches are separated into a Q88 Value Add sheet and not mixed with authoritative Class Status findings.
-- Observation Excel question numbers like `10.1.4`, `2.1.5`, `1.9.8` are extracted and checked against the HVPQ text.
-- Vessel Action Checklist is clearer and formatted for sending to vessel/office.
-- Excel export uses wrapped text, readable row heights and sensible columns.
+## Core workflow
 
-## Run
+- HVPQ is treated as the main document to correct.
+- Class Status is treated as the authority only for certificate/survey dates, Conditions of Class, Memoranda and dispensations.
+- Q88 is treated as value-add. Q88 mismatches/blanks are highlighted separately and should be verified against source evidence before correcting HVPQ.
+- PIQ is checked for operational declarations such as superintendent visits, tank inspection cycles, incidents, MOC/retrofit and PSC.
+- Observation Excel question numbers are extracted and converted into targeted HVPQ/vessel checks.
+- If the app cannot reliably extract/check an item, it is flagged in Manual Confirmation so it is not silently missed.
+
+## UI tabs
+
+1. Review Dashboard - simple paragraph summary and top action items.
+2. Vessel Register - clean action list suitable for vessel/office.
+3. HVPQ / PIQ Issues - office correction register.
+4. Manual Confirmation - data not reliably checked or requiring positive confirmation.
+5. Q88 Value Add - Q88-specific mismatch/blank review.
+6. Coverage - what was checked and what needs manual confirmation.
+7. Advanced Review - optional extracted fields/raw text/debug.
+
+## Run locally
+
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Optional local LLM
+Optional local LLM extraction assist through Ollama:
+
 ```bash
 ollama pull qwen2.5:14b
+ollama run qwen2.5:14b
 ```
-Enable local LLM extraction assist in the app sidebar.
+
+Then enable the Ollama checkbox in the sidebar.

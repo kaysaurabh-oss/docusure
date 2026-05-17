@@ -19,8 +19,8 @@ from openpyxl.utils import get_column_letter
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
-APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v12"
-APP_SUBTITLE = "Extraction-first HVPQ correction register: Class Status as certificate authority, Q88 as value-add, and clear manual-check coverage."
+APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v13"
+APP_SUBTITLE = "Simple review dashboard with HVPQ correction register, vessel action list, Q88 value-add checks, and manual-confirmation coverage."
 
 # ----------------------------- Data models -----------------------------
 
@@ -1182,7 +1182,37 @@ def run_rules(fields: List[FieldRecord], ref_date: date, settings: Dict[str, Any
     for fid in required_hvpq:
         if not first_field(fields, "HVPQ", fid):
             add_finding(findings, area="Blank / Missing", check=f"HVPQ missing {FIELD_LABELS.get(fid, fid)}", status="MANUAL CHECK", risk="MEDIUM",
-                        hvpq_value="blank", reason="Required/commonly observed HVPQ field is blank or not extracted.", action="Verify and complete if applicable.")
+                        hvpq_value="blank", reason="Required/commonly observed HVPQ field is blank or not extracted.", action="Verify and complete HVPQ if applicable. HVPQ is the main document to correct.")
+
+    # 13b. Mapped blanks in PIQ and Q88. These are not automatic defects; they are included so no blank/uncertain field is silently missed.
+    has_piq = any(f.source == "PIQ" for f in fields)
+    has_q88 = any(f.source == "Q88" for f in fields)
+    if has_piq:
+        required_piq = [
+            "vessel.name", "vessel.type", "psc.last_date", "psc.detained_36m",
+            "superintendent.technical.1.from", "superintendent.technical.1.to",
+            "superintendent.marine.1.from", "superintendent.marine.1.to",
+            "tank.cargo_slop.oldest", "tank.ballast.oldest", "tank.void.oldest",
+        ]
+        for fid in required_piq:
+            if not first_field(fields, "PIQ", fid):
+                add_finding(findings, area="Blank / Missing", check=f"PIQ missing/not extracted {FIELD_LABELS.get(fid, fid)}", status="MANUAL CHECK", risk="MEDIUM",
+                            piq_value="blank/not extracted", reason="Mapped PIQ field is blank or could not be reliably extracted.",
+                            action="Verify the PIQ entry manually and correct PIQ if blank/stale/wrong.")
+    if has_q88:
+        required_q88 = [
+            "vessel.name", "vessel.imo", "vessel.type", "classification.class_society",
+            "classification.conditions_of_class", "classification.memo_of_class",
+            "surveys.last_drydock", "surveys.next_drydock_due",
+            "surveys.last_special", "surveys.next_special_due",
+            "environment.cii_rating", "environment.cii_verified_by",
+            "insurance.pni_club",
+        ]
+        for fid in required_q88:
+            if not first_field(fields, "Q88", fid):
+                add_finding(findings, area="Blank / Missing", check=f"Q88 missing/not extracted {FIELD_LABELS.get(fid, fid)}", status="MANUAL CHECK", risk="MEDIUM",
+                            q88_value="blank/not extracted", reason="Mapped Q88 value-add field is blank or could not be reliably extracted.",
+                            action="Verify Q88 entry manually. If Q88 disagrees with HVPQ, use source evidence/Class Status before changing HVPQ.")
 
     # 14. Observation-library driven checklist, not mismatch
     for area, action in observation_checklist_from_excel(obs_df):
@@ -1788,14 +1818,13 @@ def make_vessel_action_checklist(findings: List[Finding], obs_df: pd.DataFrame, 
 def make_excel(findings: List[Finding], fields: List[FieldRecord], vessel_actions: pd.DataFrame, obs_qids: pd.DataFrame, coverage_df: pd.DataFrame, manual_df: pd.DataFrame, q88_df: pd.DataFrame, hvpq_register: pd.DataFrame) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        hvpq_register.to_excel(writer, index=False, sheet_name="HVPQ Correction Register")
-        manual_df.to_excel(writer, index=False, sheet_name="Manual Checks")
-        vessel_actions.to_excel(writer, index=False, sheet_name="Vessel Action Checklist")
+        vessel_actions.to_excel(writer, index=False, sheet_name="Vessel Register")
+        hvpq_register.to_excel(writer, index=False, sheet_name="HVPQ PIQ Issues")
+        manual_df.to_excel(writer, index=False, sheet_name="Manual Confirmation")
         q88_df.to_excel(writer, index=False, sheet_name="Q88 Value Add")
         coverage_df.to_excel(writer, index=False, sheet_name="Coverage Matrix")
-        obs_qids.to_excel(writer, index=False, sheet_name="Observation QID Checks")
+        obs_qids.to_excel(writer, index=False, sheet_name="Observation Q Checks")
         df_from_findings(findings).to_excel(writer, index=False, sheet_name="Detailed Findings")
-        df_from_fields(fields).to_excel(writer, index=False, sheet_name="Extracted Fields")
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             # Header style
@@ -1818,6 +1847,113 @@ def make_excel(findings: List[Finding], fields: List[FieldRecord], vessel_action
                 ws.row_dimensions[r].height = 48
     return bio.getvalue()
 
+
+# ----------------------------- Simple UI summary helpers -----------------------------
+
+def _risk_n(findings: List[Finding], risk: str) -> int:
+    return sum(1 for f in findings if f.risk.upper() == risk.upper())
+
+
+def _area_has_issue(findings: List[Finding], area_keyword: str, risks=("CRITICAL", "HIGH", "MEDIUM")) -> bool:
+    k = area_keyword.lower()
+    return any(k in f.area.lower() and f.risk.upper() in risks for f in findings)
+
+
+def build_human_review_summary(fields: List[FieldRecord], findings: List[Finding], coverage_df: pd.DataFrame, manual_df: pd.DataFrame, obs_qid_df: pd.DataFrame, ref_date: date) -> Dict[str, str]:
+    checked = []
+    if field_exists(fields, "vessel.imo", ["HVPQ", "XML"]): checked.append("HVPQ identity/core particulars")
+    if count_fields(fields, "cert.", ["HVPQ"]): checked.append("HVPQ certificate table")
+    if count_fields(fields, "cert.", ["CLASS"]): checked.append("Class Status certificate/survey dates")
+    if field_exists(fields, "vessel.imo", ["Q88"]) or count_fields(fields, "cert.", ["Q88"]): checked.append("Q88 value-add fields")
+    if any(f.field_id.startswith("superintendent.") for f in fields): checked.append("PIQ superintendent visit gaps")
+    if any(f.field_id.startswith("tank.") for f in fields): checked.append("PIQ tank inspection cycles")
+    if any(f.field_id.startswith("incidents.") for f in fields): checked.append("incident/no-incident declarations")
+    if not obs_qid_df.empty: checked.append("historical observation question numbers")
+    checked_text = ", ".join(checked) if checked else "the uploaded documents, subject to extraction quality"
+
+    ok_bits = []
+    # Tank inspections ok if no high tank issue and PIQ dates exist within cycle
+    tank_ok = []
+    for title, old_fid, freq_fid in [("cargo/slop", "tank.cargo_slop.oldest", "tank.cargo_slop.freq_months"), ("ballast", "tank.ballast.oldest", "tank.ballast.freq_months"), ("void", "tank.void.oldest", "tank.void.freq_months")]:
+        old = parse_date_any(first_field(fields, "PIQ", old_fid))
+        freq = first_field(fields, "PIQ", freq_fid)
+        months = 12
+        try: months = int(float(freq)) if freq else 12
+        except Exception: pass
+        if old and old + relativedelta(months=months) >= ref_date:
+            tank_ok.append(title)
+    if tank_ok: ok_bits.append(f"tank inspection cycles appear within required interval for {', '.join(tank_ok)} tanks")
+    if not _area_has_issue(findings, "Management Oversight", ("CRITICAL", "HIGH")) and any(f.field_id.startswith("superintendent.") for f in fields):
+        ok_bits.append("no high-risk superintendent interval breach was detected from extracted PIQ dates")
+    if not _area_has_issue(findings, "Certificates", ("CRITICAL", "HIGH")) and count_fields(fields, "cert.", ["HVPQ"]):
+        ok_bits.append("no high-risk certificate mismatch/expiry issue was detected from extracted certificate rows")
+    if not _area_has_issue(findings, "Class", ("CRITICAL", "HIGH")) and any(field_exists(fields, fid, ["HVPQ", "CLASS", "Q88"]) for fid in ["classification.conditions_of_class", "classification.memo_of_class"]):
+        ok_bits.append("Class Conditions/Memoranda were checked where extractable")
+    ok_text = "; ".join(ok_bits) if ok_bits else "no clean 'in-order' conclusion is shown where extraction was insufficient; those items are moved to manual confirmation instead"
+
+    main_issues = [f for f in findings if f.risk.upper() in ["CRITICAL", "HIGH"]]
+    if main_issues:
+        issue_text = "; ".join([f"{f.area}: {f.check}" for f in main_issues[:8]])
+        if len(main_issues) > 8: issue_text += f"; plus {len(main_issues)-8} more high-priority item(s)"
+    else:
+        issue_text = "no critical/high-priority mismatch was detected from the extracted mapped fields"
+
+    if not manual_df.empty:
+        manual_text = f"{len(manual_df)} item(s) could not be reliably checked or need positive confirmation. These are included in the Manual Confirmation and Vessel Action Checklist tabs so they are not missed."
+    else:
+        manual_text = "no major extraction-gap/manual-confirmation item was generated from the current upload."
+
+    if obs_qid_df.empty:
+        obs_text = "No observation-library question-number checks were generated. Upload an observation Excel containing HVPQ question numbers such as 10.1.4 or 2.1.5 to activate this section."
+    else:
+        review = obs_qid_df[obs_qid_df["HVPQ check status"].astype(str).str.contains("could not reliably|not found|manual", case=False, regex=True, na=False)]
+        ok = len(obs_qid_df) - len(review)
+        obs_text = f"{len(obs_qid_df)} repeated-observation HVPQ question check(s) were generated from the observation sheet. {ok} were located with an apparent answer/excerpt; {len(review)} need manual review or clearer evidence."
+
+    return {
+        "checked": f"Checked: {checked_text}.",
+        "ok": f"Appearing in order: {ok_text}.",
+        "issues": f"Not satisfactory / requires correction: {issue_text}.",
+        "manual": f"Could not reliably check / manual confirmation: {manual_text}",
+        "obs": f"Repeat-observation coverage: {obs_text}",
+    }
+
+
+def build_major_repeat_summary(obs_qid_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Question No.", "Topic", "Review status", "What to check", "HVPQ evidence excerpt"]
+    if obs_qid_df is None or obs_qid_df.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for _, r in obs_qid_df.iterrows():
+        stt = str(r.get("HVPQ check status", ""))
+        if re.search(r"could not reliably|not found|manual", stt, flags=re.I):
+            status = "Needs review"
+        else:
+            status = "Located in HVPQ - verify correctness"
+        rows.append({
+            "Question No.": r.get("Question No.", ""),
+            "Topic": r.get("Topic", ""),
+            "Review status": status,
+            "What to check": r.get("What vessel/office should check", ""),
+            "HVPQ evidence excerpt": r.get("HVPQ evidence excerpt", ""),
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def style_priority_dataframe(df: pd.DataFrame):
+    if df is None or df.empty:
+        return df
+    def row_style(row):
+        val = " ".join(str(x).upper() for x in row.values)
+        if "CRITICAL" in val:
+            return ['background-color: #fde2e1'] * len(row)
+        if "HIGH" in val:
+            return ['background-color: #fff1cc'] * len(row)
+        if "NEEDS REVIEW" in val or "MANUAL" in val or "COULD NOT" in val:
+            return ['background-color: #eef4ff'] * len(row)
+        return [''] * len(row)
+    return df.style.apply(row_style, axis=1)
+
 # ----------------------------- Streamlit app -----------------------------
 
 def main():
@@ -1827,11 +1963,11 @@ def main():
 
     with st.sidebar:
         st.header("Upload documents")
-        hvpq_file = st.file_uploader("HVPQ PDF", type=["pdf"], key="hvpq")
+        hvpq_file = st.file_uploader("HVPQ PDF — main document to correct", type=["pdf"], key="hvpq")
         hvpq_xml = st.file_uploader("HVPQ XML (optional)", type=["xml"], key="xml")
         piq_file = st.file_uploader("PIQ PDF", type=["pdf"], key="piq")
-        q88_file = st.file_uploader("Q88 PDF", type=["pdf"], key="q88")
-        class_file = st.file_uploader("Class Status PDF", type=["pdf"], key="class")
+        q88_file = st.file_uploader("Q88 PDF — value-add cross-check", type=["pdf"], key="q88")
+        class_file = st.file_uploader("Class Status PDF — certificate/survey authority", type=["pdf"], key="class")
         obs_file = st.file_uploader("HVPQ observation library Excel", type=["xlsx", "xls"], key="obs")
         inc_obs_file = st.file_uploader("Incident observation library Excel", type=["xlsx", "xls"], key="incobs")
         st.divider()
@@ -1840,17 +1976,17 @@ def main():
         use_llm = st.checkbox("Use local LLM extraction assist (Ollama)", value=False)
         ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", disabled=not use_llm)
         ollama_model = st.text_input("Ollama model", value="qwen2.5:14b", disabled=not use_llm)
-        run_btn = st.button("Run extraction and checks", type="primary")
+        run_btn = st.button("Run checks", type="primary")
 
     if not run_btn:
-        st.info("Upload documents and click **Run extraction and checks**. For best accuracy, review/edit extracted fields before relying on findings.")
+        st.info("Upload HVPQ, PIQ, Class Status and Q88 where available, then click **Run checks**. HVPQ is treated as the correction target; Class Status is used only for certificate/survey dates and Conditions/Memoranda; Q88 is shown separately as value-add.")
         return
 
     settings = {"show_low": show_low}
     all_fields: List[FieldRecord] = []
     page_cache = {}
 
-    with st.spinner("Extracting text and structured fields..."):
+    with st.spinner("Extracting mapped fields and running verification rules..."):
         if hvpq_file:
             pages = extract_pdf_pages(hvpq_file); page_cache["HVPQ"] = pages
             all_fields += extract_hvpq(pages)
@@ -1872,13 +2008,8 @@ def main():
         obs_df = pd.concat([parse_obs_excel(obs_file), parse_obs_excel(inc_obs_file)], ignore_index=True) if (obs_file or inc_obs_file) else pd.DataFrame()
         all_fields = dedupe_fields(all_fields)
 
-    st.subheader("Step 1 — Review extracted fields")
-    st.caption("Critical point: findings are only as good as extracted values. Edit any wrong extracted values below, then rerun checks using the edited table.")
-    fields_df = df_from_fields(all_fields)
-    edited_df = st.data_editor(fields_df, num_rows="dynamic", use_container_width=True, height=360)
-    edited_fields = []
-    for _, r in edited_df.fillna("").iterrows():
-        edited_fields.append(FieldRecord(source=str(r.get("source", "")), field_id=str(r.get("field_id", "")), label=str(r.get("label", "")), value=str(r.get("value", "")), date_value=str(r.get("date_value", "")), confidence=str(r.get("confidence", "")), raw=str(r.get("raw", ""))))
+    # Keep the extracted table out of the main workflow. It is available only in Advanced Review.
+    edited_fields = all_fields
 
     findings = run_rules(edited_fields, ref_date_input, settings, obs_df)
     if not show_low:
@@ -1891,59 +2022,99 @@ def main():
     hvpq_register_df = make_hvpq_correction_register(findings)
     q88_value_add_df = make_q88_value_add(findings)
     vessel_actions_df = make_vessel_action_checklist(findings, obs_df, hvpq_text)
+    repeat_summary_df = build_major_repeat_summary(obs_qid_df)
+    summary = build_human_review_summary(edited_fields, findings, coverage_df, manual_df, obs_qid_df, ref_date_input)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("HVPQ correction rows", len(hvpq_register_df))
-    c2.metric("Critical", int((findings_df.get("risk", pd.Series(dtype=str)).str.upper() == "CRITICAL").sum()) if not findings_df.empty else 0)
-    c3.metric("Manual checks", len(manual_df))
-    c4.metric("Obs QID checks", len(obs_qid_df))
+    c1.metric("Critical / High", _risk_n(findings, "CRITICAL") + _risk_n(findings, "HIGH"))
+    c2.metric("HVPQ correction rows", len(hvpq_register_df))
+    c3.metric("Manual confirmations", len(manual_df))
+    c4.metric("Observation Q checks", len(obs_qid_df))
 
-    tabs = st.tabs(["Review Dashboard", "HVPQ Correction Register", "Manual Checks", "Vessel Action Checklist", "Q88 Value Add", "Extracted fields", "Observation QIDs", "Raw text debug", "JSON export"])
+    tabs = st.tabs(["Review Dashboard", "Vessel Register", "HVPQ / PIQ Issues", "Manual Confirmation", "Q88 Value Add", "Coverage", "Advanced Review"])
+
     with tabs[0]:
         st.subheader("Review dashboard")
-        st.caption("This page tells the user what was checked and what could not be reliably checked. No separate office-summary sheet is exported.")
-        st.dataframe(coverage_df, use_container_width=True, height=360)
-        if not manual_df.empty:
-            st.warning("Some areas could not be reliably checked. Review the Manual Checks tab before relying on the register.")
-    with tabs[1]:
-        st.subheader("HVPQ correction register")
-        st.caption("Primary register. HVPQ is the document to correct. Class Status is treated as authoritative for certificate/class/survey dates where available.")
-        st.dataframe(hvpq_register_df, use_container_width=True, height=560)
-    with tabs[2]:
-        st.subheader("Manual checks / extraction gaps")
-        st.caption("These are items the app could not reliably verify. They are included so the user knows nothing was silently skipped.")
-        st.dataframe(manual_df, use_container_width=True, height=560)
-    with tabs[3]:
-        st.subheader("Vessel action checklist")
-        st.caption("Export/send this to the vessel/office. It is written as clear action points with question references and wrapped text in Excel.")
-        st.dataframe(vessel_actions_df, use_container_width=True, height=560)
-    with tabs[4]:
-        st.subheader("Q88 value-add checks")
-        st.caption("Q88 is not treated as the authority. Mismatches here are highlighted separately for review against source documents/Class Status.")
-        st.dataframe(q88_value_add_df, use_container_width=True, height=500)
-    with tabs[5]:
-        st.subheader("Extracted structured fields")
-        st.dataframe(edited_df, use_container_width=True, height=500)
-    with tabs[6]:
-        st.subheader("Observation-library HVPQ question checks")
-        st.caption("Question numbers are extracted from the observation text and checked against HVPQ extraction. If answer is unclear, it is marked for manual verification.")
-        if obs_qid_df.empty:
-            st.info("No specific question-number checks generated from the observation Excel.")
+        st.markdown("""
+        This dashboard is meant to give the reviewer confidence that the uploaded documents were checked in a controlled way.  
+        **HVPQ is the main document to correct. Class Status is used as the authority only for certificate/survey dates and Conditions/Memoranda. Q88 is treated as a value-add cross-check and is shown separately.**
+        """)
+        st.success(summary["checked"] + "\n\n" + summary["ok"])
+        if findings_df.empty or not any(r in findings_df.get("risk", pd.Series(dtype=str)).astype(str).str.upper().tolist() for r in ["CRITICAL", "HIGH"]):
+            st.info(summary["issues"])
         else:
-            st.dataframe(obs_qid_df, use_container_width=True, height=560)
-    with tabs[7]:
-        st.subheader("Raw text debug")
-        src = st.selectbox("Source", list(page_cache.keys()) or ["None"])
-        if src != "None":
-            page_no = st.number_input("Page", min_value=1, max_value=max([p for p, _ in page_cache[src]]), value=1)
-            txt = dict(page_cache[src]).get(page_no, "")
-            st.text_area("Extracted page text", txt, height=500)
-    with tabs[8]:
-        st.subheader("JSON export")
-        st.json({"findings": [asdict(f) for f in findings], "fields": [asdict(f) for f in edited_fields], "coverage": coverage_df.to_dict(orient="records")})
+            st.error(summary["issues"])
+        if manual_df.empty:
+            st.success(summary["manual"])
+        else:
+            st.warning(summary["manual"] + " These items are included in the Vessel Register / Manual Confirmation tabs.")
+        st.info(summary["obs"])
+
+        st.markdown("### Major repeat-finding checks from observation sheet")
+        if repeat_summary_df.empty:
+            st.caption("No repeat-finding question-number checks generated. Upload observation sheets with HVPQ question numbers to activate this section.")
+        else:
+            st.dataframe(style_priority_dataframe(repeat_summary_df), use_container_width=True, height=360)
+
+        st.markdown("### Top action items")
+        top_actions = vessel_actions_df.head(12) if not vessel_actions_df.empty else pd.DataFrame()
+        if top_actions.empty:
+            st.success("No action item generated from the mapped checks. Review Manual Confirmation if any document was not uploaded or not reliably extracted.")
+        else:
+            st.dataframe(style_priority_dataframe(top_actions), use_container_width=True, height=420)
+
+    with tabs[1]:
+        st.subheader("Vessel register — clear action list to send to vessel/office")
+        st.caption("This combines confirmed mismatches, blank/not-extracted mapped entries, no-incident confirmation, and observation-led targeted checks. Class Status values are shown only as reference where relevant.")
+        st.dataframe(style_priority_dataframe(vessel_actions_df), use_container_width=True, height=620)
+
+    with tabs[2]:
+        st.subheader("HVPQ / PIQ issues and correction register")
+        st.caption("Use this as the office correction register. HVPQ is the correction target. PIQ mismatches/blanks are shown where operational declarations need alignment.")
+        st.dataframe(style_priority_dataframe(hvpq_register_df), use_container_width=True, height=620)
+
+    with tabs[3]:
+        st.subheader("Manual confirmation / could not reliably check")
+        st.caption("These rows are deliberately shown so the reviewer knows what the app could not verify with confidence. They should be checked manually before closing the review.")
+        if manual_df.empty:
+            st.success("No manual-confirmation row generated from the current upload.")
+        else:
+            st.dataframe(style_priority_dataframe(manual_df), use_container_width=True, height=620)
+
+    with tabs[4]:
+        st.subheader("Q88 value-add mismatches / blanks")
+        st.caption("Q88 is not the authority. Use this tab to spot Q88/HVPQ inconsistencies, blanks and stale entries, then verify against source evidence before correcting HVPQ.")
+        if q88_value_add_df.empty:
+            st.success("No Q88 value-add mismatch detected from mapped fields.")
+        else:
+            st.dataframe(style_priority_dataframe(q88_value_add_df), use_container_width=True, height=560)
+
+    with tabs[5]:
+        st.subheader("Coverage — what was checked vs what needs manual confirmation")
+        st.caption("This is the confidence matrix. Items marked 'Could not reliably check' are also carried into Manual Confirmation/Vessel Register where applicable.")
+        st.dataframe(style_priority_dataframe(coverage_df), use_container_width=True, height=560)
+        st.markdown("### Observation-library HVPQ question checks")
+        if obs_qid_df.empty:
+            st.info("No exact HVPQ question-number checks generated from the observation Excel.")
+        else:
+            st.dataframe(style_priority_dataframe(obs_qid_df), use_container_width=True, height=460)
+
+    with tabs[6]:
+        st.subheader("Advanced review / audit trail")
+        st.caption("Kept out of the main workflow to avoid confusing users. Use only for troubleshooting extraction.")
+        with st.expander("Show extracted structured fields"):
+            st.dataframe(df_from_fields(edited_fields), use_container_width=True, height=500)
+        with st.expander("Show raw page text"):
+            src = st.selectbox("Source", list(page_cache.keys()) or ["None"])
+            if src != "None":
+                page_no = st.number_input("Page", min_value=1, max_value=max([p for p, _ in page_cache[src]]), value=1)
+                txt = dict(page_cache[src]).get(page_no, "")
+                st.text_area("Extracted page text", txt, height=500)
+        with st.expander("Show JSON output"):
+            st.json({"findings": [asdict(f) for f in findings], "fields": [asdict(f) for f in edited_fields], "coverage": coverage_df.to_dict(orient="records")})
 
     xlsx = make_excel(findings, edited_fields, vessel_actions_df, obs_qid_df, coverage_df, manual_df, q88_value_add_df, hvpq_register_df)
-    st.download_button("Download Excel register", xlsx, file_name="hvpq_piq_q88_class_verification_register_v12.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download Excel register", xlsx, file_name="hvpq_piq_q88_class_verification_register_v13.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if __name__ == "__main__":
     main()
