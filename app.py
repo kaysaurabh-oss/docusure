@@ -19,8 +19,8 @@ from openpyxl.utils import get_column_letter
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
-APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v14"
-APP_SUBTITLE = "Extraction-first document review with separate HVPQ, Q88, PIQ and repeat-observation check registers."
+APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v15"
+APP_SUBTITLE = "Extraction-first HVPQ, Q88 and PIQ review with observation-informed reasons and rule-based validation checks."
 
 # ----------------------------- Data models -----------------------------
 
@@ -1252,9 +1252,8 @@ def run_rules(fields: List[FieldRecord], ref_date: date, settings: Dict[str, Any
                             q88_value="blank/not extracted", reason="Mapped Q88 value-add field is blank or could not be reliably extracted.",
                             action="Verify Q88 entry manually. If Q88 disagrees with HVPQ, use source evidence/Class Status before changing HVPQ.")
 
-    # 14. Observation-library driven checklist, not mismatch
-    for area, action in observation_checklist_from_excel(obs_df):
-        add_finding(findings, area="Observation Library", check=area, status="MANUAL CHECK", risk="MEDIUM", reason="Recurring historical observation pattern found in uploaded observation library.", action=action)
+    # 14. Observation library is not added as a standalone checklist anymore.
+    # It is merged into HVPQ check reasons later, so items that are already in order are not repeatedly sent to vessel.
 
     return dedupe_findings(findings)
 
@@ -2286,6 +2285,259 @@ def make_excel_v14(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, piq_df: pd.DataF
                 ws.row_dimensions[r].height=55
     return bio.getvalue()
 
+
+
+# ----------------------------- v15 observation-informed and rules-based output -----------------------------
+
+DEFAULT_COMPARISON_RULES_TEXT = 'I will give you 2 documents to analyze HVPQ (PDF) and PIQ Excel , we need to audit individually for errors and then compare both for inconsistencies. The audit needs to be done \nin a human like reading fashion. Here are the rules\n\nHVPQ File checks\n1. In HVPQ, Section 13 Combination carriers can be left blank.\n2. In HVPQ Section 9, subsection 6 LNG bunkers can be left blank .\n3. This is Oil ship so Chemical sections can be left blank.\n3. Remaining questions and sub questions apply your logical reasoning if parent question is NO, sub-questions can be NA or blank.\n4. Other than this, No questions are left blank, please flag if anything.\n5. No certificates should be expired.\n6. In section 2 certificates, Any certificate issued more than 1 year ago must have annual endorsement date within 1 year. Last annual date of any certificate should match with response in 1.5.11\n7. In section 2 certificates, Any certificate issued more than 2.5 year ago must have intermediate endorsement date within 2.5 years. Last intermediate date of any certificate should match with response in 1.5.12\n8. 1.1.13.4 response must be yes\n9. Vessel age basis 1.4.7 if more than 15 years, then CAP rating is applicable and must be 1.\n10. 1.5.1.2 must be "Yes"\n11. 1.5.4.1 date of last dry dock should not be more than 5 years old and must match response of 1.5.6.1\n12. If 1.9.1 is "No", 1.9.2 cannot be "No" or blank.\n13. Response for 3.2.1 should be "No"\n14. Courses mention in 3.3.4 must include something like "Engine Room Resource Management using an Engine Room Simulator", "Cargo simulator", "Ship handling".\n\n16. Response in 5.3.1.4 should not be more than 1 year old.\n17. Section 7.1.1 date of coating inspections by ship staff should not be expired basis the frequency of inspections mentioned.\n18. Section 7.1.3 date of coating inspections by competent person should not be expired basis the frequency of inspections mentioned.\n19. 7.1.4.5 response should be more than 0 and in % unit.\n20. If 1.6.1 is greater than 200, than pump type in 9.6.2 is Centrifugal else Deepwell.\n21. 10.1.4 Date of last brake test should not be expired basis frequency of testing brakes.\n22. 10.1.7 if type is wire installed date should not be older than 10 years, if type is Tails installed date should not be older than 18 months, if type is Ropes installed date should not be older than 5 years.\n23. 10.9.1 last annual test and last 5 year test dates should not be expired.\n\nPIQ File Checks\n1. Vessel Type in PIQ 1.1.1 must match with HVPQ response in 2.1.4\n3. In PIQ Chapter 3.2.1 and 3.2.2 static and Dynamic navigational assessment both cannot be Yes or NO, must be opposite response.\n4. Last navigational assessment in either of 3.2.1 or 3.2.2 should not be older than 12 months.\n5. Chapter 3.5,3.6,3.7 if marked yes, dates of last audits should not be older than 12 months.\n6. Chapter 3 subsection 3.3.1,3.3.3,3.3.4 crew training, courses mentioned must also be included in HVPQ 3.3.4\n7. Chapter 3.4.2001 date must be within 12 months and Chapter 3.4.2002 date must be within 3 months\n8. Section 5.2.4 response must match with HVPQ response 5.3.2 sub question 4.\n9. Chapter 5.7.1001 to 5.7.1029, all questions response must align with HVPQ responses 1.9.1 to 1.9.7, please analyze. Also check if PIQ Chapter 2.1.1 Purpose of visit is Damage or Other / Occasional then there may be a damage or repair verification survey here this should align with other responses.\n10. Chapter 2 sub-section 8, General information on PSC must align with HVPQ responses for PSC in 1.9.8 and 1.9.9\n11. Section 8 sub section 3 response for various questions must align with HVPQ responses in HVPQ Chapter 9 sub section 9 - Vapor emission control and 10 - Venting, please analyze.\n12. Section 10 subsection 2 question 1 response must match with HVPQ 11.3.3\n13. Section 10 subsection 2 question 3 response must match with HVPQ 11.9.1\n14. Chapter 2 Subsection 2 ques 1001 last technical suptt visit must not be older than 7 months and there should not be a gap of more than 7 months for successive visits.\n15. Chapter 2 Subsection 2 ques 1002 last marine suptt visit must not be older than 12 months and there should not be a gap of more than 12 months for successive visits.\n16. Chapter 2 Subsection 3 ques 3001 required frequency of inspection of cargo tanks and last date must align if HVPQ response 7.1.1 for frequency and inspection dates.\n17. Chapter 2 Subsection 3 ques 3002 required frequency of inspection of ballast tanks and last date must align if HVPQ response 7.1.3 for frequency and inspection dates.\n\n\n\n\n\n\n'
+
+RULE_QIDS = ["1.1.13.4", "1.5.1.2", "1.5.4.1", "1.5.6.1", "1.5.11", "1.5.12", "1.9.1", "1.9.2", "3.2.1", "3.3.4", "5.3.1.4", "7.1.1", "7.1.3", "7.1.4.5", "9.6.2", "10.1.4", "10.1.7", "10.9.1", "PIQ 1.1.1", "PIQ 3.2.1", "PIQ 3.2.2", "PIQ 3.2.5", "PIQ 3.2.6", "PIQ 3.2.7", "PIQ 2.2.1001", "PIQ 2.2.1002", "PIQ 2.3.3001", "PIQ 2.3.3002", "PIQ 2.8.2", "PIQ 5.7.1001-1029"]
+
+def extract_qids_from_obs(obs_df: pd.DataFrame) -> set:
+    qids=set()
+    if obs_df is None or obs_df.empty:
+        return qids
+    try:
+        joined = obs_df.fillna("").astype(str).apply(lambda r: " ".join(r.tolist()), axis=1)
+    except Exception:
+        return qids
+    for s in joined:
+        for m in re.findall(r"\b(?:\d{1,2}\.\d{1,2}(?:\.\d{1,4})?)\b", str(s)):
+            qids.add(m)
+    return qids
+
+def obs_reason_for(qno: str, obs_qids: set) -> str:
+    if not qno or not obs_qids:
+        return ""
+    qno_s=str(qno)
+    q_tokens=set(re.findall(r"\d{1,2}\.\d{1,2}(?:\.\d{1,4})?", qno_s))
+    if qno_s in obs_qids or q_tokens.intersection(obs_qids):
+        return "High repeat-observation area from uploaded observation library; this item has been prioritized for HVPQ accuracy review."
+    for q in obs_qids:
+        if q and (q in qno_s or qno_s.startswith(q)):
+            return "High repeat-observation area from uploaded observation library; this item has been prioritized for HVPQ accuracy review."
+    return ""
+
+def concise_check_name(text_in: str) -> str:
+    s=clean_text(text_in)
+    s=re.sub(r"^(HVPQ|PIQ|Q88)\s+(missing|missing/not extracted)\s+", "", s, flags=re.I)
+    s=re.sub(r"\b(completeness|value was extracted for review)\b", "", s, flags=re.I)
+    s=re.sub(r"\s+", " ", s).strip(" -:")
+    return s
+
+def add_v15_validation_findings(findings: List[Finding], fields: List[FieldRecord], ref_date: date):
+    """Add deterministic/manual validation rows from the user's comparison rules. Avoid false confidence: if not extractable, add manual confirmation."""
+    hvpq_raw = "\n".join([f.raw for f in fields if f.source=="HVPQ"])
+
+    pni_sec = first_field(fields,"HVPQ","section.1.1.13") or ""
+    if pni_sec and re.search(r"wreck\s+removal[^\n]{0,80}\bno\b", pni_sec, re.I):
+        add_finding(findings, area="Insurance", check="P&I wreck removal cover declaration", status="MISMATCH", risk="HIGH", hvpq_value=pni_sec[:350], reason="HVPQ 1.1.13.4 should confirm wreck removal cover. Extracted text suggests it may not be Yes.", action="Correct HVPQ or provide evidence that P&I cover includes wreck removal.")
+    elif not pni_sec:
+        add_finding(findings, area="Insurance", check="P&I wreck removal cover declaration", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason="HVPQ 1.1.13.4 could not be reliably checked. Rule requires the response to be Yes.", action="Vessel/office to confirm HVPQ 1.1.13.4 is Yes and supported by P&I evidence.")
+
+    iacs_sec = section_text_by_qid(hvpq_raw, "1.5.1") or first_field(fields,"HVPQ","classification.class_society")
+    if iacs_sec and re.search(r"IACS[^\n]{0,100}\bNo\b", iacs_sec, re.I):
+        add_finding(findings, area="Class", check="IACS membership declaration", status="MISMATCH", risk="HIGH", hvpq_value=iacs_sec[:350], reason="HVPQ 1.5.1.2 should be Yes for IACS member class society.", action="Correct HVPQ 1.5.1.2 or verify class society details.")
+    elif not iacs_sec:
+        add_finding(findings, area="Class", check="IACS membership declaration", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason="HVPQ 1.5.1.2 could not be reliably checked. Rule requires IACS member response to be Yes.", action="Vessel/office to confirm HVPQ 1.5.1.2.")
+
+    last_dd=parse_date_any(first_field(fields,"HVPQ","surveys.last_drydock"))
+    last_sp=parse_date_any(first_field(fields,"HVPQ","surveys.last_special"))
+    if last_dd:
+        if last_dd + relativedelta(years=5) < ref_date:
+            add_finding(findings, area="Class / Survey", check="Last dry dock age", status="MISMATCH", risk="HIGH", hvpq_value=last_dd.isoformat(), reason="HVPQ 1.5.4.1 last dry dock appears older than 5 years.", action="Verify dry dock/Class Status and update HVPQ if stale.")
+        if last_sp and abs((last_dd-last_sp).days)>14:
+            add_finding(findings, area="Class / Survey", check="Last dry dock vs last special survey date", status="MANUAL CHECK", risk="MEDIUM", hvpq_value=f"Dry dock {last_dd.isoformat()} / special {last_sp.isoformat()}", reason="Rule expects HVPQ 1.5.4.1 to align with 1.5.6.1 where renewal/special survey was completed at drydock; dates differ beyond tolerance.", action="Confirm whether dates should match based on latest Class Status and update stale HVPQ entry if required.")
+    else:
+        add_finding(findings, area="Class / Survey", check="Last dry dock date", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason="HVPQ 1.5.4.1 could not be reliably checked.", action="Verify last dry dock date against Class Status.")
+
+    foam_dt=None
+    foam_sec=first_field(fields,"HVPQ","section.5.3.1") or ""
+    dates=all_dates_in_text(foam_sec)
+    if dates: foam_dt=max(dates)
+    if foam_dt:
+        if foam_dt + relativedelta(months=12) < ref_date:
+            add_finding(findings, area="Firefighting", check="Foam test / supply date", status="MISMATCH", risk="HIGH", hvpq_value=foam_dt.isoformat(), reason="HVPQ 5.3.1.4 foam supply/test analysis date appears older than 1 year.", action="Verify latest foam test/supply certificate and update HVPQ.")
+    else:
+        add_finding(findings, area="Firefighting", check="Foam test / supply date", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason="HVPQ 5.3.1.4 could not be reliably checked from extracted text.", action="Vessel to confirm latest foam supply/test analysis date is within 1 year.")
+
+    for q, label in [("7.1.1","Cargo tank coating inspection dates"),("7.1.3","Ballast tank coating inspection dates")]:
+        sec=first_field(fields,"HVPQ",f"section.{q}") or ""
+        dates=all_dates_in_text(sec)
+        if dates:
+            oldest=min(dates); due=oldest+relativedelta(months=12)
+            if due < ref_date:
+                add_finding(findings, area="Tank inspection", check=label, status="MISMATCH", risk="HIGH", hvpq_value=f"Oldest visible date {oldest.isoformat()}", reason=f"HVPQ {q} visible coating inspection date appears outside 12-month annual frequency.", action="Verify every tank entry and update HVPQ if any coating inspection is overdue/stale.")
+        else:
+            add_finding(findings, area="Tank inspection", check=label, status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason=f"HVPQ {q} coating inspection table could not be reliably checked. Manual check is preferred.", action="Vessel to verify all coating inspection dates against stated frequency.")
+
+    anode_sec=section_text_by_qid(hvpq_raw, "7.1.4")
+    if anode_sec and not re.search(r"\b([1-9][0-9]?(?:\.\d+)?)\s*%", anode_sec):
+        add_finding(findings, area="Tank inspection", check="Ballast tank anode wastage percentage", status="MANUAL CHECK", risk="MEDIUM", hvpq_value=anode_sec[:350], reason="HVPQ 7.1.4.5 should contain wastage greater than 0 with % unit where anodes are applicable; extraction did not show a clear percentage.", action="Vessel to verify anode entries and correct HVPQ if blank/zero/wrong unit.")
+
+    pump_sec=section_text_by_qid(hvpq_raw, "9.6.2")
+    if not pump_sec:
+        add_finding(findings, area="Cargo systems", check="Cargo pump type vs vessel length", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="HVPQ 9.6.2 not reliably extracted", reason="Comparison rule for pump type could not be reliably checked.", action="Verify HVPQ 9.6.2 manually against vessel length and cargo pump arrangement.")
+
+    lift_sec=section_text_by_qid(hvpq_raw, "10.9.1")
+    if lift_sec:
+        dates=all_dates_in_text(lift_sec)
+        if dates:
+            newest=max(dates)
+            if newest + relativedelta(months=12) < ref_date:
+                add_finding(findings, area="Lifting gear", check="Annual lifting gear test date", status="MISMATCH", risk="HIGH", hvpq_value=newest.isoformat(), reason="Latest visible lifting gear test date appears older than annual requirement; table may need detailed checking.", action="Vessel to verify annual and 5-year lifting gear/crane tests and update HVPQ 10.9.1.")
+        else:
+            add_finding(findings, area="Lifting gear", check="Annual and 5-year lifting gear test dates", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Not reliably extracted", reason="HVPQ 10.9.1 could not be reliably checked.", action="Vessel to confirm annual and 5-year lifting gear test dates are current.")
+    else:
+        add_finding(findings, area="Lifting gear", check="Annual and 5-year lifting gear test dates", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Section not reliably extracted", reason="HVPQ 10.9.1 was not reliably located in extraction.", action="Vessel to verify lifting gear/crane entries.")
+
+    static=normalize_bool(first_field(fields,"PIQ","piq.static_nav_assessment"))
+    dyn=normalize_bool(first_field(fields,"PIQ","piq.dynamic_nav_assessment_shore"))
+    if static and dyn and static==dyn:
+        add_finding(findings, area="PIQ Navigational Assessment", check="Static and dynamic assessment responses", status="MISMATCH", risk="HIGH", piq_value=f"Static {static}; dynamic {dyn}", reason="PIQ 3.2.1 and 3.2.2 should not both be Yes or both be No as per provided rule.", action="Verify PIQ navigation assessment responses and dates.")
+    elif not static or not dyn:
+        add_finding(findings, area="PIQ Navigational Assessment", check="Static and dynamic assessment responses", status="MANUAL CHECK", risk="MEDIUM", piq_value=f"Static {static or 'not extracted'}; dynamic {dyn or 'not extracted'}", reason="PIQ 3.2.1/3.2.2 could not be fully extracted for rule check.", action="Verify static/dynamic navigational assessment responses and last assessment date.")
+
+    for fid,label,q in [("piq.cargo_audit","Cargo audit","PIQ 3.2.5"),("piq.engineering_audit","Engineering audit","PIQ 3.2.6"),("piq.mooring_anchoring_audit","Mooring/anchoring audit","PIQ 3.2.7")]:
+        v=normalize_bool(first_field(fields,"PIQ",fid))
+        raw=next((f.raw for f in fields if f.source=="PIQ" and f.field_id==fid),"")
+        dates=all_dates_in_text(raw)
+        if v=="yes" and dates:
+            latest=max(dates)
+            if latest + relativedelta(months=12) < ref_date:
+                add_finding(findings, area="PIQ Audit", check=f"{label} date", status="MISMATCH", risk="HIGH", piq_value=latest.isoformat(), reason=f"{q} is marked Yes but latest visible date appears older than 12 months.", action="Verify latest audit date and update PIQ.")
+        elif v=="yes" and not dates:
+            add_finding(findings, area="PIQ Audit", check=f"{label} date", status="MANUAL CHECK", risk="MEDIUM", piq_value="Yes, date not reliably extracted", reason=f"{q} is marked Yes but date could not be reliably checked.", action="Verify audit date is within 12 months.")
+
+    return dedupe_findings(findings)
+
+
+def build_hvpq_checks_v15(fields: List[FieldRecord], findings: List[Finding], ref_date: date, obs_qids: set) -> pd.DataFrame:
+    rows=[]; seen=set()
+    def add_row(priority,qno,area,check,status,hvpq_val,ref_source,ref_val,interp,action):
+        check=concise_check_name(check)
+        obs_reason=obs_reason_for(qno, obs_qids)
+        if obs_reason and obs_reason not in interp:
+            interp=(interp + " " + obs_reason).strip()
+        key=(priority,qno,area,check,status,hvpq_val,ref_val)
+        if key in seen: return
+        seen.add(key)
+        rows.append({"Priority":priority,"Question / Section":qno,"Area":area,"Check":check,"Status":status,"HVPQ value":hvpq_val,"Reference source":ref_source,"Reference value":ref_val,"Finding / interpretation":interp,"Action requested":action})
+    for f in findings:
+        if f.risk.upper() not in ["CRITICAL","HIGH","MEDIUM"]: continue
+        if f.hvpq_value or f.class_value or f.area in ["Certificates","Class / Survey","Classification","Blank / Missing","Environment","Ownership / Operation","Ownership","Insurance","Vessel Type","Class","Tank inspection","Firefighting","Cargo systems","Lifting gear"]:
+            add_row(f.risk, qno_for_finding(f), f.area, f.check, f.status, f.hvpq_value, "Class Status" if f.class_value else ("Q88" if f.q88_value else "PIQ/manual"), f.class_value or f.q88_value or f.piq_value, f.reason, f.action)
+    for r in cert_validity_rows(fields, ref_date):
+        add_row(r["Priority"], r["Question / Section"], r["Area"], r["Check"], r["Status"], r["Document value"], "Class Status/latest certificate", r["Reference value"], r["Finding / interpretation"], r["Action requested"])
+    for row in [_hvpq_ops_row(fields, ref_date, "Brake testing", "mooring.brake_test_date", 12, "10.1.4", "Mooring", "Latest brake test date found in HVPQ/Q88 text"), _hvpq_ops_row(fields, ref_date, "Mooring ropes age / visible date", "mooring.ropes.latest_visible_date", 60, "10.1.7", "Mooring", "Latest rope/tail visible date found; verify every rope individually")]:
+        if row["Priority"] != "Manual":
+            add_row(row["Priority"], row["Question / Section"], row["Area"], row["Check"], row["Status"], row["HVPQ value"], row["Reference source"], row["Reference value"], row["Finding / interpretation"], row["Action requested"])
+    covered_q=set(str(r.get("Question / Section","")) for r in rows)
+    for q in sorted(obs_qids):
+        if not q or any(q in c for c in covered_q):
+            continue
+        add_row("Manual", q, "Observation-informed HVPQ review", f"HVPQ question {q}", "Manual confirmation", "See HVPQ", "Observation library", "High repeat observation", "High repeat-observation area from uploaded observation library. The app could not reliably confirm the exact answer/validity from extracted data; manual check is preferred.", "Vessel/office to verify this HVPQ question and update HVPQ if blank, stale or inconsistent with evidence.")
+    cols=["Priority","Question / Section","Area","Check","Status","HVPQ value","Reference source","Reference value","Finding / interpretation","Action requested"]
+    df=pd.DataFrame(rows)
+    if df.empty: return pd.DataFrame(columns=cols)
+    df=df[cols].drop_duplicates()
+    df["_rank"]=df["Priority"].map(lambda x: {"Critical":0,"CRITICAL":0,"High":1,"HIGH":1,"Medium":2,"MEDIUM":2,"Manual":3,"OK":4}.get(str(x),5))
+    return df.sort_values(["_rank","Area","Question / Section"]).drop(columns="_rank")
+
+
+def build_piq_checks_v15(fields: List[FieldRecord], findings: List[Finding], ref_date: date) -> pd.DataFrame:
+    rows=[]
+    base=build_piq_checks(fields, findings, ref_date)
+    if not base.empty:
+        for _,r in base.iterrows():
+            d=r.to_dict()
+            d["Area"]=str(d.get("Area","")).replace("PIQ completeness","PIQ declaration")
+            d["Check"]=concise_check_name(str(d.get("Check","")))
+            interp=str(d.get("Finding / interpretation",""))
+            interp=re.sub(r"PIQ value was extracted for review\.?", "The PIQ entry was extracted and included in the review.", interp, flags=re.I)
+            d["Finding / interpretation"]=interp
+            rows.append(d)
+    if not any(str(r.get("Question / Section","")).startswith("PIQ 5.7") for r in rows):
+        inc_vals=[f.value for f in fields if f.source=="PIQ" and f.field_id.startswith("incidents.")]
+        status="In order / positive confirmation" if inc_vals and all(normalize_bool(v)=="no" for v in inc_vals if v) else "Manual confirmation"
+        rows.append({"Priority":"Manual","Question / Section":"PIQ 5.7.1001-1029","Area":"Incident declarations","Check":"Incident declaration alignment","Status":status,"Document value":"; ".join(inc_vals[:8]) or "Not reliably extracted","Reference value":"HVPQ 1.9.1-1.9.7","Finding / interpretation":"Incident-related PIQ answers should align with HVPQ 1.9.1-1.9.7 and any Class survey purpose indicating damage/repair/occasional survey.","Action requested":"Vessel/office to positively confirm there were no reportable machinery, injury, mooring, pollution, security, navigation or operational incidents omitted from PIQ/HVPQ."})
+    df=pd.DataFrame(rows)
+    cols=["Priority","Question / Section","Area","Check","Status","Document value","Reference value","Finding / interpretation","Action requested"]
+    for c in cols:
+        if c not in df.columns: df[c]=""
+    df=df[cols].drop_duplicates()
+    df["_rank"]=df["Priority"].map(lambda x: {"Critical":0,"CRITICAL":0,"High":1,"HIGH":1,"Medium":2,"MEDIUM":2,"Manual":3,"OK":4}.get(str(x),5))
+    return df.sort_values(["_rank","Area","Question / Section"]).drop(columns="_rank")
+
+
+def build_q88_checks_v15(fields: List[FieldRecord], findings: List[Finding]) -> pd.DataFrame:
+    df=build_q88_checks(fields, findings)
+    if df.empty: return df
+    df=df.copy()
+    df["Area"]=df["Area"].astype(str).str.replace("Q88 completeness","Q88 value-add", regex=False)
+    df["Check"]=df["Check"].map(concise_check_name)
+    df["Finding / interpretation"]=df["Finding / interpretation"].astype(str).str.replace("Q88 value was extracted for cross-check.", "The Q88 entry was extracted and cross-checked as value-add information.", regex=False)
+    return df
+
+
+def build_summary_paragraphs_v15(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, piq_df: pd.DataFrame) -> Dict[str,str]:
+    def list_items(df, priorities, limit=10):
+        if df is None or df.empty or "Priority" not in df.columns: return []
+        mask=df["Priority"].astype(str).str.upper().isin([p.upper() for p in priorities])
+        vals=[]
+        for _,r in df[mask].head(limit).iterrows():
+            chk=clean_text(r.get("Check", r.get("Area","")))
+            q=clean_text(r.get("Question / Section",""))
+            vals.append(f"{q} {chk}".strip())
+        return vals
+    ok=list_items(hvpq_df,["OK"],8)+list_items(piq_df,["OK"],8)+list_items(q88_df,["OK"],4)
+    bad=list_items(hvpq_df,["CRITICAL","HIGH","MEDIUM"],8)+list_items(piq_df,["CRITICAL","HIGH","MEDIUM"],8)+list_items(q88_df,["CRITICAL","HIGH","MEDIUM"],5)
+    manual=list_items(hvpq_df,["MANUAL"],8)+list_items(piq_df,["MANUAL"],8)+list_items(q88_df,["MANUAL"],5)
+    ok_text="; ".join(ok) if ok else "No positive conclusion is shown for areas where extraction was not strong enough; those items are carried as manual confirmations instead."
+    bad_text="; ".join(bad) if bad else "No critical/high mismatch was identified from the mapped checks."
+    manual_text="; ".join(manual) if manual else "No major manual confirmation gap was generated."
+    return {
+        "checked": "The review checked HVPQ as the main correction document, used Class Status only as the reference for certificate/survey dates and Conditions/Memoranda/dispensations, checked Q88 as value-add information, and reviewed PIQ operational declarations, superintendent intervals, tank inspection cycles, PSC, MOC and incident declarations.",
+        "ok": "Items appearing in order from extracted data include: " + ok_text,
+        "bad": "Items needing correction or review include: " + bad_text,
+        "manual": "Items that could not be reliably checked and should be manually confirmed include: " + manual_text,
+    }
+
+
+def make_excel_v15(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, piq_df: pd.DataFrame) -> bytes:
+    bio=io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        sheets=[("HVPQ Checks", hvpq_df), ("Q88 Value Add", q88_df), ("PIQ Checks", piq_df)]
+        for name, df in sheets:
+            df.to_excel(writer, index=False, sheet_name=name)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes="A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font=Font(bold=True, color="FFFFFF")
+                cell.fill=PatternFill("solid", fgColor="1F4E78")
+                cell.alignment=Alignment(wrap_text=True, vertical="center")
+            for row in ws.iter_rows(min_row=2):
+                pr = str(row[0].value).upper() if row and row[0].value is not None else ""
+                fill = None
+                if "CRITICAL" in pr or "HIGH" in pr:
+                    fill=PatternFill("solid", fgColor="FCE4D6")
+                elif "MEDIUM" in pr or "MANUAL" in pr:
+                    fill=PatternFill("solid", fgColor="EAF2F8")
+                elif "OK" in pr:
+                    fill=PatternFill("solid", fgColor="E2F0D9")
+                for cell in row:
+                    cell.alignment=Alignment(wrap_text=True, vertical="top")
+                    if fill: cell.fill=fill
+            widths={"A":13,"B":18,"C":24,"D":30,"E":20,"F":44,"G":28,"H":44,"I":60,"J":58}
+            for idx, col in enumerate(ws.columns, start=1):
+                letter=get_column_letter(idx)
+                max_len=max((len(str(c.value)) if c.value is not None else 0) for c in col)
+                ws.column_dimensions[letter].width=min(max(widths.get(letter, 14), min(max_len+2, 55)), 65)
+            for r in range(2, min(ws.max_row, 500)+1):
+                ws.row_dimensions[r].height=62
+    return bio.getvalue()
+
 # ----------------------------- Streamlit app -----------------------------
 
 def main():
@@ -2302,6 +2554,7 @@ def main():
         class_file = st.file_uploader("Class Status PDF — certificate/survey authority", type=["pdf"], key="class")
         obs_file = st.file_uploader("HVPQ observation library Excel", type=["xlsx", "xls"], key="obs")
         inc_obs_file = st.file_uploader("Incident observation library Excel", type=["xlsx", "xls"], key="incobs")
+        rules_file = st.file_uploader("Comparison Rules TXT (optional)", type=["txt"], key="rules")
         st.divider()
         ref_date_input = st.date_input("Reference / review date", value=date.today())
         show_low = st.checkbox("Show low-risk findings", value=False)
@@ -2341,15 +2594,16 @@ def main():
         all_fields = dedupe_fields(all_fields)
 
     findings = run_rules(all_fields, ref_date_input, settings, obs_df)
+    findings = add_v15_validation_findings(findings, all_fields, ref_date_input)
     if not show_low:
         findings = [f for f in findings if f.risk.upper() != "LOW"]
     hvpq_text = raw_text_for_source(page_cache, "HVPQ")
     obs_qid_df = hvpq_qid_status_df(obs_df, hvpq_text)
-    repeat_obs_df = build_repeat_obs_checks(obs_qid_df)
-    hvpq_checks_df = build_hvpq_checks(all_fields, findings, ref_date_input)
-    q88_checks_df = build_q88_checks(all_fields, findings)
-    piq_checks_df = build_piq_checks(all_fields, findings, ref_date_input)
-    summary = build_summary_paragraphs(hvpq_checks_df, q88_checks_df, piq_checks_df, repeat_obs_df)
+    obs_qids = extract_qids_from_obs(obs_df)
+    hvpq_checks_df = build_hvpq_checks_v15(all_fields, findings, ref_date_input, obs_qids)
+    q88_checks_df = build_q88_checks_v15(all_fields, findings)
+    piq_checks_df = build_piq_checks_v15(all_fields, findings, ref_date_input)
+    summary = build_summary_paragraphs_v15(hvpq_checks_df, q88_checks_df, piq_checks_df)
 
     # Summary metrics
     def count_bad(df):
@@ -2359,21 +2613,22 @@ def main():
     c1.metric("HVPQ checks", len(hvpq_checks_df))
     c2.metric("Q88 checks", len(q88_checks_df))
     c3.metric("PIQ checks", len(piq_checks_df))
-    c4.metric("Repeat obs Q checks", len(repeat_obs_df))
+    manual_count = int((hvpq_checks_df.get('Priority', pd.Series(dtype=str)).astype(str).str.upper()=='MANUAL').sum() + (q88_checks_df.get('Priority', pd.Series(dtype=str)).astype(str).str.upper()=='MANUAL').sum() + (piq_checks_df.get('Priority', pd.Series(dtype=str)).astype(str).str.upper()=='MANUAL').sum())
+    c4.metric("Manual checks", manual_count)
 
     st.subheader("Office review summary")
     st.markdown(summary["checked"])
     st.success(summary["ok"])
-    if count_bad(hvpq_checks_df)+count_bad(q88_checks_df)+count_bad(piq_checks_df)+count_bad(repeat_obs_df):
+    if count_bad(hvpq_checks_df)+count_bad(q88_checks_df)+count_bad(piq_checks_df):
         st.warning(summary["bad"])
     else:
         st.success(summary["bad"])
-    st.info(summary["obs"])
+    st.info(summary["manual"])
 
-    xlsx = make_excel_v14(hvpq_checks_df, q88_checks_df, piq_checks_df, repeat_obs_df)
-    st.download_button("Download Excel check register", xlsx, file_name="hvpq_piq_q88_check_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    xlsx = make_excel_v15(hvpq_checks_df, q88_checks_df, piq_checks_df)
+    st.download_button("Download Excel check register", xlsx, file_name="hvpq_piq_q88_check_register_v15.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    tabs = st.tabs(["HVPQ Checks", "Q88 Checks", "PIQ Checks", "Repeat Observation Questions", "Advanced Extraction"])
+    tabs = st.tabs(["HVPQ Checks", "Q88 Value Add", "PIQ Checks", "Advanced Extraction"])
     with tabs[0]:
         st.subheader("HVPQ checks — main correction register")
         st.caption("HVPQ is the document to correct. Class Status is used as authority for certificate/survey dates; Q88 is only value-add.")
@@ -2384,13 +2639,9 @@ def main():
         st.dataframe(style_priority_dataframe(q88_checks_df), use_container_width=True, height=680)
     with tabs[2]:
         st.subheader("PIQ checks — operational declarations and intervals")
-        st.caption("Includes PIQ superintendent intervals, tank inspection cycles, MOC/retrofit, PSC, incidents and key PIQ extraction completeness checks.")
+        st.caption("Includes PIQ superintendent intervals, tank inspection cycles, MOC/retrofit, PSC, incidents and key PIQ rule checks.")
         st.dataframe(style_priority_dataframe(piq_checks_df), use_container_width=True, height=680)
     with tabs[3]:
-        st.subheader("Repeat-observation question checks")
-        st.caption("Generated from question numbers found in the observation Excel. These rows are targeted checks, not automatic defects.")
-        st.dataframe(style_priority_dataframe(repeat_obs_df), use_container_width=True, height=680)
-    with tabs[4]:
         st.subheader("Advanced extraction review")
         st.caption("For troubleshooting extraction only. This is not intended as the main user workflow.")
         st.dataframe(df_from_fields(all_fields), use_container_width=True, height=600)
