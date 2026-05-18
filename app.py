@@ -19,7 +19,7 @@ from openpyxl.utils import get_column_letter
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
-APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v18"
+APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v19"
 APP_SUBTITLE = "Extraction-first verifier with built-in machine-readable observation priority library and validation rules. No external rules/observation uploads required."
 
 # ----------------------------- Data models -----------------------------
@@ -478,6 +478,52 @@ def block_answer(block: List[str], skip_label_lines: int = 1, max_answer_lines: 
             break
     return clean_text(" ".join(vals))
 
+
+# Class Status date-label safeguards.
+# DNV Class Status normally uses "Issued date" for certificate issue and "Valid until" for expiry.
+# Never treat a lone "Issued date" as an expiry. Expiry is accepted only when an expiry/validity label is present
+# or when a clearly labelled table provides both issue and valid-until dates.
+EXPIRY_LABEL_RE = re.compile(r"\b(valid\s*(?:until|to)|validity|expiry|expires?|expiration|date\s*expires|valid\s*until)\b", re.I)
+ISSUE_LABEL_RE = re.compile(r"\b(issued?|date\s*issued|issue\s*date|issued\s*date)\b", re.I)
+
+def has_expiry_label(s: str) -> bool:
+    return bool(EXPIRY_LABEL_RE.search(clean_text(s)))
+
+def has_issue_label(s: str) -> bool:
+    return bool(ISSUE_LABEL_RE.search(clean_text(s)))
+
+def first_date_after_label(text: str, label_re: re.Pattern, max_chars: int = 140) -> str:
+    txt = clean_text(text)
+    for m in label_re.finditer(txt):
+        seg = txt[m.end():m.end()+max_chars]
+        dates = extract_dates(seg)
+        if dates:
+            return dates[0]
+    return ""
+
+def labelled_cert_dates(block: str) -> Tuple[str, str]:
+    """Return (issue_date, expiry_date) only when labels support the classification.
+
+    This is intentionally conservative for Class Status PDFs. A date near 'Issued date' is issue.
+    A date near 'Valid until'/'Expiry' is expiry. A single unlabelled date is not expiry.
+    """
+    txt = clean_text(block)
+    issue = first_date_after_label(txt, ISSUE_LABEL_RE)
+    expiry = first_date_after_label(txt, EXPIRY_LABEL_RE)
+    if issue or expiry:
+        return issue, expiry
+
+    # Fallback for one-line/table rows where labels and dates are both present but OCR order is imperfect.
+    dates = extract_dates(txt)
+    if has_issue_label(txt) and len(dates) == 1:
+        return dates[0], ""
+    if has_expiry_label(txt) and len(dates) == 1:
+        return "", dates[0]
+    if has_issue_label(txt) and has_expiry_label(txt) and len(dates) >= 2:
+        return dates[0], dates[-1]
+    return "", ""
+
+
 def add_q88_block_field(fields: List[FieldRecord], blocks: Dict[str, List[str]], qno: str, source: str, field_id: str, label: str = ''):
     b = blocks.get(qno.lower(), [])
     if not b:
@@ -518,8 +564,16 @@ def parse_cert_rows_from_sequence(lines: List[str], source: str, cert_order: str
             if len(dates) >= 2: add_field(fields, source, f"cert.{key}.last_annual", dates[1], raw=block)
             if len(dates) >= 3: add_field(fields, source, f"cert.{key}.last_intermediate", dates[2], raw=block)
         elif cert_order == 'class':
-            if len(dates) >= 1: add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block)
-            if len(dates) >= 2: add_field(fields, source, f"cert.{key}.expiry", dates[1], raw=block)
+            issue_dt, expiry_dt = labelled_cert_dates(block)
+            if issue_dt:
+                add_field(fields, source, f"cert.{key}.issue", issue_dt, raw=block)
+            elif len(dates) >= 1 and not has_expiry_label(block):
+                # Conservative fallback: an unlabelled/lone Class Status date is issue/review data, not expiry.
+                add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block)
+            if expiry_dt:
+                add_field(fields, source, f"cert.{key}.expiry", expiry_dt, raw=block)
+            elif has_expiry_label(block) and len(dates) >= 2:
+                add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=block)
         else:
             if len(dates) >= 1: add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block)
             if len(dates) >= 2: add_field(fields, source, f"cert.{key}.expiry", dates[1], raw=block)
@@ -902,29 +956,32 @@ def extract_class_status(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     class_cert_lines = lines[cstart:cend] if cstart >= 0 else []
     fields += parse_cert_rows_from_sequence(class_cert_lines, source, cert_order="class")
 
-    # KR certificate table sometimes has certificate desc rows followed by issue/expiry dates. Scan all lines.
-    for line in lines:
+    # Certificate rows in Class Status. Be strict with DNV-style labels:
+    # 'Issued date' is issue only; expiry must be labelled 'Valid until' / 'Expiry' / equivalent.
+    for i, line in enumerate(lines):
         key = cert_key_from_label(line)
         if key:
-            dates = extract_dates(line)
-            # KR order usually issue/expiry or expiry only depending page. Use text labels when possible.
-            if dates:
-                if re.search(r"Expiry", line, re.I) and len(dates) == 1:
-                    add_field(fields, source, f"cert.{key}.expiry", dates[0], raw=line)
-                elif len(dates) >= 2:
-                    add_field(fields, source, f"cert.{key}.issue", dates[0], raw=line)
-                    add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=line)
-                elif len(dates) == 1:
-                    # for ClassNK Current Statutory Certificates rows list only expiry date
-                    add_field(fields, source, f"cert.{key}.expiry", dates[0], raw=line)
-    # ClassNK Current Statutory Certificates: row has cert + expiry date
+            win = " ".join(lines[max(0, i-2):min(len(lines), i+3)])
+            dates = extract_dates(win)
+            issue_dt, expiry_dt = labelled_cert_dates(win)
+            if issue_dt and not sources_value(fields, f"cert.{key}.issue").get(source):
+                add_field(fields, source, f"cert.{key}.issue", issue_dt, raw=win)
+            if expiry_dt and not sources_value(fields, f"cert.{key}.expiry").get(source):
+                add_field(fields, source, f"cert.{key}.expiry", expiry_dt, raw=win)
+            # Safe fallback: multiple dates can be issue+validity only if an expiry label exists in the same window.
+            if has_expiry_label(win) and len(dates) >= 2 and not sources_value(fields, f"cert.{key}.expiry").get(source):
+                add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=win)
+            elif has_issue_label(win) and len(dates) >= 1 and not sources_value(fields, f"cert.{key}.issue").get(source):
+                add_field(fields, source, f"cert.{key}.issue", dates[0], raw=win)
+    # Last chance expiry extraction: only if an expiry/validity label is present nearby.
     for i, line in enumerate(lines):
         key = cert_key_from_label(line)
         if key and not sources_value(fields, f"cert.{key}.expiry").get(source):
-            win = " ".join(lines[i:i+3])
+            win = " ".join(lines[max(0, i-2):min(len(lines), i+4)])
             dates = extract_dates(win)
-            if dates:
-                add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=win)
+            if dates and has_expiry_label(win):
+                issue_dt, expiry_dt = labelled_cert_dates(win)
+                add_field(fields, source, f"cert.{key}.expiry", expiry_dt or dates[-1], raw=win)
 
     # Survey status rows KR/NK
     for line in lines:
@@ -1891,9 +1948,9 @@ def build_coverage_matrix(fields: List[FieldRecord], findings: List[Finding], ob
     # Observation library
     obs_q = hvpq_qid_status_df(obs_df, hvpq_text)
     if obs_df is None or obs_df.empty:
-        add("Observation library", "Historical observation question-number checks", "Not uploaded", "No observation Excel uploaded.", "Upload HVPQ observation Excel to generate targeted HVPQ question checks.")
+        add("Observation library", "Historical observation question-number checks", "Not uploaded", "Built-in observation library is active.", "Built-in observation priorities are already available.")
     elif obs_q.empty:
-        add("Observation library", "Historical observation question-number checks", "Could not reliably check", "No exact question numbers captured from observation library.", "Review observation Excel format or add question numbers such as 10.1.4 in observation text.")
+        add("Observation library", "Historical observation question-number checks", "Could not reliably check", "No exact question numbers captured from observation library.", "Review the embedded observation knowledge base if additional question numbers are required.")
     else:
         missing = int(obs_q["HVPQ check status"].astype(str).str.contains("not found|could not reliably", case=False, regex=True).sum())
         add("Observation library", "Historical observation question-number checks", "Checked with manual gaps" if missing else "Checked", f"Generated {len(obs_q)} targeted HVPQ question checks; {missing} require manual confirmation.", "Review the Observation QID Checks tab for exact HVPQ question-level checks.")
@@ -2090,7 +2147,7 @@ def build_human_review_summary(fields: List[FieldRecord], findings: List[Finding
         manual_text = "no major extraction-gap/manual-confirmation item was generated from the current upload."
 
     if obs_qid_df.empty:
-        obs_text = "No observation-library question-number checks were generated. Upload an observation Excel containing HVPQ question numbers such as 10.1.4 or 2.1.5 to activate this section."
+        obs_text = "No observation-library question-number checks were generated. The embedded observation library did not generate question checks for this item."
     else:
         review = obs_qid_df[obs_qid_df["HVPQ check status"].astype(str).str.contains("could not reliably|not found|manual", case=False, regex=True, na=False)]
         ok = len(obs_qid_df) - len(review)
