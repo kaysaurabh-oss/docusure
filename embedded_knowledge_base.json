@@ -1,6 +1,6 @@
 {
-  "schema_version": "2026-05-17.v18",
-  "description": "Machine-readable embedded observation and validation knowledge base for HVPQ/PIQ/Q88 verifier. Observations are priority signals only; validation rules create findings only when evidence supports them.",
+  "schema_version": "2026-09-18.v20",
+  "description": "Evidence-led DocuSure rule base. Observation history prioritises review; only supported contradictions or explicit rule breaches become discrepancies, while extraction gaps remain Not verified.",
   "observation_library": [
     {
       "question_no": "10.1.4",
@@ -2659,12 +2659,12 @@
         "10.1.7"
       ],
       "category": "Mooring",
-      "rule_type": "age_limit",
+      "rule_type": "retirement_criteria_check",
       "severity": "HIGH",
-      "statement": "Wire, tails and ropes must be within allowed age: wire 10 years, tails 18 months, ropes 5 years.",
-      "machine_logic": "For each mooring line row, parse type and installed date; fail if age exceeds type limit.",
-      "evidence_required": "Line type and installed date for each wire/tail/rope.",
-      "action_if_fail": "Replace overdue line or correct date/type.",
+      "statement": "Line and tail service/retirement life must be checked against the applicable LMP/MSMP, manufacturer, certificates and company criteria; installation date alone does not establish a universal limit.",
+      "machine_logic": "Extract type, installation/service date, material and strength. Flag a discrepancy only when the uploaded evidence contains the applicable criterion and shows it is breached; otherwise create a verification item.",
+      "evidence_required": "Line/tail identity, certificate, inspection history and documented retirement criterion.",
+      "action_if_fail": "Verify every line/tail against documented retirement criteria; replace or correct records only when a breach is supported.",
       "skip_when": []
     },
     {
@@ -2715,12 +2715,12 @@
         "PIQ 3.2.2"
       ],
       "category": "Navigation assessment",
-      "rule_type": "mutual_exclusive_boolean",
+      "rule_type": "assessment_coverage_check",
       "severity": "MEDIUM",
-      "statement": "Static and dynamic navigational assessments cannot both be Yes or both be No; responses must be opposite.",
-      "machine_logic": "Normalize both answers; fail if equal or blank.",
+      "statement": "If both static and dynamic navigational assessment responses are No, verify applicability and assessment coverage; both Yes is not an automatic contradiction.",
+      "machine_logic": "Do not fail when both are Yes. If both are No or either is blank, create a verification item only.",
       "evidence_required": "PIQ 3.2.1 and 3.2.2.",
-      "action_if_fail": "Correct assessment type declaration.",
+      "action_if_fail": "Confirm assessment applicability, type, date and evidence.",
       "skip_when": []
     },
     {
@@ -2966,6 +2966,84 @@
       "machine_logic": "Compare PIQ required frequency and oldest inspection date against HVPQ tank coating last inspection dates and frequency.",
       "evidence_required": "PIQ 2.3.3002 and HVPQ 7.1.3 table.",
       "action_if_fail": "Correct stale/mismatched ballast tank inspection data.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "DOC-CLASS-001",
+      "source_scope": ["ALL"],
+      "question_refs": ["UPLOAD"],
+      "category": "Document recognition",
+      "rule_type": "classification_confidence",
+      "severity": "HIGH",
+      "statement": "Each uploaded document must be classified with adequate evidence before its values drive a finding.",
+      "machine_logic": "Low-confidence or unknown documents are excluded from deterministic conclusions.",
+      "evidence_required": "Filename, text signatures and extraction quality.",
+      "action_if_fail": "Confirm document type or provide a searchable copy.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "DOC-ID-001",
+      "source_scope": ["ALL"],
+      "question_refs": ["IMO"],
+      "category": "Identity",
+      "rule_type": "vessel_grouping",
+      "severity": "CRITICAL",
+      "statement": "Documents are grouped by checksum-valid IMO; cross-document comparison is blocked across different vessels.",
+      "machine_logic": "Validate the IMO checksum and compare only within the selected or user-confirmed vessel group.",
+      "evidence_required": "IMO number or reliable vessel-name match from each document.",
+      "action_if_fail": "Correct the session assignment or provide documents with visible vessel identity.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "CERT-WATCH-001",
+      "source_scope": ["CERTIFICATE", "CLASS", "HVPQ"],
+      "question_refs": ["2.1.5"],
+      "category": "Certificates",
+      "rule_type": "expiry_watch",
+      "severity": "HIGH",
+      "statement": "List expired certificates and certificates expiring within 30, 90 and the configured watch period separately.",
+      "machine_logic": "Prefer a labelled original-certificate expiry, then Class Status, then HVPQ; calculate days remaining from the review/operation date.",
+      "evidence_required": "Labelled expiry, filename/page and evidence source.",
+      "action_if_fail": "Renew, verify voyage coverage or resolve before fixture/operation.",
+      "skip_when": ["Certificates without an expiry requirement"]
+    },
+    {
+      "rule_id": "CLASS-OPEN-001",
+      "source_scope": ["CLASS", "HVPQ", "Q88"],
+      "question_refs": ["1.5.14", "1.5.16", "1.5.18"],
+      "category": "Class / chartering",
+      "rule_type": "open_item_watch",
+      "severity": "CRITICAL",
+      "statement": "Open Conditions of Class, significant memoranda/recommendations and dispensations must be highlighted with their actual text and due date where visible.",
+      "machine_logic": "A heading alone is not an open item; require explicit Nil/None or an actual open/status marker.",
+      "evidence_required": "Current Class Status context.",
+      "action_if_fail": "Review restriction, due date and acceptance before fixture/STS clearance.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "MOOR-FACTS-001",
+      "source_scope": ["HVPQ", "Q88", "LMP", "MSMP"],
+      "question_refs": ["10.1.3", "10.1.4", "10.1.7"],
+      "category": "Mooring",
+      "rule_type": "key_fact_inventory",
+      "severity": "HIGH",
+      "statement": "Surface brake-test date, SDMBL/LDBF/TDBF and recognised rope/wire/tail particulars with evidence confidence.",
+      "machine_logic": "Only structure a line/tail row when at least two local attributes are visible; do not turn a heading or installation date alone into a defect.",
+      "evidence_required": "HVPQ/LMP row context, certificates and documented retirement criteria.",
+      "action_if_fail": "Verify every line/tail against LMP/MSMP, certificates and retirement criteria.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "STS-PRE-001",
+      "source_scope": ["TWO_VESSELS"],
+      "question_refs": ["STS"],
+      "category": "STS clearance",
+      "rule_type": "pre_clearance_screen",
+      "severity": "CRITICAL",
+      "statement": "STS pre-check separates holds, review points, missing evidence and extracted compatibility inputs for both vessels.",
+      "machine_logic": "Group by IMO; review certificates/class/insurance/plans and compare available principal, manifold, transfer and mooring particulars without issuing final operational clearance.",
+      "evidence_required": "Both vessel packs and operation-specific compatibility/JPO/risk assessment.",
+      "action_if_fail": "Resolve holds and evidence gaps through the responsible STS review process.",
       "skip_when": []
     }
   ]

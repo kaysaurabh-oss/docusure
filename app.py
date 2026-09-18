@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
+import math
 import re
 import zipfile
+from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
@@ -19,8 +22,24 @@ from openpyxl.utils import get_column_letter
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
-APP_TITLE = "HVPQ / PIQ / Q88 / Class Status Checker v19"
-APP_SUBTITLE = "Extraction-first verifier with built-in machine-readable observation priority library and validation rules. No external rules/observation uploads required."
+from docusure_engine import (
+    DocumentProfile,
+    best_field as engine_best_field,
+    build_sts_screen,
+    certificate_watch_df,
+    conclusion_counts,
+    detect_document_type,
+    document_inventory_df,
+    enhance_register,
+    extract_mooring_summary,
+    extract_numbered_section,
+    extract_sts_particulars,
+    profile_document,
+    valid_imo as engine_valid_imo,
+)
+
+APP_TITLE = "DocuSure — SIRE & Chartering Readiness v20"
+APP_SUBTITLE = "Evidence-led review of HVPQ, PIQ, Q88 and Class Status. Confirmed discrepancies, potential concerns and extraction gaps are kept separate."
 
 # ----------------------------- Data models -----------------------------
 
@@ -33,6 +52,10 @@ class FieldRecord:
     date_value: str = ""
     confidence: str = "deterministic"
     raw: str = ""
+    confidence_score: int = 0
+    page: int = 0
+    extraction_method: str = ""
+    document_name: str = ""
 
 @dataclass
 class Finding:
@@ -47,14 +70,28 @@ class Finding:
     xml_value: str = ""
     reason: str = ""
     action: str = ""
+    conclusion: str = ""
+    confidence: str = ""
+    confidence_score: int = 0
+    evidence: str = ""
+    rule_basis: str = ""
+
+
+@dataclass
+class ProcessedDocument:
+    profile: DocumentProfile
+    pages: List[Tuple[int, str]]
+    text: str
+    fields: List[FieldRecord]
+    file_hash: str
 
 # ----------------------------- General helpers -----------------------------
 
 MONTHS_7_DAYS = 7 * 30.4375
 MONTHS_12_DAYS = 12 * 30.4375
 DATE_PATTERNS = [
-    r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b",
-    r"\b[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4}\b",
+    r"\b\d{1,2}[\s./-]+[A-Za-z]{3,9}[\s,./-]+\d{2,4}\b",
+    r"\b[A-Za-z]{3,9}[\s./-]+\d{1,2},?[\s./-]+\d{2,4}\b",
     r"\b\d{4}-\d{2}-\d{2}\b",
     r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b",
 ]
@@ -191,15 +228,29 @@ def normalize_bool(s: str) -> str:
     return x
 
 
+def valid_imo_number(value: str) -> bool:
+    """Validate the seven-digit IMO checksum (six weighted digits + check digit)."""
+    digits = re.sub(r"\D", "", clean_text(value))
+    if len(digits) != 7:
+        return False
+    return sum(int(digits[i]) * (7 - i) for i in range(6)) % 10 == int(digits[-1])
+
+
 def parse_date_any(s: str) -> Optional[date]:
     if not s:
         return None
-    # Avoid question numbers / decimals being parsed as dates
-    s = clean_text(s)
-    m = DATE_RE.search(s)
-    target = m.group(0) if m else s
+    # Maritime forms overwhelmingly use day-month-year. Parse ambiguous numeric
+    # dates day-first, while keeping ISO dates year-first. Restrict parsing to a
+    # recognised date token so question numbers and decimal values are ignored.
+    value = clean_text(s)
+    m = DATE_RE.search(value)
+    if not m:
+        return None
+    target = m.group(0).strip(" ,.;")
+    target = re.sub(r"(?<=\d)[.](?=[A-Za-z])|(?<=[A-Za-z])[.](?=\d)", "-", target)
     try:
-        dt = dateparser.parse(target, dayfirst=False, fuzzy=True)
+        yearfirst = bool(re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", target))
+        dt = dateparser.parse(target, dayfirst=not yearfirst, yearfirst=yearfirst, fuzzy=False)
         if dt and 1900 <= dt.year <= 2100:
             return dt.date()
     except Exception:
@@ -221,11 +272,38 @@ def extract_dates(line: str) -> List[str]:
     return out
 
 
-def add_field(fields: List[FieldRecord], source: str, field_id: str, value: Any, label: str = "", raw: str = "", confidence: str = "deterministic"):
+CONFIDENCE_SCORES = {
+    "table-aware": 96,
+    "deterministic": 92,
+    "xml": 92,
+    "section-snippet": 78,
+    "best-effort": 68,
+    "local-llm": 62,
+    "manual-needed": 30,
+    "llm-error": 0,
+}
+
+
+def base_confidence_score(label: str) -> int:
+    return CONFIDENCE_SCORES.get(clean_text(label).lower(), 70)
+
+
+def add_field(fields: List[FieldRecord], source: str, field_id: str, value: Any, label: str = "", raw: str = "", confidence: str = "deterministic", page: int = 0, extraction_method: str = ""):
     val = clean_text(value)
     if val == "":
         return
-    fields.append(FieldRecord(source=source, field_id=field_id, label=label or FIELD_LABELS.get(field_id, field_id), value=val, date_value=iso_date(val), raw=clean_text(raw)[:800], confidence=confidence))
+    fields.append(FieldRecord(
+        source=source,
+        field_id=field_id,
+        label=label or FIELD_LABELS.get(field_id, field_id),
+        value=val,
+        date_value=iso_date(val),
+        raw=clean_text(raw)[:1200],
+        confidence=confidence,
+        confidence_score=base_confidence_score(confidence),
+        page=page,
+        extraction_method=extraction_method or confidence,
+    ))
 
 
 
@@ -252,7 +330,7 @@ def parse_table_dates_by_last_inspection(section: str) -> List[date]:
     if not section:
         return []
     txt = clean_text(section)
-    date_pat = r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})"
+    date_pat = r"(\d{1,2}[\s./-]+[A-Za-z]{3,9}[\s,./-]+\d{2,4}|[A-Za-z]{3,9}[\s./-]+\d{1,2},?[\s./-]+\d{2,4}|\d{1,2}[./-]\d{1,2}[./-]\d{4})"
     pairs = re.findall(date_pat + r"\s+" + date_pat + r"\s+(?:Annual|12\s*months?|[0-9]+\s*months?)", txt, flags=re.I)
     out=[]
     for _, insp in pairs:
@@ -294,27 +372,46 @@ def extract_q88_coating_fields(fields: List[FieldRecord], source: str, text: str
         if dates:
             add_structured_date_list(fields, source, fid, dates, f"Q88 {name} coating inspection dates", raw=sec, confidence="table-aware")
 
+def field_quality_score(field: FieldRecord) -> int:
+    """Score competing extraction candidates before any rule consumes a value."""
+    score = int(field.confidence_score or base_confidence_score(field.confidence))
+    value = clean_text(field.value)
+    norm = normalize_value(value)
+    if field.field_id == "vessel.imo":
+        score += 12 if valid_imo_number(value) else -80
+    elif field.field_id == "vessel.mmsi":
+        score += 8 if re.fullmatch(r"\d{9}", re.sub(r"\D", "", value)) else -35
+    if field.field_id.startswith(("cert.", "surveys.")) or field.field_id.endswith((".date", ".expiry", ".issue")):
+        score += 7 if parse_date_any(value) else -25
+    if field.field_id in {"vessel.name", "vessel.flag", "vessel.type", "owner.registered_owner", "owner.technical_operator", "insurance.pni_club"}:
+        if len(value) > 160 or re.match(r"^(name|date|yes/no|if other|amount|question|address)$", norm, re.I):
+            score -= 45
+        elif 2 < len(value) < 90:
+            score += 5
+    if field.raw and value and normalize_value(value) in normalize_value(field.raw):
+        score += 3
+    return score
+
+
+def best_field_record(fields: List[FieldRecord], source: str, field_id: str) -> Optional[FieldRecord]:
+    candidates = [f for f in fields if f.source == source and f.field_id == field_id and clean_text(f.value)]
+    if not candidates:
+        return None
+    frequencies = Counter(normalize_value(f.value) for f in candidates)
+    return max(candidates, key=lambda f: field_quality_score(f) + min(6, frequencies[normalize_value(f.value)] * 2))
+
+
 def first_field(fields: List[FieldRecord], source: str, field_id: str) -> str:
-    for f in fields:
-        if f.source == source and f.field_id == field_id and clean_text(f.value):
-            return f.value
-    return ""
+    record = best_field_record(fields, source, field_id)
+    return record.value if record else ""
 
 
 def values_by_field(fields: List[FieldRecord], source: str) -> Dict[str, str]:
-    d = {}
-    for f in fields:
-        if f.source == source and f.field_id not in d and clean_text(f.value):
-            d[f.field_id] = f.value
-    return d
+    return {field_id: first_field(fields, source, field_id) for field_id in {f.field_id for f in fields if f.source == source} if first_field(fields, source, field_id)}
 
 
 def sources_value(fields: List[FieldRecord], field_id: str) -> Dict[str, str]:
-    out = {}
-    for f in fields:
-        if f.field_id == field_id and clean_text(f.value):
-            out.setdefault(f.source, f.value)
-    return out
+    return {source: first_field(fields, source, field_id) for source in {f.source for f in fields if f.field_id == field_id} if first_field(fields, source, field_id)}
 
 
 def cert_key_from_label(label: str) -> Optional[str]:
@@ -364,15 +461,28 @@ def semantically_equivalent(a: str, b: str, field_id: str = "") -> bool:
 
 # ----------------------------- PDF/Text extraction -----------------------------
 
-def extract_pdf_pages(file_obj) -> List[Tuple[int, str]]:
+def extract_pdf_pages(file_obj, enable_ocr: bool = True) -> List[Tuple[int, str]]:
     if file_obj is None:
         return []
-    data = file_obj.getvalue() if hasattr(file_obj, "getvalue") else file_obj.read()
+    data = file_obj if isinstance(file_obj, (bytes, bytearray)) else (file_obj.getvalue() if hasattr(file_obj, "getvalue") else file_obj.read())
     pages = []
     try:
         with fitz.open(stream=data, filetype="pdf") as doc:
             for i, page in enumerate(doc, 1):
-                txt = page.get_text("text") or ""
+                txt = page.get_text("text", sort=True) or ""
+                # PyMuPDF can call Tesseract when it is installed. The fallback is
+                # intentionally silent: document diagnostics will identify a sparse
+                # page and ask for a searchable/OCR copy rather than pretending a
+                # blank extraction is a document defect.
+                visible = len(re.sub(r"[^A-Za-z0-9]+", "", txt))
+                if enable_ocr and visible < 50:
+                    try:
+                        text_page = page.get_textpage_ocr(language="eng", dpi=200, full=True)
+                        ocr_text = page.get_text("text", textpage=text_page, sort=True) or ""
+                        if len(re.sub(r"[^A-Za-z0-9]+", "", ocr_text)) > visible:
+                            txt = ocr_text
+                    except Exception:
+                        pass
                 pages.append((i, txt))
     except Exception as e:
         st.warning(f"PDF extraction failed: {e}")
@@ -1004,15 +1114,43 @@ def extract_class_status(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
             if re.search(r"next|due", line, re.I): add_field(fields, source, "surveys.next_iws_due", dates[0], raw=line)
             add_field(fields, source, "surveys.last_iws", dates[-1], raw=line)
 
-    # Conditions / memo / recommendations: be conservative, don't confuse empty sections with mismatch.
-    cc_text = " ".join([l for l in lines if re.search(r"condition(s)? of class|recommendation|memoranda|memorandum|memo", l, re.I)])
-    if cc_text:
-        if re.search(r"no\s+(open\s+)?condition|none|nil", cc_text, re.I):
-            add_field(fields, source, "classification.conditions_of_class", "No", raw=cc_text)
-        elif re.search(r"condition", cc_text, re.I):
-            add_field(fields, source, "classification.conditions_of_class", "Review listed items", raw=cc_text)
-        if re.search(r"no\s+(memoranda|memorandum|memo)|none|nil", cc_text, re.I):
-            add_field(fields, source, "classification.memo_of_class", "No", raw=cc_text)
+    # Conditions / memoranda / dispensations. A heading alone is never evidence
+    # that an item is open. Require an explicit Nil/None/zero count or an actual
+    # status/item marker in the local context.
+    def contexts_for(pattern: str, radius: int = 3) -> str:
+        chunks = []
+        for idx, line in enumerate(lines):
+            if re.search(pattern, line, re.I):
+                chunks.append(" ".join(lines[max(0, idx-radius):min(len(lines), idx+radius+1)]))
+        return clean_text(" | ".join(chunks))[:4000]
+
+    condition_ctx = contexts_for(r"condition(?:s)?\s+of\s+class|class\s+condition|recommendation")
+    memo_ctx = contexts_for(r"memoranda|memorandum|\bmemo(?:s)?\b")
+    disp_ctx = contexts_for(r"dispensation|exemption|equivalence")
+
+    def explicit_nil(context: str, noun: str) -> bool:
+        return bool(context and re.search(rf"(?:{noun})[^|]{{0,120}}\b(?:none|nil|no\s+open|zero|0\s+(?:item|outstanding))\b|\b(?:none|nil|no\s+open|zero)\b[^|]{{0,80}}(?:{noun})", context, re.I))
+
+    def explicit_open(context: str) -> bool:
+        return bool(context and re.search(r"\b(?:open|outstanding|overdue|due\s+date|imposed|recommendation\s+no\.?|condition\s+no\.?)\b", context, re.I) and not re.search(r"\bno\s+open\b", context, re.I))
+
+    if explicit_nil(condition_ctx, r"conditions?|recommendations?"):
+        add_field(fields, source, "classification.conditions_of_class", "No", raw=condition_ctx, confidence="table-aware")
+    elif explicit_open(condition_ctx):
+        add_field(fields, source, "classification.conditions_of_class", "Yes — review listed item(s)", raw=condition_ctx, confidence="table-aware")
+        add_field(fields, source, "classification.conditions_of_class.details", condition_ctx, label="Conditions of Class details", raw=condition_ctx, confidence="section-snippet")
+
+    if explicit_nil(memo_ctx, r"memoranda|memorandum|memos?"):
+        add_field(fields, source, "classification.memo_of_class", "No", raw=memo_ctx, confidence="table-aware")
+    elif explicit_open(memo_ctx):
+        add_field(fields, source, "classification.memo_of_class", "Yes — review listed item(s)", raw=memo_ctx, confidence="table-aware")
+        add_field(fields, source, "classification.memo_of_class.details", memo_ctx, label="Memoranda of Class details", raw=memo_ctx, confidence="section-snippet")
+
+    if explicit_nil(disp_ctx, r"dispensations?|exemptions?|equivalences?"):
+        add_field(fields, source, "classification.flag_dispensation", "No", raw=disp_ctx, confidence="table-aware")
+    elif explicit_open(disp_ctx):
+        add_field(fields, source, "classification.flag_dispensation", "Yes — review listed item(s)", raw=disp_ctx, confidence="table-aware")
+        add_field(fields, source, "classification.flag_dispensation.details", disp_ctx, label="Dispensation/exemption details", raw=disp_ctx, confidence="section-snippet")
 
     return dedupe_fields(fields)
 
@@ -1051,6 +1189,234 @@ def dedupe_fields(fields: List[FieldRecord]) -> List[FieldRecord]:
         seen.add(k)
         out.append(f)
     return out
+
+
+def attach_field_evidence(fields: List[FieldRecord], page_cache: Dict[str, List[Tuple[int, str]]]) -> List[FieldRecord]:
+    """Attach page provenance and final candidate confidence after extraction."""
+    normalized_pages: Dict[str, List[Tuple[int, str]]] = {
+        source: [(page_no, normalize_value(text)) for page_no, text in pages]
+        for source, pages in page_cache.items()
+    }
+    for field in fields:
+        field.confidence_score = max(0, min(99, field_quality_score(field)))
+        if field.page or field.source not in normalized_pages:
+            continue
+        needles = []
+        value_needle = normalize_value(field.value)
+        raw_needle = normalize_value(field.raw)[:120]
+        if len(value_needle) >= 4:
+            needles.append(value_needle)
+        if len(raw_needle) >= 18:
+            needles.append(raw_needle)
+        for page_no, page_text in normalized_pages[field.source]:
+            if any(needle and needle in page_text for needle in needles):
+                field.page = page_no
+                break
+    return fields
+
+
+def extract_generic_certificate(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
+    """Extract identity and labelled validity from an individual certificate PDF."""
+    source = "CERTIFICATE"
+    text = join_pages(pages)
+    lines = lines_from_text(text)
+    fields: List[FieldRecord] = []
+    imo_match = re.search(r"\bIMO(?:\s+(?:No\.?|Number))?\s*[:#-]?\s*(\d{7})\b", text, re.I)
+    if imo_match:
+        add_field(fields, source, "vessel.imo", imo_match.group(1), raw=imo_match.group(0), confidence="table-aware")
+    add_field(fields, source, "vessel.name", next_value_after(lines, r"^Name of (?:the )?Ship$|^Ship Name$|^Name of Vessel$"), confidence="deterministic")
+
+    cert_key = cert_key_from_label(text[:5000])
+    if not cert_key:
+        for line in lines[:80]:
+            cert_key = cert_key_from_label(line)
+            if cert_key:
+                break
+    if cert_key:
+        issue, expiry = labelled_cert_dates(text[:12000])
+        if issue:
+            add_field(fields, source, f"cert.{cert_key}.issue", issue, raw=text[:1800], confidence="table-aware")
+        if expiry:
+            add_field(fields, source, f"cert.{cert_key}.expiry", expiry, raw=text[:1800], confidence="table-aware")
+        # Capture certificate number for key-facts/export; it is not used as a
+        # validity decision when the label is unclear.
+        number_match = re.search(r"(?:Certificate\s+(?:No\.?|Number)|Cert\.?\s*No\.?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9/._-]{3,40})", text, re.I)
+        if number_match:
+            add_field(fields, source, f"cert.{cert_key}.number", number_match.group(1), raw=number_match.group(0), confidence="table-aware")
+    return dedupe_fields(fields)
+
+
+def extract_insurance_evidence(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
+    source = "CERTIFICATE"
+    text = join_pages(pages)
+    lines = lines_from_text(text)
+    fields: List[FieldRecord] = []
+    imo_match = re.search(r"\bIMO(?:\s+(?:No\.?|Number))?\s*[:#-]?\s*(\d{7})\b", text, re.I)
+    if imo_match:
+        add_field(fields, source, "vessel.imo", imo_match.group(1), raw=imo_match.group(0), confidence="table-aware")
+    add_field(fields, source, "vessel.name", next_value_after(lines, r"^Name of (?:the )?(?:Ship|Vessel)$|^Ship Name$|^Vessel Name$"), confidence="deterministic")
+    club_match = re.search(r"(?:P\s*(?:&|and)\s*I\s+Club|Club)\s*[:\-]?\s*([^\n]{3,100})", text, re.I)
+    if club_match:
+        add_field(fields, source, "insurance.pni_club", club_match.group(1), raw=club_match.group(0), confidence="deterministic")
+    _, expiry = labelled_cert_dates(text[:14000])
+    if expiry:
+        add_field(fields, source, "cert.pni_cover.expiry", expiry, label="P&I cover expiry", raw=text[:2200], confidence="table-aware")
+    return dedupe_fields(fields)
+
+
+def _source_for_document_type(doc_type: str) -> str:
+    return {"HVPQ": "HVPQ", "PIQ": "PIQ", "Q88": "Q88", "CLASS": "CLASS", "HVPQ_XML": "XML", "CERTIFICATE": "CERTIFICATE", "PNI": "CERTIFICATE"}.get(doc_type, doc_type)
+
+
+def process_document_bytes(filename: str, data: bytes, enable_ocr: bool = True, use_llm: bool = False, ollama_url: str = "", ollama_model: str = "") -> ProcessedDocument:
+    is_xml = filename.lower().endswith(".xml")
+    if is_xml:
+        decoded = data.decode("utf-8", errors="replace")
+        pages: List[Tuple[int, str]] = [(1, decoded)]
+        text = decoded
+    else:
+        pages = extract_pdf_pages(data, enable_ocr=enable_ocr)
+        text = join_pages(pages)
+    profile = profile_document(filename, pages, text, is_xml=is_xml)
+    fields: List[FieldRecord] = []
+    if profile.doc_type == "HVPQ":
+        fields = extract_hvpq(pages)
+    elif profile.doc_type == "PIQ":
+        fields = extract_piq(pages)
+    elif profile.doc_type == "Q88":
+        fields = extract_q88(pages)
+    elif profile.doc_type == "CLASS":
+        fields = extract_class_status(pages)
+    elif profile.doc_type == "CERTIFICATE":
+        fields = extract_generic_certificate(pages)
+    elif profile.doc_type == "PNI":
+        fields = extract_insurance_evidence(pages)
+    elif profile.doc_type == "HVPQ_XML":
+        fields = extract_xml(io.BytesIO(data))
+
+    source = _source_for_document_type(profile.doc_type)
+    for extracted_field in fields:
+        extracted_field.document_name = filename
+    if fields and pages:
+        attach_field_evidence(fields, {source: pages})
+    if use_llm and profile.doc_type in {"HVPQ", "PIQ", "Q88", "CLASS"} and pages:
+        llm_fields = llm_assist_extract(profile.doc_type, pages, ollama_url, ollama_model)
+        for extracted_field in llm_fields:
+            extracted_field.document_name = filename
+        attach_field_evidence(llm_fields, {source: pages})
+        fields += llm_fields
+        fields = dedupe_fields(fields)
+
+    extracted_imo = first_field(fields, source, "vessel.imo") if fields else ""
+    if extracted_imo and valid_imo_number(extracted_imo):
+        profile.imo = re.sub(r"\D", "", extracted_imo)
+    extracted_name = first_field(fields, source, "vessel.name") if fields else ""
+    if extracted_name:
+        profile.vessel_name = extracted_name
+    visible_imos = [value.strip() for value in profile.related_imos.split(",") if value.strip()]
+    if profile.imo and profile.imo not in visible_imos:
+        visible_imos.insert(0, profile.imo)
+        profile.related_imos = ", ".join(visible_imos)
+    if profile.imo:
+        profile.assigned_group = profile.imo
+        profile.grouping_confidence = "High" if len(visible_imos) <= 1 else "Medium"
+        profile.grouping_evidence = "Checksum-valid IMO extracted" if len(visible_imos) <= 1 else f"Multiple checksum-valid IMOs visible: {profile.related_imos}"
+    else:
+        profile.assigned_group = "Unassigned"
+    return ProcessedDocument(profile=profile, pages=pages, text=text, fields=fields, file_hash=hashlib.sha256(data).hexdigest())
+
+
+def process_uploaded_documents(uploaded_files, enable_ocr: bool = True, use_llm: bool = False, ollama_url: str = "", ollama_model: str = "") -> List[ProcessedDocument]:
+    """Process uploaded files once per active Streamlit session."""
+    payload = [(file.name, file.getvalue()) for file in uploaded_files]
+    fingerprint = hashlib.sha256(b"|".join(name.encode("utf-8", errors="ignore") + b":" + hashlib.sha256(data).digest() for name, data in payload) + str(enable_ocr).encode() + str(use_llm).encode()).hexdigest()
+    cache_key = "docusure_processed_documents"
+    if st.session_state.get("docusure_upload_fingerprint") == fingerprint and cache_key in st.session_state:
+        return st.session_state[cache_key]
+    processed = [process_document_bytes(name, data, enable_ocr, use_llm, ollama_url, ollama_model) for name, data in payload]
+    assign_document_groups(processed)
+    st.session_state["docusure_upload_fingerprint"] = fingerprint
+    st.session_state[cache_key] = processed
+    return processed
+
+
+def assign_document_groups(documents: List[ProcessedDocument]) -> None:
+    def labelled_name_in_content(document: ProcessedDocument) -> bool:
+        name = clean_text(document.profile.vessel_name)
+        if not name:
+            return False
+        text = document.text or ""
+        for match in re.finditer(r"(?:Name\s+of\s+(?:the\s+)?(?:Ship|Vessel)|Ship\s+Name|Vessel\s+Name)", text, re.I):
+            nearby = normalize_value(text[match.end():match.end() + 140])
+            if normalize_value(name) and normalize_value(name) in nearby:
+                return True
+        return False
+
+    known = [doc for doc in documents if doc.profile.imo and valid_imo_number(doc.profile.imo)]
+    imos = sorted({doc.profile.imo for doc in known})
+    names_by_imo: Dict[str, List[str]] = defaultdict(list)
+    for doc in known:
+        if doc.profile.vessel_name:
+            names_by_imo[doc.profile.imo].append(doc.profile.vessel_name)
+    for doc in documents:
+        if doc.profile.imo:
+            doc.profile.assigned_group = doc.profile.imo
+            visible_imos = [value.strip() for value in doc.profile.related_imos.split(",") if value.strip()]
+            if doc.profile.doc_type == "STS_ASSESSMENT" and len(visible_imos) > 1:
+                doc.profile.grouping_confidence = "High"
+                doc.profile.grouping_evidence = f"Shared STS evidence; checksum-valid IMOs visible: {', '.join(visible_imos)}"
+            else:
+                doc.profile.grouping_confidence = "High" if len(visible_imos) <= 1 else "Medium"
+                doc.profile.grouping_evidence = "Checksum-valid IMO extracted" if len(visible_imos) <= 1 else f"Multiple checksum-valid IMOs visible: {', '.join(visible_imos)}"
+            continue
+        name = doc.profile.vessel_name
+        scores = []
+        if name:
+            for imo, names in names_by_imo.items():
+                score = max([similarity(name, candidate) for candidate in names] or [0.0])
+                scores.append((score, imo))
+        if scores and max(scores)[0] >= 0.78:
+            score, matched_imo = max(scores)
+            doc.profile.assigned_group = matched_imo
+            doc.profile.grouping_confidence = "High" if score >= 0.92 else "Medium"
+            doc.profile.grouping_evidence = f"Vessel-name match ({score:.0%}); no IMO extracted from this file"
+        elif name and labelled_name_in_content(doc):
+            doc.profile.assigned_group = "Name: " + clean_text(name).upper()
+            doc.profile.grouping_confidence = "Medium"
+            doc.profile.grouping_evidence = "Labelled vessel name extracted; checksum-valid IMO not available"
+        elif len(imos) == 1 and (not name or normalize_key(name) in {"smc", "issc", "iopp", "class", "status", "pni", "insurance", "document", "report", "manual"}):
+            doc.profile.assigned_group = imos[0]
+            doc.profile.grouping_confidence = "Low"
+            doc.profile.grouping_evidence = "Provisional assignment to the only identified vessel; confirm before relying on cross-document results"
+        else:
+            doc.profile.assigned_group = "Unassigned"
+            doc.profile.grouping_confidence = "Unassigned"
+            doc.profile.grouping_evidence = "No checksum-valid IMO or reliable vessel-name match"
+
+
+def documents_for_group(documents: List[ProcessedDocument], group: str) -> List[ProcessedDocument]:
+    selected = []
+    for doc in documents:
+        related = {value.strip() for value in doc.profile.related_imos.split(",") if value.strip()}
+        shared_sts_evidence = doc.profile.doc_type == "STS_ASSESSMENT" and group in related
+        if doc.profile.assigned_group == group or shared_sts_evidence:
+            selected.append(doc)
+    return selected
+
+
+def merge_group_content(documents: List[ProcessedDocument]) -> Tuple[List[FieldRecord], Dict[str, List[Tuple[int, str]]], Dict[str, str]]:
+    fields: List[FieldRecord] = []
+    page_cache: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+    text_by_source: Dict[str, List[str]] = defaultdict(list)
+    for doc in documents:
+        fields.extend(doc.fields)
+        source = _source_for_document_type(doc.profile.doc_type)
+        if source in {"HVPQ", "PIQ", "Q88", "CLASS", "CERTIFICATE", "XML"}:
+            page_cache[source].extend(doc.pages)
+            text_by_source[source].append(doc.text)
+    fields = dedupe_fields(fields)
+    attach_field_evidence(fields, dict(page_cache))
+    return fields, dict(page_cache), {source: "\n".join(parts) for source, parts in text_by_source.items()}
 
 # ----------------------------- Optional local LLM extraction assist -----------------------------
 
@@ -1195,8 +1561,9 @@ def run_rules(fields: List[FieldRecord], ref_date: date, settings: Dict[str, Any
                             hvpq_value=vals.get("HVPQ", ""), class_value=vals.get("CLASS", ""), q88_value=vals.get("Q88", ""),
                             reason=f"{label} appears differently declared across documents.", action="Verify latest Class Status and update HVPQ/Q88.")
 
-    # 5. Superintendent gaps
-    run_superintendent_rules(findings, fields, ref_date)
+    # 5. Superintendent gaps — only when a PIQ is actually present.
+    if any(f.source == "PIQ" for f in fields):
+        run_superintendent_rules(findings, fields, ref_date)
 
     # 6. Certificates: compare HVPQ/Q88/CLASS mapped fields.
     certs = sorted(set([f.field_id.split(".")[1] for f in fields if f.field_id.startswith("cert.") and len(f.field_id.split(".")) >= 3]))
@@ -1342,10 +1709,12 @@ def run_rules(fields: List[FieldRecord], ref_date: date, settings: Dict[str, Any
         "psc.last_date", "psc.detained_36m", "environment.cii_rating", "environment.cii_verified_by",
         "insurance.pni_club", "classification.conditions_of_class", "classification.memo_of_class",
     ]
-    for fid in required_hvpq:
-        if not first_field(fields, "HVPQ", fid):
-            add_finding(findings, area="Blank / Missing", check=f"HVPQ missing {FIELD_LABELS.get(fid, fid)}", status="MANUAL CHECK", risk="MEDIUM",
-                        hvpq_value="blank", reason="Required/commonly observed HVPQ field is blank or not extracted.", action="Verify and complete HVPQ if applicable. HVPQ is the main document to correct.")
+    has_hvpq = any(f.source in {"HVPQ", "XML"} for f in fields)
+    if has_hvpq:
+        for fid in required_hvpq:
+            if not first_field(fields, "HVPQ", fid) and not first_field(fields, "XML", fid):
+                add_finding(findings, area="Blank / Missing", check=f"HVPQ missing {FIELD_LABELS.get(fid, fid)}", status="MANUAL CHECK", risk="MEDIUM",
+                            hvpq_value="blank", reason="Required/commonly observed HVPQ field is blank or not extracted.", action="Verify and complete HVPQ if applicable. HVPQ is the main document to correct.")
 
     # 13b. Mapped blanks in PIQ and Q88. These are not automatic defects; they are included so no blank/uncertain field is silently missed.
     has_piq = any(f.source == "PIQ" for f in fields)
@@ -1442,6 +1811,96 @@ def dedupe_findings(findings: List[Finding]) -> List[Finding]:
     out.sort(key=lambda x: (priority.get(x.risk.upper(), 9), x.area, x.check))
     return out
 
+
+def _finding_value_records(finding: Finding, fields: List[FieldRecord]) -> List[FieldRecord]:
+    pairs = [
+        ("HVPQ", finding.hvpq_value), ("PIQ", finding.piq_value),
+        ("CLASS", finding.class_value), ("Q88", finding.q88_value),
+        ("XML", finding.xml_value),
+    ]
+    records: List[FieldRecord] = []
+    for source, value in pairs:
+        norm = normalize_value(value)
+        if not norm or norm in {"blank", "not extracted", "not reliably extracted", "blank not extracted"}:
+            continue
+        matches = [fld for fld in fields if fld.source == source and clean_text(fld.value) and (normalize_value(fld.value) == norm or normalize_value(fld.value) in norm or norm in normalize_value(fld.value))]
+        if matches:
+            records.append(max(matches, key=field_quality_score))
+    return records
+
+
+def calibrate_findings(findings: List[Finding], fields: List[FieldRecord]) -> List[Finding]:
+    """Add a calibrated conclusion and evidence level to every finding."""
+    for finding in findings:
+        records = _finding_value_records(finding, fields)
+        values = [finding.hvpq_value, finding.piq_value, finding.class_value, finding.q88_value, finding.xml_value]
+        present_values = [v for v in values if clean_text(v) and normalize_value(v) not in {"blank", "not extracted", "not reliably extracted", "blank not extracted"}]
+        text = normalize_value(" ".join([finding.status, finding.reason, finding.check] + present_values))
+        extraction_gap = any(token in text for token in ["not reliably extracted", "could not be reliably", "not extracted", "section not reliably", "blank or", "may be blank"])
+        exact_contradiction = (
+            finding.status.upper() == "MISMATCH"
+            and any(token in text for token in ["expired", "before reference date", "differs across", "yes and no", "overdue", "exceeds locked interval", "imo consistency"])
+        )
+        visible_inference = any(token in text for token in ["appears", "latest visible", "may ", "potential", "best effort", "broad confidence"])
+
+        if finding.status.upper() == "BLOCKED":
+            score, conclusion = 95, "Not assessed — vessel identity conflict"
+        elif finding.status.upper() == "MANUAL CHECK" or extraction_gap:
+            score = 32 if extraction_gap else 55
+            conclusion = "Not verified"
+        elif exact_contradiction and not visible_inference:
+            score = min([field_quality_score(r) for r in records] or [88])
+            score = max(82, score)
+            conclusion = "Document-supported discrepancy"
+        elif finding.status.upper() == "MISMATCH":
+            score = min([field_quality_score(r) for r in records] or [66])
+            score = min(score, 78 if visible_inference else 84)
+            conclusion = "Potential concern" if score < 82 or visible_inference else "Document-supported discrepancy"
+        else:
+            score = min([field_quality_score(r) for r in records] or [58])
+            conclusion = "Needs review"
+
+        finding.confidence_score = max(0, min(99, int(score)))
+        finding.confidence = "High" if score >= 82 else ("Medium" if score >= 60 else "Low")
+        finding.conclusion = conclusion
+        evidence_parts = []
+        for record in records[:4]:
+            page = f" p.{record.page}" if record.page else ""
+            location = record.document_name or record.source
+            evidence_parts.append(f"{location}{page}: {clean_text(record.value)[:160]}")
+        finding.evidence = " | ".join(evidence_parts) or "No reliable extracted value; source confirmation required"
+        if finding.area in {"Certificates", "Class / Survey", "Class"}:
+            finding.rule_basis = "Certificate/Class date and declaration check"
+        elif finding.area == "Identity":
+            finding.rule_basis = "Checksum-valid vessel identity comparison"
+        elif "Mooring" in finding.area or "mooring" in finding.check.lower():
+            finding.rule_basis = "Mooring readiness / HVPQ data check"
+        elif finding.piq_value:
+            finding.rule_basis = "PIQ operational declaration check"
+        else:
+            finding.rule_basis = "Cross-document consistency / validation rule"
+    return findings
+
+
+def apply_vessel_identity_gate(findings: List[Finding], fields: List[FieldRecord]) -> Tuple[List[Finding], bool, Dict[str, str]]:
+    """Block cross-document conclusions when checksum-valid IMOs identify different vessels."""
+    by_source: Dict[str, str] = {}
+    for source in {field.source for field in fields}:
+        imo = first_field(fields, source, "vessel.imo")
+        if imo and valid_imo_number(imo):
+            by_source[source] = re.sub(r"\D", "", imo)
+    same_vessel = len(set(by_source.values())) <= 1
+    if same_vessel:
+        return findings, True, by_source
+    for finding in findings:
+        source_values = [finding.hvpq_value, finding.piq_value, finding.class_value, finding.q88_value, finding.xml_value]
+        if finding.area != "Identity" and sum(bool(clean_text(v)) for v in source_values) >= 2:
+            finding.status = "BLOCKED"
+            finding.risk = "REVIEW"
+            finding.reason = "Cross-document conclusion blocked because uploaded documents contain different checksum-valid IMO numbers. " + finding.reason
+            finding.action = "Separate or reassign the documents to the correct vessel before relying on this comparison."
+    return findings, False, by_source
+
 # ----------------------------- Observation library -----------------------------
 
 def parse_obs_excel(file_obj) -> pd.DataFrame:
@@ -1489,7 +1948,7 @@ def observation_checklist_from_excel(obs_df: pd.DataFrame) -> List[Tuple[str, st
 # ----------------------------- Export helpers -----------------------------
 
 def df_from_fields(fields: List[FieldRecord]) -> pd.DataFrame:
-    return pd.DataFrame([asdict(f) for f in fields]) if fields else pd.DataFrame(columns=["source", "field_id", "label", "value", "date_value", "confidence", "raw"])
+    return pd.DataFrame([asdict(f) for f in fields]) if fields else pd.DataFrame(columns=["document_name", "page", "source", "field_id", "label", "value", "date_value", "confidence", "confidence_score", "raw"])
 
 
 def df_from_findings(findings: List[Finding]) -> pd.DataFrame:
@@ -1788,20 +2247,8 @@ def raw_text_for_source(page_cache: Dict[str, List[Tuple[int, str]]], source: st
 
 
 def section_text_by_qid(text: str, qid: str, max_chars: int = 2600) -> str:
-    """Return text around an HVPQ-style question number. Conservative helper for vessel-facing checks."""
-    if not text or not qid:
-        return ""
-    m = re.search(r"(?<!\d)" + re.escape(qid) + r"(?!\d)", text)
-    if not m:
-        return ""
-    start = max(0, m.start())
-    end = min(len(text), start + max_chars)
-    snippet = text[start:end]
-    # stop at a later question number when it is not simply a subline very close to start
-    nxt = re.search(r"\n\s*\d{1,2}\.\d{1,2}(?:\.\d{1,4})?\b", snippet[len(qid)+120:])
-    if nxt:
-        snippet = snippet[:len(qid)+120+nxt.start()]
-    return clean_text(snippet)
+    """Return a numbered section while retaining child questions and table rows."""
+    return extract_numbered_section(text, qid, max_chars=max_chars)
 
 
 def latest_date_in_text(text: str) -> str:
@@ -1831,41 +2278,49 @@ def add_section_and_operational_fields(fields: List[FieldRecord], source: str, t
     """
     if not text:
         return
-    qids = ["10.1.4", "10.1.7", "7.1.1", "7.1.3", "2.1.5", "1.9.8", "5.3.1", "5.3.2", "6.1.13", "6.1.14"]
+    qids = ["10.1.3", "10.1.4", "10.1.7", "7.1.1", "7.1.3", "2.1.5", "1.9.8", "5.3.1", "5.3.2", "6.1.13", "6.1.14"]
     for q in qids:
-        sec = section_text_by_qid(text, q)
+        sec = section_text_by_qid(text, q, max_chars=22000 if q == "10.1.7" else 9000)
         if sec:
             add_field(fields, source, f"section.{q}", sec, label=f"Section {q}", raw=sec, confidence="section-snippet")
     # Brake test: look around brake test keywords, fall back to HVPQ 10.1.4 section
     brake_windows = []
-    for m in re.finditer(r"brake\s+test|brake\s+holding|BHC|rendering", text, re.I):
-        brake_windows.append(text[max(0, m.start()-800):min(len(text), m.end()+1800)])
-    if not brake_windows:
-        sec = section_text_by_qid(text, "10.1.4")
-        if sec:
-            brake_windows.append(sec)
+    brake_section = section_text_by_qid(text, "10.1.4", max_chars=9000)
+    if brake_section:
+        brake_windows.append(brake_section)
+    else:
+        for m in re.finditer(r"brake\s+test|brake\s+holding|BHC|rendering", text, re.I):
+            brake_windows.append(text[max(0, m.start()-500):min(len(text), m.end()+900)])
     if brake_windows:
         joined = " ".join(brake_windows[:3])
         dt = latest_date_in_text(joined)
         if dt:
             add_field(fields, source, "mooring.brake_test_date", dt, label="Latest brake test date found", raw=clean_text(joined[:1600]), confidence="best-effort")
         add_field(fields, source, "mooring.brake_section", clean_text(joined[:2000]), label="Brake/mooring section", raw=clean_text(joined[:2000]), confidence="section-snippet")
-    # Rope / tail windows
-    rope_windows = []
-    for m in re.finditer(r"mooring\s+rope|rope\s+certificate|date\s+of\s+installation|end[- ]?for[- ]?end|tail|pennant", text, re.I):
-        rope_windows.append(text[max(0, m.start()-700):min(len(text), m.end()+1700)])
-    if not rope_windows:
-        sec = section_text_by_qid(text, "10.1.7")
-        if sec:
-            rope_windows.append(sec)
-    if rope_windows:
-        joined = " ".join(rope_windows[:4])
+    # Rope / tail information is scoped to 10.1.7 so dates from unrelated
+    # sections cannot create a false age conclusion.
+    rope_section = section_text_by_qid(text, "10.1.7", max_chars=22000)
+    if rope_section:
+        joined = rope_section
         dates = all_dates_in_text(joined)
         if dates:
-            # Store newest visible installation/service date; summary will use this only as a broad confidence check.
-            newest = max(dates)
+            oldest, newest = min(dates), max(dates)
+            add_field(fields, source, "mooring.ropes.oldest_visible_date", oldest.isoformat(), label="Oldest rope/tail visible date", raw=clean_text(joined[:2400]), confidence="best-effort")
             add_field(fields, source, "mooring.ropes.latest_visible_date", newest.isoformat(), label="Latest rope/tail visible date", raw=clean_text(joined[:1800]), confidence="best-effort")
-        add_field(fields, source, "mooring.ropes_section", clean_text(joined[:2200]), label="Rope/tail section", raw=clean_text(joined[:2200]), confidence="section-snippet")
+        materials = list(dict.fromkeys(m.group(0) for m in re.finditer(r"\b(?:HMPE|UHMWPE|Dyneema|polyester|polyamide|nylon|polypropylene|mixed polyolefin|steel wire|wire rope|aramid)\b", joined, re.I)))
+        if materials:
+            add_field(fields, source, "mooring.materials_visible", ", ".join(materials[:20]), label="Visible mooring line/tail materials", raw=joined[:2400], confidence="best-effort")
+        add_field(fields, source, "mooring.ropes_section", clean_text(joined[:5000]), label="Rope/tail section", raw=clean_text(joined[:5000]), confidence="section-snippet")
+
+    design_section = " ".join(filter(None, [section_text_by_qid(text, "10.1.3", 9000), section_text_by_qid(text, "10.1.4", 9000), rope_section]))
+    for fid, label, patt in [
+        ("mooring.sdmbl", "Ship design MBL (SDMBL)", r"\bSDMBL\b[^0-9]{0,45}([0-9]+(?:\.[0-9]+)?)\s*(?:t|tonnes?|mt)"),
+        ("mooring.ldbf", "Line design break force (LDBF)", r"\bLDBF\b[^0-9]{0,45}([0-9]+(?:\.[0-9]+)?)\s*(?:t|tonnes?|mt)"),
+        ("mooring.tdbf", "Tail design break force (TDBF)", r"\bTDBF\b[^0-9]{0,45}([0-9]+(?:\.[0-9]+)?)\s*(?:t|tonnes?|mt)"),
+    ]:
+        values = list(dict.fromkeys(m.group(1) for m in re.finditer(patt, design_section, re.I)))
+        if values:
+            add_field(fields, source, fid, ", ".join(values[:16]) + " tonnes", label=label, raw=design_section[:3000], confidence="best-effort")
 
 
 def hvpq_qid_status_df(obs_df: pd.DataFrame, hvpq_text: str) -> pd.DataFrame:
@@ -2300,13 +2755,11 @@ def build_hvpq_checks(fields: List[FieldRecord], findings: List[Finding], ref_da
         rows.append({"Priority":r["Priority"],"Question / Section":r["Question / Section"],"Area":r["Area"],"Check":r["Check"],"Status":r["Status"],"HVPQ value":r["Document value"],"Reference source":"Class Status/latest certificate","Reference value":r["Reference value"],"Finding / interpretation":r["Finding / interpretation"],"Action requested":r["Action requested"]})
     # HVPQ operational recurring checks
     rows.append(_hvpq_ops_row(fields, ref_date, "Brake testing", "mooring.brake_test_date", 12, "10.1.4", "Mooring", "Latest brake test date found in HVPQ/Q88 text"))
-    rows.append(_hvpq_ops_row(fields, ref_date, "Mooring ropes age / visible date", "mooring.ropes.latest_visible_date", 60, "10.1.7", "Mooring", "Latest rope/tail visible date found; verify every rope individually"))
-    # Tails are harder; do not overclaim unless tail text is present.
+    # Installation dates are surfaced for review, but no universal retirement
+    # life is imposed: actual limits come from the LMP/MSMP, manufacturer,
+    # certificates and company criteria for each line/tail.
     tail_sec = first_field(fields,"HVPQ","mooring.ropes_section") or first_field(fields,"Q88","mooring.ropes_section")
-    if re.search(r"tail|pennant", tail_sec, re.I):
-        rows.append(_hvpq_ops_row(fields, ref_date, "Tails within 18 months of installation", "mooring.ropes.latest_visible_date", 18, "10.1.7", "Mooring", "Tail/pennant keyword found; verify each tail date individually"))
-    else:
-        rows.append({"Priority":"Manual","Question / Section":"10.1.7","Area":"Mooring","Check":"Tails within 18 months of installation","Status":"Could not reliably check","HVPQ value":"Tail/pennant details not reliably extracted","Reference source":"Vessel records","Reference value":"","Finding / interpretation":"The app could not confirm tail installation/service dates from extracted text.","Action requested":"Vessel to confirm tail certificates/installation dates and whether all tails are within the applicable service interval."})
+    rows.append({"Priority":"Manual","Question / Section":"10.1.7","Area":"Mooring","Check":"Line and tail retirement criteria","Status":"Criteria verification required","HVPQ value":first_field(fields,"HVPQ","mooring.ropes.oldest_visible_date") or (tail_sec[:350] if tail_sec else "Not reliably extracted"),"Reference source":"LMP/MSMP, certificates and manufacturer criteria","Reference value":"No universal age limit applied","Finding / interpretation":"Visible installation/service dates are not enough to prove a line or tail is overdue.","Action requested":"Verify each line/tail type, certificate, inspection history and retirement criterion in the LMP/MSMP."})
     df=pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["Priority","Question / Section","Area","Check","Status","HVPQ value","Reference source","Reference value","Finding / interpretation","Action requested"])
@@ -2323,7 +2776,7 @@ def _hvpq_ops_row(fields, ref_date, label, fid, months, qno, area, interp):
         return {"Priority":"Manual","Question / Section":qno,"Area":area,"Check":label,"Status":"Could not reliably check","HVPQ value":val or "Not extracted/blank","Reference source":"Vessel records","Reference value":"","Finding / interpretation":f"{label} could not be reliably verified from extracted HVPQ/Q88 text.","Action requested":"Vessel/office to verify supporting records and update HVPQ if blank/stale/wrong."}
     due=d+relativedelta(months=months)
     ok=due>=ref_date
-    return {"Priority":"OK" if ok else "High","Question / Section":qno,"Area":area,"Check":label,"Status":"In order" if ok else "Not satisfactory","HVPQ value":val,"Reference source":source,"Reference value":f"Due not before {due.isoformat()} for {months}-month check","Finding / interpretation":interp + ("; appears in order from extracted date." if ok else "; appears outside expected interval."),"Action requested":"Keep evidence ready onboard." if ok else "Verify latest record and update HVPQ if stale/wrong."}
+    return {"Priority":"OK" if ok else "High","Question / Section":qno,"Area":area,"Check":label,"Status":"Within screening horizon" if ok else "Potentially outside screening horizon","HVPQ value":val,"Reference source":source,"Reference value":f"{months}-month screening date {due.isoformat()}","Finding / interpretation":interp + ("; within the screening horizon, subject to the vessel's stated interval." if ok else "; older than the screening horizon, but the applicable vessel/company interval must be verified before calling it overdue."),"Action requested":"Keep the stated interval and supporting record ready onboard." if ok else "Verify the applicable interval and latest record; update HVPQ if stale/wrong."}
 
 
 def build_q88_checks(fields: List[FieldRecord], findings: List[Finding]) -> pd.DataFrame:
@@ -2423,6 +2876,39 @@ DEFAULT_COMPARISON_RULES_TEXT = 'I will give you 2 documents to analyze HVPQ (PD
 EMBEDDED_KNOWLEDGE_BASE = {'schema_version': '2026-05-17.v18', 'description': 'Machine-readable embedded observation and validation knowledge base for HVPQ/PIQ/Q88 verifier. Observations are priority signals only; validation rules create findings only when evidence supports them.', 'observation_library': [{'question_no': '10.1.4', 'repeat_count': 35, 'priority': 'HIGH_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring brake test date / brake holding capacity', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following HVPQ Entries were not updated – The date of last winch test (10.1.4): 05-Aug-2025. There were no restrictions noted for the hose handling crane’s capability to maintain it’s design SWL when plumbing a point one metre outboard from the ship’s side over the full length of the manifold (10.9.1). the vessel was capable of carrying out operations at SBM /CBM but the arrangement at the vapor manifold area did not have arrangements for securing floating hoses. (10.9.4)', "HVPQ entries in the following sections were incorrect. 1. HVPQ 1.1.8 - Type of vessel in IOPP form B 1.11.4 stated as an oil tanker, however form B states as crude oil product tanker. 2. HVPQ 2.1.4 - Stated as an oil tanker, it should be crude oil product tanker. 3. HVPQ 10.1.4 - Vessel's mooring winch drums were split drum type. The entry in the HVPQ was incorrect and stated as 'No' to the split drums.", 'The following typo errors were seen in the latest HVPQ uploaded in the OCIMF repository, dated 12 May 2025: 1) HVPQ 7.1.1: cargo tanks inspection interval quarterly instead annually. 2) HVPQ 7.1.3: last 5 side starboard ballast tank inspection dated 12 July 2024 instead 12 March 2025. 3) HVPQ 9.16.18: missing the entry bleed and block valves. 4) HVPQ 10.1.3: missing entry SDMBL 36.5 tonnes. 5) HVPQ 10.1.4: the details of only one mooring winch was recorded. The vessel was fitted with 8 mooring w']}, {'question_no': '7.1.3', 'repeat_count': 34, 'priority': 'HIGH_REPEAT', 'category': 'Structural assessment / tank coating', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following information was either not completed or was not accurately updated in the HVPQ dated 14-Sep-2025: (i) Date of last in water survey (1. 5. 5. 1 ): 16-Jan-2025; (ii) Assigned dead weight 4 1.e. 34,999 MT that was available was not included (1.8.6); (iii) The following ballast tank inspection dates were not updated (7.1.3): 1P on 08-Jul-2025, 2P on 08-Jul-2025, 3P on 08-Jul-2025, 5S on 7 7-Aug-2025; (iv) Accommodation ladder wire renewal date (10.10.2). 05-Jun-2025; (v) The renewal da', 'As per the HVPQ dated 02 Sep 2024, the following information was inaccurate:\n1. Section 1.5.11 Date of last annual survey was 12 Aug 2024, whereas this was the date of the last intermediate survey.\n2. Section 2.1.5 Certificate dates. a. The date of last annual for the statutory certificates was 12 Aug 2024, whereas this was the\ndate of last intermediate survey.\nb. The dates of last endorsement of the statutory and applicable certificates were blank.\n3. Section 7.1.1 Cargo tank coating. The last ', 'The following typo errors were seen in the latest HVPQ uploaded in the OCIMF repository, dated 12 May 2025: 1) HVPQ 7.1.1: cargo tanks inspection interval quarterly instead annually. 2) HVPQ 7.1.3: last 5 side starboard ballast tank inspection dated 12 July 2024 instead 12 March 2025. 3) HVPQ 9.16.18: missing the entry bleed and block valves. 4) HVPQ 10.1.3: missing entry SDMBL 36.5 tonnes. 5) HVPQ 10.1.4: the details of only one mooring winch was recorded. The vessel was fitted with 8 mooring w']}, {'question_no': '10.9.1', 'repeat_count': 29, 'priority': 'HIGH_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Two items were incorrectly declared in the latest HVPQ6 dated 3 October 2024 asf: 1-Item 1.4.3- Date of building contract 20-January-2019; Actually on 18-May-2018: 2-item 10.9.1 – last 5yr test for one of two cranes : 20-January-2011: Actually on 20-January-2022. Reportedly online updated immediately.', 'The following HVPQ Entries were not updated – The date of last winch test (10.1.4): 05-Aug-2025. There were no restrictions noted for the hose handling crane’s capability to maintain it’s design SWL when plumbing a point one metre outboard from the ship’s side over the full length of the manifold (10.9.1). the vessel was capable of carrying out operations at SBM /CBM but the arrangement at the vapor manifold area did not have arrangements for securing floating hoses. (10.9.4)', 'On the uploaded HVPQ the following items were recorded with inaccurate information: 1.9.(5,6) (LTI on 04-Jun-2025), 1.9.8 (Last PSC inspection was at Nha Be, Vietnam on 24-Jun-2025), 10.9.1 (Last 5 yearly test was on 04-Jun-2025).']}, {'question_no': '7.1.1', 'repeat_count': 22, 'priority': 'HIGH_REPEAT', 'category': 'Structural assessment / tank coating', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['As per the HVPQ dated 02 Sep 2024, the following information was inaccurate:\n1. Section 1.5.11 Date of last annual survey was 12 Aug 2024, whereas this was the date of the last intermediate survey.\n2. Section 2.1.5 Certificate dates. a. The date of last annual for the statutory certificates was 12 Aug 2024, whereas this was the\ndate of last intermediate survey.\nb. The dates of last endorsement of the statutory and applicable certificates were blank.\n3. Section 7.1.1 Cargo tank coating. The last ', 'The following typo errors were seen in the latest HVPQ uploaded in the OCIMF repository, dated 12 May 2025: 1) HVPQ 7.1.1: cargo tanks inspection interval quarterly instead annually. 2) HVPQ 7.1.3: last 5 side starboard ballast tank inspection dated 12 July 2024 instead 12 March 2025. 3) HVPQ 9.16.18: missing the entry bleed and block valves. 4) HVPQ 10.1.3: missing entry SDMBL 36.5 tonnes. 5) HVPQ 10.1.4: the details of only one mooring winch was recorded. The vessel was fitted with 8 mooring w', 'There were minor errors having no impact on the inspection. 7.1.1 Tank Type 2G is a gas tanker The tank construction is SS cladding, which is not an option in the HVPQ drop-down menu. 9.1.1 Tank plan cross-section schematic is wrong. 9.5.3 Says that the pump cannot be by pass pump during loading; this is incorrect. 12.1.13 The vessel has closed chocks and bollards at the manifold, the distances are missing.']}, {'question_no': '10.1.3', 'repeat_count': 20, 'priority': 'HIGH_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating']}, {'question_no': '10.7.1', 'repeat_count': 20, 'priority': 'HIGH_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The following HVPQ items were not corrected from the previous observations provided in the PIQ:- 1.5.11 / 1.5.12 / 9.1.1 /10.1.3.2.1 / 10.2.1 & 10.7.1. They were diagrams, and OP reported that operator was not able to upload']}, {'question_no': '10.8.1', 'repeat_count': 15, 'priority': 'MEDIUM_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The following items in the HVPQ were not correctly completed: 10.7.1; 10.8.1; 12.1.3 and 12.1.4.', 'Some erroneous or missing information was noted within the HVPQ under the following sections: 10.1.3.2, 10.7.1, 10.8.1.']}, {'question_no': '1.5.5', 'repeat_count': 15, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', "The following incorrect information was listed in the ship's HVPQ (dated 28 April 2025).\nItem 1.5.5.1\nLast IWS date 16 Nov 2022 was not correct since last SSH was also undertaken on this date, as per Item 1.5.6.1.", '(i) The HVPQ entries inside section Ref: 1.5.5.2/ 9.16.18/ 9.32.2(Dehumidifier not fitted)/ 11.3.1(KW incorrect) /11.7.1/ 11.7.4/ 12.1.4 did not accurately reflect the information relating to the ship at the time of inspection. The incorrect info & particulars were brought to the attention of Master.\n(ii) The vessel designation as recorded as per IOPP certificate was not declared inside the PIQ.']}, {'question_no': '2.2.1', 'repeat_count': 13, 'priority': 'MEDIUM_REPEAT', 'category': 'Environmental / certificates', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'Not all the publications required under HVPQ 2.2.1 were observed listed on the last Operator’s HVPQ dated 29th July 2025.', 'The following items in HVPQ completed on 9 Dec.2024 were inaccurate. 2.1.5 DOC last annual, CLC wreck removal and bunker 2.2.1 Publication Edition Number - ICS Bridge Procedure Guide 3.1.1 The minimum number of certificate officers to be carried as record in the MSMD 3.1.9 The minimum number of ratings to be carried as specified in the MSMD 9.16.5 Fixed O2 alarm fitted in inert gas generating or storage spaces 10.1.7 Details for Mooring Ropes - Renewal date 10.9.1 Crane last annual test']}, {'question_no': '10.2.1', 'repeat_count': 13, 'priority': 'MEDIUM_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The following HVPQ items were not corrected from the previous observations provided in the PIQ:- 1.5.11 / 1.5.12 / 9.1.1 /10.1.3.2.1 / 10.2.1 & 10.7.1. They were diagrams, and OP reported that operator was not able to upload']}, {'question_no': '1.5.6', 'repeat_count': 12, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following information related to the uploaded HVPQ were missing or inaccurate; 1.5.6.5 The date of the next special survey was stated as 07.09.2026 instead of 07.09.2030. 1.9.8 Port state control dates were missing. 4.2.10 Can the radio transmit the helicopter homing signal on 410 KHz states as Yes instead of No.', "The following incorrect information was listed in the ship's HVPQ (dated 28 April 2025).\nItem 1.5.5.1\nLast IWS date 16 Nov 2022 was not correct since last SSH was also undertaken on this date, as per Item 1.5.6.1.", 'A few errors were noted in the HVPQ. The correct data was:\n1.5.4 Date of last drydock was 12 June 2024.\n1.5.6 Date of last special survey was 12 June 2024.\n9.16.19 The nitrogen system had one segregation.']}, {'question_no': '1.3.1', 'repeat_count': 11, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'In the last HVPQ dated on 03 January 2025 was observed missing information: Ownership and Operation 1.3.1.5 IMO Number register owner. In the item 3 firefighting and lifesaving equipment it was stated last date test foam analysis on 24 November 2023. However, on board was noted valid certificate dated on 09 September 2024.', 'The following discrepancies were noted in the HVPQ document: - Item 1.3.1.6: Lack of the necessary information. - Item 1.5.10: Error in the recording of the date, listed incorrectly as 28 September 2022 instead of 19 September 2022.. - Item 1.5.12: Lack of the necessary information. - Item 3.1.1: Error in the recording of the quantity, listed incorrectly as 07 instead of 06. - Item 3.1.9: Error in the recording of the quantity, listed incorrectly as 08 instead of 07. - Item 9.10.4: Error in the ']}, {'question_no': '1.5.12', 'repeat_count': 11, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The following HVPQ items were not corrected from the previous observations provided in the PIQ:- 1.5.11 / 1.5.12 / 9.1.1 /10.1.3.2.1 / 10.2.1 & 10.7.1. They were diagrams, and OP reported that operator was not able to upload', 'The following discrepancies were noted in the HVPQ document: - Item 1.3.1.6: Lack of the necessary information. - Item 1.5.10: Error in the recording of the date, listed incorrectly as 28 September 2022 instead of 19 September 2022.. - Item 1.5.12: Lack of the necessary information. - Item 3.1.1: Error in the recording of the quantity, listed incorrectly as 07 instead of 06. - Item 3.1.9: Error in the recording of the quantity, listed incorrectly as 08 instead of 07. - Item 9.10.4: Error in the ']}, {'question_no': '5.3.1', 'repeat_count': 11, 'priority': 'MEDIUM_REPEAT', 'category': 'Safety / firefighting / lifeboats', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ had some minor errors as follows: (1.1.7/3) Ship\'s email entered was ineffective as senders\' emails may be rejected & not received by vessel. (Only by adding "master." was ship receiving all emails. For information, using email given in HVPQ, Inspector was not able to contact ship for pre-boarding formalities); (3.2.1) Incorrectly entered YES when senior officers in actuality, did not return to same ship on rotational basis; (5.3.1.4) Foam supplied or tested date was entered as 11 November ', '1.3.1.10 Date when registered with the current owner was incorrectly recorded. 1.3.2.10 Date current operator assumed technical control of the vessel was not documented. 1.5.5 IWS details were incorrectly recorded. 1.5.11 Date of last annual survey was not documented. 5.3.1.4 Date of last foam test analysis certificate was incorrectly recorded.', 'The following discrepancies were found in the HVPQ document:\nItem 1.5.3.1: An error was discovered in the recording of the answer, which was incorrectly marked as NO instead of YES.\nItem 1.5.3.2: Lack of the necessary information.\nItem 1.5.3.3: Lack of the necessary information.\nItem 1.5.5.1: Lack of the necessary information.\nItem 1.5.5.2: Lack of the necessary information.\nItem 1.5.10: Error in recording the date, listed incorrectly 26 March 2024 instead 12 March 2024.\nItem 1.5.12: Lack of the']}, {'question_no': '1.9.8', 'repeat_count': 10, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'PSC inspection / detention / deficiency declaration', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'The following information related to the uploaded HVPQ were missing or inaccurate; 1.5.6.5 The date of the next special survey was stated as 07.09.2026 instead of 07.09.2030. 1.9.8 Port state control dates were missing. 4.2.10 Can the radio transmit the helicopter homing signal on 410 KHz states as Yes instead of No.', 'On the uploaded HVPQ the following items were recorded with inaccurate information: 1.9.(5,6) (LTI on 04-Jun-2025), 1.9.8 (Last PSC inspection was at Nha Be, Vietnam on 24-Jun-2025), 10.9.1 (Last 5 yearly test was on 04-Jun-2025).']}, {'question_no': '3.1.1', 'repeat_count': 10, 'priority': 'MEDIUM_REPEAT', 'category': 'Crew / training / operator assessments', 'topic': 'Manning / crew declarations', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Question 3.1.1 in the HVPQ wrongly stated the minimum number of certified officers to be carried as 6 instead of 7 as per the Minimum Safe Manning Document as well as the information filled in the PIQ. Question 9.16.2 in the HVPQ was answered as a No for the vessel not being fitted with a P/V Breaker. The vessel was however with a P/V breaker in the form of two higher capacity P/V valves installed on the main N2 line.', 'The HVPQ last updated on 05 Jun 2025 and uploaded to the document repository on 06 Jun 2025 was reviewed and the following discrepancies were noted, viz., 1.5.2 date next In Water Survey due, 3.1.1 minimum number of certified officers to be carried as recorded in Minimum Safe Manning document was incorrect, 3.1.9 minimum number of ratings to be carried as specified in the Minimum Safe Manning document was incorrect.', 'The following discrepancies were noted in the HVPQ document: - Item 1.3.1.6: Lack of the necessary information. - Item 1.5.10: Error in the recording of the date, listed incorrectly as 28 September 2022 instead of 19 September 2022.. - Item 1.5.12: Lack of the necessary information. - Item 3.1.1: Error in the recording of the quantity, listed incorrectly as 07 instead of 06. - Item 3.1.9: Error in the recording of the quantity, listed incorrectly as 08 instead of 07. - Item 9.10.4: Error in the ']}, {'question_no': '10.1.7', 'repeat_count': 10, 'priority': 'MEDIUM_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following information was either not completed or was not accurately updated in the HVPQ dated 14-Sep-2025: (i) Date of last in water survey (1. 5. 5. 1 ): 16-Jan-2025; (ii) Assigned dead weight 4 1.e. 34,999 MT that was available was not included (1.8.6); (iii) The following ballast tank inspection dates were not updated (7.1.3): 1P on 08-Jul-2025, 2P on 08-Jul-2025, 3P on 08-Jul-2025, 5S on 7 7-Aug-2025; (iv) Accommodation ladder wire renewal date (10.10.2). 05-Jun-2025; (v) The renewal da', 'The following typo errors were seen in the latest HVPQ uploaded in the OCIMF repository, dated 12 May 2025: 1) HVPQ 7.1.1: cargo tanks inspection interval quarterly instead annually. 2) HVPQ 7.1.3: last 5 side starboard ballast tank inspection dated 12 July 2024 instead 12 March 2025. 3) HVPQ 9.16.18: missing the entry bleed and block valves. 4) HVPQ 10.1.3: missing entry SDMBL 36.5 tonnes. 5) HVPQ 10.1.4: the details of only one mooring winch was recorded. The vessel was fitted with 8 mooring w', 'The following entries were either incorrect or incomplete :- 1.2.4.3, 1.3.1.7 & 8, 1.4.2, 1.5.4.1, 1.5.6, 3.1.6.2, 3.2.1, 3.2.2, 6.1.8, 7.1.1, 9.15.1, 9.15.3.5, 9.16.10, 9.16.29.2, 10.1.7 and 12.1.9.']}, {'question_no': '2.1.5', 'repeat_count': 10, 'priority': 'MEDIUM_REPEAT', 'category': 'Environmental / certificates', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['As per the HVPQ dated 02 Sep 2024, the following information was inaccurate:\n1. Section 1.5.11 Date of last annual survey was 12 Aug 2024, whereas this was the date of the last intermediate survey.\n2. Section 2.1.5 Certificate dates. a. The date of last annual for the statutory certificates was 12 Aug 2024, whereas this was the\ndate of last intermediate survey.\nb. The dates of last endorsement of the statutory and applicable certificates were blank.\n3. Section 7.1.1 Cargo tank coating. The last ', 'HVPQ provided with CVIQ had incorrect information under 2.1.5 (Expiry date of safety radio certificate was wrongly entered as 14\nNovember 2028 instead of 15 December 2024.)', 'The following items in HVPQ completed on 9 Dec.2024 were inaccurate. 2.1.5 DOC last annual, CLC wreck removal and bunker 2.2.1 Publication Edition Number - ICS Bridge Procedure Guide 3.1.1 The minimum number of certificate officers to be carried as record in the MSMD 3.1.9 The minimum number of ratings to be carried as specified in the MSMD 9.16.5 Fixed O2 alarm fitted in inert gas generating or storage spaces 10.1.7 Details for Mooring Ropes - Renewal date 10.9.1 Crane last annual test']}, {'question_no': '1.5.4', 'repeat_count': 9, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'A few errors were noted in the HVPQ. The correct data was:\n1.5.4 Date of last drydock was 12 June 2024.\n1.5.6 Date of last special survey was 12 June 2024.\n9.16.19 The nitrogen system had one segregation.']}, {'question_no': '9.1.1', 'repeat_count': 9, 'priority': 'MEDIUM_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The following HVPQ items were not corrected from the previous observations provided in the PIQ:- 1.5.11 / 1.5.12 / 9.1.1 /10.1.3.2.1 / 10.2.1 & 10.7.1. They were diagrams, and OP reported that operator was not able to upload', "The HVPQ data entered either in error or not populated for the following HVPQ numbers were noted:\n9.1.1 tank plan incomplete\n9.2.1 1 & 2 not populated\n9.15.1 heat exchanger internal, heating coils were fitted.\n10.1.6.4 All mooring ropes had indicator strands\n10.9.4 not populated\n11.1.9 not populated\n11.3.1 A/E fuel HFO only. (The HVPQ only allows one selection) the A/E's can use either HFO or MDO.\nRECTIFIED, where possible, during the inspection."]}, {'question_no': '9.16.5', 'repeat_count': 9, 'priority': 'MEDIUM_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ item 6.1.8&10, regarding cargo chest and item 9.16.5, regarding IGS space/room oxygen sensors installation were marked wrongly.', 'The following items in HVPQ completed on 9 Dec.2024 were inaccurate. 2.1.5 DOC last annual, CLC wreck removal and bunker 2.2.1 Publication Edition Number - ICS Bridge Procedure Guide 3.1.1 The minimum number of certificate officers to be carried as record in the MSMD 3.1.9 The minimum number of ratings to be carried as specified in the MSMD 9.16.5 Fixed O2 alarm fitted in inert gas generating or storage spaces 10.1.7 Details for Mooring Ropes - Renewal date 10.9.1 Crane last annual test', 'Below sections of the HVPQ were not correctly updated :\n1.3.2.5 : IMO number of the Technical operator was 1677771.\n1.3.2.10 : Date current operator assumed responsibility was 08 Feb 2025 as per Safety Management Certificate.\n1.9.8 : Last PSC inspection was performed at New Orleans on 27 Jan 2025.\n2.1.5 : All statutory certificates except for Safety Equipment Certificate were issued on 08 Feb 2025 and were valid until 06 Nov 2028. Safety Equipment Certificate was issued on 08 Feb 2025 and was va']}, {'question_no': '1.1.13', 'repeat_count': 9, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['In HVPQ under question 1.1.13 for information on the vessel\'s P&I club the option of "Other (Specify)" had been selected and then\nthe name of the ships P&I had been typed in, instead of selecting the P&I club from the drop-down list.', 'The HVPQ showed erroneous dates and data as follows:\n1.1.13.4: P&I cover include wreck removal no response\n1.5.5.2: incorrect date\n1.5.6.5: next special date no response\n1.9.8.1: PSC date incorrect\n3.1.6.1: should be yes\n3.1.6.2: should be no\n3.1.10: same as for officers no response needed\n4.1.1: type of navigation equipments not completed\n10.9.1: crane annual test date incorrect\n11.1.13.1: quick closing valves fitted\n11.1.13.2: no response\n11.4.3: no response\n11.10.1: no response\n12.1.1: should', 'The name of P and I club on VPQ 1.1.13 was not provided however the entry certificate for P and I club was available onboard at the time of inspection.']}, {'question_no': '4.1.1', 'repeat_count': 9, 'priority': 'MEDIUM_REPEAT', 'category': 'Navigation and communication', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo', 'The HVPQ showed erroneous dates and data as follows:\n1.1.13.4: P&I cover include wreck removal no response\n1.5.5.2: incorrect date\n1.5.6.5: next special date no response\n1.9.8.1: PSC date incorrect\n3.1.6.1: should be yes\n3.1.6.2: should be no\n3.1.10: same as for officers no response needed\n4.1.1: type of navigation equipments not completed\n10.9.1: crane annual test date incorrect\n11.1.13.1: quick closing valves fitted\n11.1.13.2: no response\n11.4.3: no response\n11.10.1: no response\n12.1.1: should', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were']}, {'question_no': '11.3.1', 'repeat_count': 8, 'priority': 'MEDIUM_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ dated 21 May 2025 had the following errors: 5.3.2.8 - N/A Not Fitted. 5.3.8.2 - N/A Not Fitted. 5.3.8.3 - The Port Lifeboat was the dedicated rescue boat. 9.16.18 - Block & Bleed Arrangement. 10.6.8 - No - the SPM bracket (SWL 204MT) was fitted on the starboard side of the forward main deck with an approx 60 degree off set from the center lead and then via one pedestal roller with a wrap angle of approx 60 degrees to the winch pick up drum. 11.3.1 The vessel was equipped with 3 power ge', "The HVPQ data entered either in error or not populated for the following HVPQ numbers were noted:\n9.1.1 tank plan incomplete\n9.2.1 1 & 2 not populated\n9.15.1 heat exchanger internal, heating coils were fitted.\n10.1.6.4 All mooring ropes had indicator strands\n10.9.4 not populated\n11.1.9 not populated\n11.3.1 A/E fuel HFO only. (The HVPQ only allows one selection) the A/E's can use either HFO or MDO.\nRECTIFIED, where possible, during the inspection.", '(i) The HVPQ entries inside section Ref: 1.5.5.2/ 9.16.18/ 9.32.2(Dehumidifier not fitted)/ 11.3.1(KW incorrect) /11.7.1/ 11.7.4/ 12.1.4 did not accurately reflect the information relating to the ship at the time of inspection. The incorrect info & particulars were brought to the attention of Master.\n(ii) The vessel designation as recorded as per IOPP certificate was not declared inside the PIQ.']}, {'question_no': '1.5.11', 'repeat_count': 8, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The following HVPQ items were not corrected from the previous observations provided in the PIQ:- 1.5.11 / 1.5.12 / 9.1.1 /10.1.3.2.1 / 10.2.1 & 10.7.1. They were diagrams, and OP reported that operator was not able to upload', 'As per the HVPQ dated 02 Sep 2024, the following information was inaccurate:\n1. Section 1.5.11 Date of last annual survey was 12 Aug 2024, whereas this was the date of the last intermediate survey.\n2. Section 2.1.5 Certificate dates. a. The date of last annual for the statutory certificates was 12 Aug 2024, whereas this was the\ndate of last intermediate survey.\nb. The dates of last endorsement of the statutory and applicable certificates were blank.\n3. Section 7.1.1 Cargo tank coating. The last ']}, {'question_no': '3.1.9', 'repeat_count': 8, 'priority': 'MEDIUM_REPEAT', 'category': 'Crew / training / operator assessments', 'topic': 'Manning / crew declarations', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ last updated on 05 Jun 2025 and uploaded to the document repository on 06 Jun 2025 was reviewed and the following discrepancies were noted, viz., 1.5.2 date next In Water Survey due, 3.1.1 minimum number of certified officers to be carried as recorded in Minimum Safe Manning document was incorrect, 3.1.9 minimum number of ratings to be carried as specified in the Minimum Safe Manning document was incorrect.', 'The following discrepancies were noted in the HVPQ document: - Item 1.3.1.6: Lack of the necessary information. - Item 1.5.10: Error in the recording of the date, listed incorrectly as 28 September 2022 instead of 19 September 2022.. - Item 1.5.12: Lack of the necessary information. - Item 3.1.1: Error in the recording of the quantity, listed incorrectly as 07 instead of 06. - Item 3.1.9: Error in the recording of the quantity, listed incorrectly as 08 instead of 07. - Item 9.10.4: Error in the ', 'On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i']}, {'question_no': '1.1.8', 'repeat_count': 8, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ["HVPQ entries in the following sections were incorrect. 1. HVPQ 1.1.8 - Type of vessel in IOPP form B 1.11.4 stated as an oil tanker, however form B states as crude oil product tanker. 2. HVPQ 2.1.4 - Stated as an oil tanker, it should be crude oil product tanker. 3. HVPQ 10.1.4 - Vessel's mooring winch drums were split drum type. The entry in the HVPQ was incorrect and stated as 'No' to the split drums.", 'A review of the uploaded HVPQ dated 18 Feb 2025 indicated that the Q1.1.8 was not correctly updated as per the IOPPC which was stated that the vessel was an Oil Tanker. The HVPQ question Q12.1.4 and Q12.1.5 was answered in affirmative whereby generated a question in CVIQ for this inspection.', 'Review of the uploaded HVPQ dated 14 Apr 2025 indicated the following were not correctly updated. 1. HVPQ Q1.1.8 was not correctly updated to indicate the type of ship as an "Oil Tanker," as specified in the International Oil Pollution Prevention Certificate (IOPPC). 2. HVPQ Q10.4.1 was answered in negative and the question required to ignore the remainder of the section, but Item Q10.4.7 and Q10.5.3 was provided with information which generated a question in CVIQ for emergency towing equipment ']}, {'question_no': '1.5.19', 'repeat_count': 8, 'priority': 'MEDIUM_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', 'HVPQ dated 16th October 2024 on 1.5.19, 1.9.5, 7.1.3 and 10.1.4 were not correct.', 'HVPQ - Items 1.5.19 and 7.1.1 were incorrect. PIQ - item 5.7.1028.1 was incorrect. (A crew member injury was recorded onboard on 25 September 2024).']}, {'question_no': '1.3.2', 'repeat_count': 7, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'PSC inspection / detention / deficiency declaration', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'Below sections of the HVPQ were not correctly updated :\n1.3.2.5 : IMO number of the Technical operator was 1677771.\n1.3.2.10 : Date current operator assumed responsibility was 08 Feb 2025 as per Safety Management Certificate.\n1.9.8 : Last PSC inspection was performed at New Orleans on 27 Jan 2025.\n2.1.5 : All statutory certificates except for Safety Equipment Certificate were issued on 08 Feb 2025 and were valid until 06 Nov 2028. Safety Equipment Certificate was issued on 08 Feb 2025 and was va', 'The technical operator was not changed, but the question in the HVPQ (1.3.2.10) date current operator assumed control of the ship was on 05 August 2024.']}, {'question_no': '9.15.1', 'repeat_count': 7, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ["The HVPQ data entered either in error or not populated for the following HVPQ numbers were noted:\n9.1.1 tank plan incomplete\n9.2.1 1 & 2 not populated\n9.15.1 heat exchanger internal, heating coils were fitted.\n10.1.6.4 All mooring ropes had indicator strands\n10.9.4 not populated\n11.1.9 not populated\n11.3.1 A/E fuel HFO only. (The HVPQ only allows one selection) the A/E's can use either HFO or MDO.\nRECTIFIED, where possible, during the inspection.", 'The following entries were either incorrect or incomplete :- 1.2.4.3, 1.3.1.7 & 8, 1.4.2, 1.5.4.1, 1.5.6, 3.1.6.2, 3.2.1, 3.2.2, 6.1.8, 7.1.1, 9.15.1, 9.15.3.5, 9.16.10, 9.16.29.2, 10.1.7 and 12.1.9.', 'The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6']}, {'question_no': '4.2.2', 'repeat_count': 7, 'priority': 'LOW_REPEAT', 'category': 'Navigation and communication', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', 'The following discrepancies were noted 3.1.3 Number of ratings declared incorrectly as 24 instead of an board 13. SDO stated the same would be rectified 4.1.1 Software and firmware data was not populated, SDO stated that during the last annuals the technician had not left behind such data while the vessel was contracted for annual software upgrade 4.2.2 EPIRB data was not populated 7.1.1 Cargo tank coating inspection interval was incorrectly stated as 30 months instead of 60 months as per operat', 'On the uploaded HVPQ dated 16 June 2025, a few entries were either missing or not accurately answered: - In item 2.2.1, the column of edition number for all publications was marked as Yes or No rather than a particular version of the published book as applicable. - Item 4.2.2 was missing information about communications equipment software and firmware version as applicable. - In item 5.2.1, the diameter of the circle was recorded as 10.0 meters instead of 20.0 meters which was marked on the main']}, {'question_no': '1.5.18', 'repeat_count': 7, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Noted following HVPQ item were wrongly marked: Item 1.5.18 - Yes, but the vessel currently did not have any Class dispensation. Item 6.1.7&8 - Yes, but Cargo sea chest was not fitted onboard. Therefore invalid question 6.2.2 generated.', 'The VPQ were errors as following; (a) 1.5.14 CLASS CONDITION: “No”-> Yes (The following class condition was appended on the last class survey status report dated 12 November 2024; (1) VESSEL INFORMED THE NO. 2 STEERING GEAR SYSTEM OF MALFUNCTIONING DUE TO A BURNT MOTOR. SAME TO BE RENEWED AND SPECIALLY SATISFACTION OF ATTENDING SURVEYOR. IMPOSED DATE: 10 NOVEMBER 2024 / DUE DATE: 15 NOVEMBER 2024) (2) THE FOLLOWING DEFICIENCIES REMAIN TO BE DEALT WITH X-BAND RADAR MALFUNCTIONING. IMPOSED DATE: 0', 'Below sections of the HVPQ were not correctly updated :\n1.5.18 : Vessel was in possession of flag state dispensation valid until 16 May 2025 for the malfunction of remote ullage and\npressure sensors of Slop port cargo tank.\n9.16.5 : Fixed oxygen detection was not provided.']}, {'question_no': '1.2.4', 'repeat_count': 6, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'information provided in the HVPQ by the vessel\'s operator completed on 30 Jun 2025 downloaded on 30 Jun 2025 from OCIMF\nwebsite was inacurate. Under HVPQ No. 1.2.3.2 CII rating was defined as "A" instead of "B" as per certificate number DCS-9637088-\n2024-242665. Under HVPQ No. 1.2.4.2 EIV rating was defined as "5.96" instead of "5.544" as per certificate number DCS-9637088-\n2024-242665.']}, {'question_no': '10.4.2', 'repeat_count': 6, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6']}, {'question_no': '10.10.6', 'repeat_count': 6, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'Question no. 4.1.1, 10.1.3.2, 10.1.6, 10.2.1, 10.8, 10.10.6, 10.10.7 & 11.3 were incomplete or blank.', 'The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol']}, {'question_no': '6.1.8', 'repeat_count': 6, 'priority': 'LOW_REPEAT', 'category': 'Pollution prevention', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ item 6.1.8&10, regarding cargo chest and item 9.16.5, regarding IGS space/room oxygen sensors installation were marked wrongly.', 'The vessel was not fitted with a cargo sea chest. HVPQ question 6.1.8 listed the type of valve fitted in the cargo sea chest.', 'On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i']}, {'question_no': '1.5.14', 'repeat_count': 6, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Following were noted in HVPQ last updated 07 Feb 2025: - Entries missing in 1.5.14 & 10.1.8. Incorrect entries in 9.30.6, 10.6.3 & 10.9.1', 'The VPQ were errors as following; (a) 1.5.14 CLASS CONDITION: “No”-> Yes (The following class condition was appended on the last class survey status report dated 12 November 2024; (1) VESSEL INFORMED THE NO. 2 STEERING GEAR SYSTEM OF MALFUNCTIONING DUE TO A BURNT MOTOR. SAME TO BE RENEWED AND SPECIALLY SATISFACTION OF ATTENDING SURVEYOR. IMPOSED DATE: 10 NOVEMBER 2024 / DUE DATE: 15 NOVEMBER 2024) (2) THE FOLLOWING DEFICIENCIES REMAIN TO BE DEALT WITH X-BAND RADAR MALFUNCTIONING. IMPOSED DATE: 0', 'From the review of the HVPQ dated 13 May 2025, it was noted that the minimum safe manning certificate information (Section 3.1.1) was incorrect (7 Officers and 7 Ratings), while the MSM certificate required 8 Officers and 8 Ratings). In addition, the HVPQ section 1.1.13 indicated as P&I Club the North Standard Limited, while the vessel had UK P&I Club. Furthermore, HVPQ section 1.5.14 Condition of Class was answered as "No" while the vessel had a condition of Class issued for a shell plating ind']}, {'question_no': '12.1.4', 'repeat_count': 6, 'priority': 'LOW_REPEAT', 'category': 'Ice / special operations / VOC', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['A review of the uploaded HVPQ dated 18 Feb 2025 indicated that the Q1.1.8 was not correctly updated as per the IOPPC which was stated that the vessel was an Oil Tanker. The HVPQ question Q12.1.4 and Q12.1.5 was answered in affirmative whereby generated a question in CVIQ for this inspection.', '(i) The HVPQ entries inside section Ref: 1.5.5.2/ 9.16.18/ 9.32.2(Dehumidifier not fitted)/ 11.3.1(KW incorrect) /11.7.1/ 11.7.4/ 12.1.4 did not accurately reflect the information relating to the ship at the time of inspection. The incorrect info & particulars were brought to the attention of Master.\n(ii) The vessel designation as recorded as per IOPP certificate was not declared inside the PIQ.', 'On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i']}, {'question_no': '5.3.2', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'Safety / firefighting / lifeboats', 'topic': 'Safety / firefighting / lifeboats', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'The HVPQ dated 21 May 2025 had the following errors: 5.3.2.8 - N/A Not Fitted. 5.3.8.2 - N/A Not Fitted. 5.3.8.3 - The Port Lifeboat was the dedicated rescue boat. 9.16.18 - Block & Bleed Arrangement. 10.6.8 - No - the SPM bracket (SWL 204MT) was fitted on the starboard side of the forward main deck with an approx 60 degree off set from the center lead and then via one pedestal roller with a wrap angle of approx 60 degrees to the winch pick up drum. 11.3.1 The vessel was equipped with 3 power ge', 'HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo']}, {'question_no': '11.10.1', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'The HVPQ showed erroneous dates and data as follows:\n1.1.13.4: P&I cover include wreck removal no response\n1.5.5.2: incorrect date\n1.5.6.5: next special date no response\n1.9.8.1: PSC date incorrect\n3.1.6.1: should be yes\n3.1.6.2: should be no\n3.1.10: same as for officers no response needed\n4.1.1: type of navigation equipments not completed\n10.9.1: crane annual test date incorrect\n11.1.13.1: quick closing valves fitted\n11.1.13.2: no response\n11.4.3: no response\n11.10.1: no response\n12.1.1: should', 'The HVPQ showed erroneous data and dates as below: 1.1.13 the name of P&I was not correct 3.1.9 rating as per MSMC only 8 instead of 9 10.9.1 cranes annual test incorrect 11.10.1 not filled.']}, {'question_no': '9.16.18', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ dated 21 May 2025 had the following errors: 5.3.2.8 - N/A Not Fitted. 5.3.8.2 - N/A Not Fitted. 5.3.8.3 - The Port Lifeboat was the dedicated rescue boat. 9.16.18 - Block & Bleed Arrangement. 10.6.8 - No - the SPM bracket (SWL 204MT) was fitted on the starboard side of the forward main deck with an approx 60 degree off set from the center lead and then via one pedestal roller with a wrap angle of approx 60 degrees to the winch pick up drum. 11.3.1 The vessel was equipped with 3 power ge', 'The type of deck seal was wrongly declared as semi-dry in HVPQ item 9.16.18. The vessel was fitted with a wet type deck seal instead.', 'The following typo errors were seen in the latest HVPQ uploaded in the OCIMF repository, dated 12 May 2025: 1) HVPQ 7.1.1: cargo tanks inspection interval quarterly instead annually. 2) HVPQ 7.1.3: last 5 side starboard ballast tank inspection dated 12 July 2024 instead 12 March 2025. 3) HVPQ 9.16.18: missing the entry bleed and block valves. 4) HVPQ 10.1.3: missing entry SDMBL 36.5 tonnes. 5) HVPQ 10.1.4: the details of only one mooring winch was recorded. The vessel was fitted with 8 mooring w']}, {'question_no': '1.2.2', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Environmental indices', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['1.2.2 Of the HVPQ indicated the vessel was not assigned an EEXI Rating. The vessel had been assigned an EEXI Rating', 'Some erroneous and/or missing information noted under the following sections: 1.2.2.1; 1.5.4.2; 1.5.5; 7.1.3; 10.1.4.', 'As per Supplement to the IEEC, this vessel EEXI rating was 1.97. In HVPQ, under 1.2.2 "Does the vessel has EEXI rating" was answered "No". (EEXI rating 1.97 was mentioned in the following HVPQ question).']}, {'question_no': '6.1.1', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'Pollution prevention', 'topic': 'Cargo pump details', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ uploaded by the Operator on 12 Mar 2025 had errors including:\na) 6.1.1.4- Incorrect distance for coaming of height 260mm.\nb) 9.32.2.1- The vessel has a dehumidifier.\nc) 10.6.2- The vessel was fitted with only 1 bow stopper.', 'It was observed that the HVPQ uploaded by the Operator on 09 Dec 2024 had significant errors at various locations including a)\n6.1.1- Various coaming heights , b) 9.5.3- Loading through pump cannot be bypassed, c) 9.7.3- All valves could be operated from\nthe CCR and e) 9.16.19- Vessel had seven IG segregations', 'The following items of the HVPQ incorrect information was noted:\n1.2.3.- Stated CII E, but actual rating was B.\n6.1.1/4.- "How far forward the athwartships coaming is this height maintained" stated wrong value 12800 m.\n9.11.2.- Manifold hydraulic valves time 10 seconds; but the manifold had not hydraulic valves.\nChapter 13 was filled however the ship was not a Combination Carrier']}, {'question_no': '1.8.7', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'General / certificates / PSC / ownership', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo', 'In the HVPQ dated 16 January 2025 uploaded in the system was observed: 8. Load Line Information : 1.8.6 Assigned dead weight 1 : 49999 MT, however on board was noted the correct one : 49795.7 MT. 1.8.7 What is the current in use assigned dwt: it was stated: 497796.00 MT. The correct is 49795.7 MT.', 'The HVPQ was shown erroneous data below:\n1.5.6.3/1.8.7/6.1.14.2']}, {'question_no': '1.9.5', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The vessel reported two incidents in Nov-2024 and the item 1.9.5 in the HVPQ stated that she was not involved in any incidents during the past 12 months.', "On HVPQ, several items were recorded with inaccurate information: \n- The HVPQ declared a No to the item 1.9.5, however the vessel had three reported incidents on record in the previous 12 months. \n- The HVPQ declared a Yes to the items 6.2.1, 6.2.2 & 6.2.3, but the vessel didn't hold a valid USCG VRP Approval Letter or COFR. \n- The HVPQ declared a Yes to the item 9.7.3, actually all manifold valves were manual. \n- The safe working load (SWL) of each provision crane and engine room crane was ente", 'HVPQ dated 16th October 2024 on 1.5.19, 1.9.5, 7.1.3 and 10.1.4 were not correct.']}, {'question_no': '11.4.3', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ showed erroneous dates and data as follows:\n1.1.13.4: P&I cover include wreck removal no response\n1.5.5.2: incorrect date\n1.5.6.5: next special date no response\n1.9.8.1: PSC date incorrect\n3.1.6.1: should be yes\n3.1.6.2: should be no\n3.1.10: same as for officers no response needed\n4.1.1: type of navigation equipments not completed\n10.9.1: crane annual test date incorrect\n11.1.13.1: quick closing valves fitted\n11.1.13.2: no response\n11.4.3: no response\n11.10.1: no response\n12.1.1: should', 'The following entries were either incomplete or incorrect - 1.5.1, 1.5.12, 6.1.5, 9.6.2, 9.6.6, 9.8.17, 9.15.1, 9.16.11, 9.16.12, 10.9.1, 11.3.4, 11.4.3, 11.5.5.2, 9.10.9.2 to 4.', 'A review of the uploaded HVPQ indicated that the below items were found to be omitted or incorrectly declared: 1) 1.1.8/IOPP designation was wrongly listed as “Others” instead of the correct option “GAS” which could be selected from the drop down options: 2) 1.1.13.1 P&I Club was wrongly listed as “Other” instead of the correct club – “North Standard Limited” which could be selected from the drop down opions 3)11.4.3/Motive power of emergency compressor was not declared.']}, {'question_no': '6.1.14', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'Pollution prevention', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ was shown erroneous data below:\n1.5.6.3/1.8.7/6.1.14.2', 'PROCESS - The following was noted not updated accurately as per the HVPQ dated 26-Nov-2024: a) 2.2.1 - The edition numbers for the publications were not provided as required. b) 6.1.14 - The bunker pipeline annual pressure test was incorrectly stated as 6.60 bars instead of 4.40 bars. c) 7.1.3 - The FPT, 1W and 3W ballast tanks annual inspection dates were not updated and indicated as overdue instead. d) 10.1.3.2 - The diagram for the mooring winch layout was not provided. e) 10.7.1 - The bow mo', 'The HVPQ was last updated by the operator on 27th March 2025 and the followings were noted - Items 6.1.14: The bunker pipeline annual pressure test was incorrectly stated as 6.60 bars, instead of 4.40 bars. - Item 10.1.3.1: The diagram for the mooring winch layout was not provided. Item 12.1.8 - details for the bollards, chock, rollers and fairleads used for the STS operation indicated that the winches / capstan driven by the electric power, instead of hydraulic power.']}, {'question_no': '1.8.1', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', 'The HVPQ uploaded by the Operator on 21st April 2025 had a few errors as follow – \na) 1.8.7 and 1.8.1 – load line information incorrect \nb) 7.1.3 – Incorrect dates for ballast tank inspections.', "Review of the ship's operator latest HVPQ completed on 14 Feb 2025 and uploaded on 15 Feb 2025 the following inaccuracies were observed: (1) Item 1.5.5 The date of last In Water Survey (IWS) was entered as 23 July 2024, however, from record this was the date of dry docking. (2) Item 1.8.1 The vessel had no multiple dead weight, vessel maximum summer dead weight was entered as 297 187.6, however, as recorded in ClasNK certificates and Certificate of Registry, the dead weight was 297 572 MT. (3) I"]}, {'question_no': '12.1.8', 'repeat_count': 5, 'priority': 'LOW_REPEAT', 'category': 'Ice / special operations / VOC', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', 'The following errors were noted in HVPQ uploaded on SIRE. - 3. 1. 1 - Minimum officers required as \nper MSMD were 6. - 9. 16. 10. 1 I 2 - Details not provided. - 9. 17. 1 - The cargo pump details of slop wing tanks were not recorded. - 9.30.1- Vessel was assigned IMO Type 2 I 3 chemical tanker notation. - 9.31. 10-IGS composition details not completed. - 10.1.4- The mooring winches were \nfitted with split drums. - 10.8. 1 - Manifold arrangement diagram not completed. - 10. 9. 1 - Last periodical', 'PROCESS - The following was noted not updated accurately as per the HVPQ dated 26-Nov-2024: a) 2.2.1 - The edition numbers for the publications were not provided as required. b) 6.1.14 - The bunker pipeline annual pressure test was incorrectly stated as 6.60 bars instead of 4.40 bars. c) 7.1.3 - The FPT, 1W and 3W ballast tanks annual inspection dates were not updated and indicated as overdue instead. d) 10.1.3.2 - The diagram for the mooring winch layout was not provided. e) 10.7.1 - The bow mo']}, {'question_no': '11.3.4', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Generators / emergency power', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ dated 21 May 2025 had the following errors: 5.3.2.8 - N/A Not Fitted. 5.3.8.2 - N/A Not Fitted. 5.3.8.3 - The Port Lifeboat was the dedicated rescue boat. 9.16.18 - Block & Bleed Arrangement. 10.6.8 - No - the SPM bracket (SWL 204MT) was fitted on the starboard side of the forward main deck with an approx 60 degree off set from the center lead and then via one pedestal roller with a wrap angle of approx 60 degrees to the winch pick up drum. 11.3.1 The vessel was equipped with 3 power ge', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', 'The following entries were either incomplete or incorrect - 1.5.1, 1.5.12, 6.1.5, 9.6.2, 9.6.6, 9.8.17, 9.15.1, 9.16.11, 9.16.12, 10.9.1, 11.3.4, 11.4.3, 11.5.5.2, 9.10.9.2 to 4.']}, {'question_no': '9.17.1', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol', 'The HVPQ uploaded had the following discrepancies: 1.2.4 - EIV rating stated available in 2024, not entered. 1.5.14 - Open conditions of class not entered 7.1.1 - Cargo tank inspections frequency stated as annual, last inspection on 11 & 12 May 2024 except for cargo tanks 4S & 5W. 7.1.3 - Ballast tank inspections frequency stated as annual, apart from forepeak tank, all others were last inspected on 18, 19 & 25 May 2024. 9.6.2, 9.6.6 & 9.17.1- Cargo pump types stated "centrifugal", whereas deep ']}, {'question_no': '3.1.3', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Crew / training / operator assessments', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The following discrepancies were noted 3.1.3 Number of ratings declared incorrectly as 24 instead of an board 13. SDO stated the same would be rectified 4.1.1 Software and firmware data was not populated, SDO stated that during the last annuals the technician had not left behind such data while the vessel was contracted for annual software upgrade 4.2.2 EPIRB data was not populated 7.1.1 Cargo tank coating inspection interval was incorrectly stated as 30 months instead of 60 months as per operat', 'The following discrepancies were found in the HVPQ document:\nItem 1.5.3.1: An error was discovered in the recording of the answer, which was incorrectly marked as NO instead of YES.\nItem 1.5.3.2: Lack of the necessary information.\nItem 1.5.3.3: Lack of the necessary information.\nItem 1.5.5.1: Lack of the necessary information.\nItem 1.5.5.2: Lack of the necessary information.\nItem 1.5.10: Error in recording the date, listed incorrectly 26 March 2024 instead 12 March 2024.\nItem 1.5.12: Lack of the']}, {'question_no': '1.2.3', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['information provided in the HVPQ by the vessel\'s operator completed on 30 Jun 2025 downloaded on 30 Jun 2025 from OCIMF\nwebsite was inacurate. Under HVPQ No. 1.2.3.2 CII rating was defined as "A" instead of "B" as per certificate number DCS-9637088-\n2024-242665. Under HVPQ No. 1.2.4.2 EIV rating was defined as "5.96" instead of "5.544" as per certificate number DCS-9637088-\n2024-242665.', 'On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i', '(i) The HVPQ entries inside section Ref: 1.2.3.2/4 (CII-B by Class ABS)/ 1.5.14 (Condition of Class on LRIT conformance test)/ 1.5.5.2/\n9.30.17.2/ 9.30.1( IMO Type 2) / 10.9.1(Last Class annual examination) / 10.10.6/ 121.4 did not accurately reflect the information\nrelating to the ship at the time of inspection. The incorrect info and particulars were brought to the attention of the Master.\n(ii) The vessel designation as recorded as per IOPP cert ., and the name of vessel P&I club were not decl']}, {'question_no': '1.5.10', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ document: - Item 1.3.1.6: Lack of the necessary information. - Item 1.5.10: Error in the recording of the date, listed incorrectly as 28 September 2022 instead of 19 September 2022.. - Item 1.5.12: Lack of the necessary information. - Item 3.1.1: Error in the recording of the quantity, listed incorrectly as 07 instead of 06. - Item 3.1.9: Error in the recording of the quantity, listed incorrectly as 08 instead of 07. - Item 9.10.4: Error in the ', 'The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6', 'The following discrepancies were found in the HVPQ document:\nItem 1.5.3.1: An error was discovered in the recording of the answer, which was incorrectly marked as NO instead of YES.\nItem 1.5.3.2: Lack of the necessary information.\nItem 1.5.3.3: Lack of the necessary information.\nItem 1.5.5.1: Lack of the necessary information.\nItem 1.5.5.2: Lack of the necessary information.\nItem 1.5.10: Error in recording the date, listed incorrectly 26 March 2024 instead 12 March 2024.\nItem 1.5.12: Lack of the']}, {'question_no': '10.6.3', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Environmental indices', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Following were noted in HVPQ last updated 07 Feb 2025: - Entries missing in 1.5.14 & 10.1.8. Incorrect entries in 9.30.6, 10.6.3 & 10.9.1', 'On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were']}, {'question_no': '9.6.6', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Cargo pump details', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i', 'The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6', 'The following entries were either incomplete or incorrect - 1.5.1, 1.5.12, 6.1.5, 9.6.2, 9.6.6, 9.8.17, 9.15.1, 9.16.11, 9.16.12, 10.9.1, 11.3.4, 11.4.3, 11.5.5.2, 9.10.9.2 to 4.']}, {'question_no': '12.1.3', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Ice / special operations / VOC', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i', 'The following items in the HVPQ were not correctly completed: 10.7.1; 10.8.1; 12.1.3 and 12.1.4.', 'The OP uploaded the HVPQ dated 22 September 2025 were inaccuracy information as: a. the previous management company name in column (1.3.2 (12). b. the vessel was not certified for a person\'s transferring by deck crane, but in column (12.1.3) was answered with "YES".']}, {'question_no': '10.10.7', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring / lifting / SPM / ETA', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo', 'Question no. 4.1.1, 10.1.3.2, 10.1.6, 10.2.1, 10.8, 10.10.6, 10.10.7 & 11.3 were incomplete or blank.', 'The uploaded HVPQ had the following discrepancies 2.1.5 – SMC & ISSC date of endorsement 10.1.4 – split drums stated no, vessel fitted with split drums 10.2.4 – Panama or closed chocks as per MEG 4 10.9.1 – lifting appliances last annual test on 04th Feb 2024, vessel carried out annual surveys on 15th May 2025. 10.10.7 shore gangway designated landing area.']}, {'question_no': '11.1.13', 'repeat_count': 4, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ showed erroneous dates and data as follows:\n1.1.13.4: P&I cover include wreck removal no response\n1.5.5.2: incorrect date\n1.5.6.5: next special date no response\n1.9.8.1: PSC date incorrect\n3.1.6.1: should be yes\n3.1.6.2: should be no\n3.1.10: same as for officers no response needed\n4.1.1: type of navigation equipments not completed\n10.9.1: crane annual test date incorrect\n11.1.13.1: quick closing valves fitted\n11.1.13.2: no response\n11.4.3: no response\n11.10.1: no response\n12.1.1: should', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', '"The following were either not completed or wrongly stated in the HVPQ:\n1.3.1. address of the owner did not match the address on certificates such as, CLC, BCLC, certificate of registry, CSSR and CSR.\n9.1.1 - tank plan\n9.16.5 - O2 alarms in IG spaces\n10.1.3.2 - mooring winch layout diagram\n10.2.1 - mooring fairleads/chocks and bollards / bitts diagram\n10.7.1 - bow mooring arrangement diagram\n10.8.1 - manifold arrangement diagram\n11.1.13 - quick closing valves"']}, {'question_no': '1.4.3', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Two items were incorrectly declared in the latest HVPQ6 dated 3 October 2024 asf: 1-Item 1.4.3- Date of building contract 20-January-2019; Actually on 18-May-2018: 2-item 10.9.1 – last 5yr test for one of two cranes : 20-January-2011: Actually on 20-January-2022. Reportedly online updated immediately.', 'The following items were incorrectly declared in the latest HVPQ6 dated 07 November 2024: 1-1.4.3 Date of building contract: 23 August 2019 instead of actual 22 August 2019; 2-10.9.1 Last annual test for 5 cranes: 12 November 2023 instead of actual 19 June 2024. Reportedly all on-line updated immediately.', 'Certain information in the HVPQ downloaded on 23 January 2026 was inaccurate or not updated in the following sections; \nQ. 1.4.3 (To be 02 Nov 2020) / \n2.1.5 (Issue dates of Safety Radio Certificate and Fitness Certificate) / \n3.1.3 / 3.1.9 / 4.1.1 (Model, software and firmware versions) / \n4.2.2 (Serial number, software and firmware versions) / \n6.1.1.4 / 6.1.14.2 (To be 5 bar) / \n7.1.3 (Date when tank was coated) / \n9.67.3 / 10.9.1 (Last annual test) / \n11.4.3 / 12.2.4.']}, {'question_no': '12.4.1', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Ice / special operations / VOC', 'topic': 'Ice / special operations / VOC', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were']}, {'question_no': '5.3.8', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Safety / firefighting / lifeboats', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ dated 21 May 2025 had the following errors: 5.3.2.8 - N/A Not Fitted. 5.3.8.2 - N/A Not Fitted. 5.3.8.3 - The Port Lifeboat was the dedicated rescue boat. 9.16.18 - Block & Bleed Arrangement. 10.6.8 - No - the SPM bracket (SWL 204MT) was fitted on the starboard side of the forward main deck with an approx 60 degree off set from the center lead and then via one pedestal roller with a wrap angle of approx 60 degrees to the winch pick up drum. 11.3.1 The vessel was equipped with 3 power ge', 'Incorrect information was provided in the HVPQ section 5.3.8 indicating that the vessel was fitted with a dedicated rescue boat, but the vessel was fitted with conventional lifeboats only, which port side was the designated rescue boat.', "Various questions in sections 1.2.2 to 1.2.4 of HVPQ were left blank. (2) as per section 5.3.8 of HVPQ vessel was provided with dedicated rescue boat. In actual vessel's starboard side davit launched conventional lifeboat was the designated rescue boat."]}, {'question_no': '2.1', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Environmental / certificates', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The following HVPQ items were not corrected from the previous observations provided in the PIQ:- 1.5.11 / 1.5.12 / 9.1.1 /10.1.3.2.1 / 10.2.1 & 10.7.1. They were diagrams, and OP reported that operator was not able to upload', 'According to the attached HVPQ, the following items were found: \n1) 1.3.1.10 the owner took over from Dec 2019; \n2) 1.5.16/ 1.5.17/1.5.18/ 1.5.19 were blank, one exemption was kept at the time of inspection (9 nos. level gauges of cargo tanks); \n3) 2.1 parts of the annual survey were marked on 13 Nov 2023, including SCC/ IOPP/ IBWM; \n4) 2.2.1 Parts of publications were not the latest editions: ICS Guide to helicopter/ Ship Operations, Guidance Manual for Tanker structures; \n5) 7.1.3 Parts of bal']}, {'question_no': '1.5.16', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'Following discrepancies noted.\n1.3.11 Total number of this type of ships was incorrectly stated as 500.\n1.5.16 was marked as NO while M05 and M08 were noted on CSSR.\n4.1.1 serial numbers of the navigation equipment were. ot populated.\n4.2.2 EPIRB and SART data was not populated.\n10.1.7 Data for mooring tails and shackle were not populated.\n10.9.1 Date was last crane annual inspection was incorrectly stated as 29 March 2025.\n7.1.3 While 1P/S TST and D/B were inspected in May 2025 while the other ', 'According to the attached HVPQ, the following items were found: \n1) 1.3.1.10 the owner took over from Dec 2019; \n2) 1.5.16/ 1.5.17/1.5.18/ 1.5.19 were blank, one exemption was kept at the time of inspection (9 nos. level gauges of cargo tanks); \n3) 2.1 parts of the annual survey were marked on 13 Nov 2023, including SCC/ IOPP/ IBWM; \n4) 2.2.1 Parts of publications were not the latest editions: ICS Guide to helicopter/ Ship Operations, Guidance Manual for Tanker structures; \n5) 7.1.3 Parts of bal']}, {'question_no': '1.5.17', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The HVPQ uploaded contained the following discrepancies: -Item 1.5.17: Memoranda described under Observations in 2.1.1 (hardware observations) were not detailed in the HVPQ. -Item 7. T. 1: Inspection intervals of the cargo tanks was 60 months (every class special survey) as per OperatorS procedures. The cargo tanks were uncoated but entries in the HVPQ included the date of coating and date of the last coating inspection for the cargo tanks.', 'According to the attached HVPQ, the following items were found: \n1) 1.3.1.10 the owner took over from Dec 2019; \n2) 1.5.16/ 1.5.17/1.5.18/ 1.5.19 were blank, one exemption was kept at the time of inspection (9 nos. level gauges of cargo tanks); \n3) 2.1 parts of the annual survey were marked on 13 Nov 2023, including SCC/ IOPP/ IBWM; \n4) 2.2.1 Parts of publications were not the latest editions: ICS Guide to helicopter/ Ship Operations, Guidance Manual for Tanker structures; \n5) 7.1.3 Parts of bal']}, {'question_no': '9.30.1', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The following errors were noted in HVPQ uploaded on SIRE. - 3. 1. 1 - Minimum officers required as \nper MSMD were 6. - 9. 16. 10. 1 I 2 - Details not provided. - 9. 17. 1 - The cargo pump details of slop wing tanks were not recorded. - 9.30.1- Vessel was assigned IMO Type 2 I 3 chemical tanker notation. - 9.31. 10-IGS composition details not completed. - 10.1.4- The mooring winches were \nfitted with split drums. - 10.8. 1 - Manifold arrangement diagram not completed. - 10. 9. 1 - Last periodical', '(i) The HVPQ entries inside section Ref: 1.2.3.2/4 (CII-B by Class ABS)/ 1.5.14 (Condition of Class on LRIT conformance test)/ 1.5.5.2/\n9.30.17.2/ 9.30.1( IMO Type 2) / 10.9.1(Last Class annual examination) / 10.10.6/ 121.4 did not accurately reflect the information\nrelating to the ship at the time of inspection. The incorrect info and particulars were brought to the attention of the Master.\n(ii) The vessel designation as recorded as per IOPP cert ., and the name of vessel P&I club were not decl']}, {'question_no': '12.2.4', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Ice / special operations / VOC', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', 'Certain information in the HVPQ downloaded on 23 January 2026 was inaccurate or not updated in the following sections; \nQ. 1.4.3 (To be 02 Nov 2020) / \n2.1.5 (Issue dates of Safety Radio Certificate and Fitness Certificate) / \n3.1.3 / 3.1.9 / 4.1.1 (Model, software and firmware versions) / \n4.2.2 (Serial number, software and firmware versions) / \n6.1.1.4 / 6.1.14.2 (To be 5 bar) / \n7.1.3 (Date when tank was coated) / \n9.67.3 / 10.9.1 (Last annual test) / \n11.4.3 / 12.2.4.']}, {'question_no': '1.8.6', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following information was either not completed or was not accurately updated in the HVPQ dated 14-Sep-2025: (i) Date of last in water survey (1. 5. 5. 1 ): 16-Jan-2025; (ii) Assigned dead weight 4 1.e. 34,999 MT that was available was not included (1.8.6); (iii) The following ballast tank inspection dates were not updated (7.1.3): 1P on 08-Jul-2025, 2P on 08-Jul-2025, 3P on 08-Jul-2025, 5S on 7 7-Aug-2025; (iv) Accommodation ladder wire renewal date (10.10.2). 05-Jun-2025; (v) The renewal da', 'In the HVPQ dated 16 January 2025 uploaded in the system was observed: 8. Load Line Information : 1.8.6 Assigned dead weight 1 : 49999 MT, however on board was noted the correct one : 49795.7 MT. 1.8.7 What is the current in use assigned dwt: it was stated: 497796.00 MT. The correct is 49795.7 MT.', 'On the uploaded HVPQ the following items were not correct: 1.8.6 (LL #6 -33497 MT), 1.8.7 (Active DW was 39996 MT), 1.9.8.2 (Last PSC was at Dumaguete, Philippines), 6.1.14.2 (Bunker lines tested to 7.0 Bar), 9.3.7 (Total capacity of cargo tanks value was not correct), 10.1.4 (Vessel was provided with split drums).']}, {'question_no': '9.16.19', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['A few errors were noted in the HVPQ. The correct data was:\n1.5.4 Date of last drydock was 12 June 2024.\n1.5.6 Date of last special survey was 12 June 2024.\n9.16.19 The nitrogen system had one segregation.', 'A few errors were noted in the HVPQ. The correct answers were: 1.5.4.3 Next drydock was due on 05.02.2027. 1.5.5.2 Next IWS due on 05.02.2027. 1.5.6 Last special survey was an enhanced special survey. 9.16.19 The IG system had only 1 segregation.', 'It was observed that the HVPQ uploaded by the Operator on 09 Dec 2024 had significant errors at various locations including a)\n6.1.1- Various coaming heights , b) 9.5.3- Loading through pump cannot be bypassed, c) 9.7.3- All valves could be operated from\nthe CCR and e) 9.16.19- Vessel had seven IG segregations']}, {'question_no': '10.1.8', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Following were noted in HVPQ last updated 07 Feb 2025: - Entries missing in 1.5.14 & 10.1.8. Incorrect entries in 9.30.6, 10.6.3 & 10.9.1', 'Process - The below information was found missing from the HVPQ uploaded on the CVIQ (dated 06 Mar 2025), as follows: 10.7.1 Bow Mooring arrangement diagram 10.1.8 Manifold Arrangement Diagram 10.2.1 Diagram for the layout of Mooring Fairleads, Chocks and Bollards and Bitts. A revised uploaded HVPQ (dated 04 Apr 2025) containing the missing diagrams was presented.', 'The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol']}, {'question_no': '11.1.9', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ["The HVPQ data entered either in error or not populated for the following HVPQ numbers were noted:\n9.1.1 tank plan incomplete\n9.2.1 1 & 2 not populated\n9.15.1 heat exchanger internal, heating coils were fitted.\n10.1.6.4 All mooring ropes had indicator strands\n10.9.4 not populated\n11.1.9 not populated\n11.3.1 A/E fuel HFO only. (The HVPQ only allows one selection) the A/E's can use either HFO or MDO.\nRECTIFIED, where possible, during the inspection.", 'HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were']}, {'question_no': '9.5.3', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['There were minor errors having no impact on the inspection. 7.1.1 Tank Type 2G is a gas tanker The tank construction is SS cladding, which is not an option in the HVPQ drop-down menu. 9.1.1 Tank plan cross-section schematic is wrong. 9.5.3 Says that the pump cannot be by pass pump during loading; this is incorrect. 12.1.13 The vessel has closed chocks and bollards at the manifold, the distances are missing.', 'It was observed that the HVPQ uploaded by the Operator on 09 Dec 2024 had significant errors at various locations including a)\n6.1.1- Various coaming heights , b) 9.5.3- Loading through pump cannot be bypassed, c) 9.7.3- All valves could be operated from\nthe CCR and e) 9.16.19- Vessel had seven IG segregations', 'Below sections of the HVPQ were not correctly updated: 9.5.3 :Cargo pumps were not provided with the external deck mounted heat exchangers. 10.1.7:Mooring ropes no. 3 end for end date was not updated to Jan 2025. 10.9.,1 : Details pertaining to engine overhead crane SWL 3.5 tons, provision crane port side SWL 5 tons and provision crane starboard side SWT 2.5 tons were not updated.']}, {'question_no': '6.2.1', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Pollution prevention', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['On the uploaded HVPQ, some entries were either missing or not accurately answered: - Items 6.1.8, 9.6.6, 11.8.3, 12.1.3 & 12.1.4 had blank responses. - The date entered in the item 1.1.4.4 was one day ahead of the actual date of change of flag. - Item 1.2.3 stated that a CII rating of A was obtained and verified by the Class. Actually, the vessel was delivered on 18 September 2025 and was not due to receive its initial CII rating. - The numbers of certified officers and ratings recorded in the i', "On HVPQ, several items were recorded with inaccurate information: \n- The HVPQ declared a No to the item 1.9.5, however the vessel had three reported incidents on record in the previous 12 months. \n- The HVPQ declared a Yes to the items 6.2.1, 6.2.2 & 6.2.3, but the vessel didn't hold a valid USCG VRP Approval Letter or COFR. \n- The HVPQ declared a Yes to the item 9.7.3, actually all manifold valves were manual. \n- The safe working load (SWL) of each provision crane and engine room crane was ente", 'On the latest published HVPQ dated 14 November 2025, a few entries were observed with incorrect data: - The amount of value was entered as USD 2 billion, which was not the same as presented in the uploaded P&I Club Certificate of Entry (Qu 1.1.13.3). – The edition number recorded for two publications (i.e., ICS Guide to Helicopter/Ship Operations & OCIMF/ICS Ship to Ship Transfer Guide (Petroleum)) was not updated to reflect the current edition of these publications onboard (Qu 2.2.1). – The HVP']}, {'question_no': '1.9.2', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Incident declarations', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following items mentioned in the HVPQ were not correct: 1.9. I; 1.9.2; I I. 9. I.', 'Vessel had suffered contact (collision) incident with another vessel at Tanjung Pelepas on 01 July 2025. Vessel had further carried out repairs using shore fitters inside steering gear room, Fields 1.9.2 and 1.9.3 in HVPQ for unscheduled repairs and collision incident respectively were mentioned as “ No”. Field 1.9.1 which should have been mentioned as “ No” was reported as”Yes”.', "HVPQ 1.9.2 response was recorded as 'No', Vessel had conducted an unscheduled voyage repair from Yeosu to Busan for fresh water tank (S) bulkhead welding crack to aft peak tank which required attendance of shore repair personnel from 7 to 9 December 2024. Class Surveyor attendance on 9 December 2024 for verification of repairs was recorded."]}, {'question_no': '11.1.6', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Generators / emergency power', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6', 'HVPQ had some minor errors as follows: (1.1.7/3) Ship\'s email entered was ineffective as senders\' emails may be rejected & not received by vessel. (Only by adding "master." was ship receiving all emails. For information, using email given in HVPQ, Inspector was not able to contact ship for pre-boarding formalities); (3.2.1) Incorrectly entered YES when senior officers in actuality, did not return to same ship on rotational basis; (5.3.1.4) Foam supplied or tested date was entered as 11 November ', 'The following errors/omissions were evident in the HVPQ:\nIn Q11.1.6 it was indicated that the type of fuel used for main propulsion was HFO. The actual fuel used for main propulsion was\nVLSFO or MGO.\nIn Q 11.3.1 It was indicated that the vessel had one generator and that it utilized HFO. The vessel had three generators that utilized\nLSFO or MGO.']}, {'question_no': '9.7.3', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Information in HVPQ was incorrect at 9.7.3 (all valves could not be controlled from the cargo control room), 10.1.4 (mooring winches were fitted with split drums and remote controls), 10.9.1 (date of last annual inspection of lifting appliances by class was 23 Sep 2024) and 11.3.1 (three diesel generators - each 600 kW rating were fitted).', "On HVPQ, several items were recorded with inaccurate information: \n- The HVPQ declared a No to the item 1.9.5, however the vessel had three reported incidents on record in the previous 12 months. \n- The HVPQ declared a Yes to the items 6.2.1, 6.2.2 & 6.2.3, but the vessel didn't hold a valid USCG VRP Approval Letter or COFR. \n- The HVPQ declared a Yes to the item 9.7.3, actually all manifold valves were manual. \n- The safe working load (SWL) of each provision crane and engine room crane was ente", 'It was observed that the HVPQ uploaded by the Operator on 09 Dec 2024 had significant errors at various locations including a)\n6.1.1- Various coaming heights , b) 9.5.3- Loading through pump cannot be bypassed, c) 9.7.3- All valves could be operated from\nthe CCR and e) 9.16.19- Vessel had seven IG segregations']}, {'question_no': '11.11.2', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Engine room / machinery / generators', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['As per HVPQ section 11.11.2, it was declared that the vessel was fitted with exhaust gas recirculation system however, such a system was not fitted.', 'Inspector Negative Comment As per HVPQ section 11.11.2, it was declared that the vessel was fitted with exhaust gas recirculation system however, such a system was not fitted.', 'The following sections were incorrect or missing in the HVPQ 1.5.11,1.6.25,7.1.1,7.1.3,10.1.3.2, 10.9.1, 11.3.1, 11.5.1,11.11.2.']}, {'question_no': '1.9.6', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Incident declarations', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['According to attached HVPQ, following items were kept in blank or wrongly entered: 1.3.1.5/1.4.2/1.9.6/10.1.3.2', 'The uploaded HVPQ had the following incorrect information. 1.1.8, 1.9.5 and 1.9.6.', 'The information related to the following HVPQ numbers were incorrect or missing in the uploaded HVPQ; 1.1.8, 1.3.1.5, 1.3.1.7, 1.3.1.8, 1.5.11, 1.5.18, 1.5.19, 1.9.5, 1.9.6, 5.3.1.4, 7.1.3, 9.1.1, 10.1.3.2, 10.1.4, 10.7.1 and 10.9.1.']}, {'question_no': '9.6.2', 'repeat_count': 3, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following entries were either incomplete or incorrect - 1.5.1, 1.5.12, 6.1.5, 9.6.2, 9.6.6, 9.8.17, 9.15.1, 9.16.11, 9.16.12, 10.9.1, 11.3.4, 11.4.3, 11.5.5.2, 9.10.9.2 to 4.', 'The HVPQ uploaded had the following discrepancies: 1.2.4 - EIV rating stated available in 2024, not entered. 1.5.14 - Open conditions of class not entered 7.1.1 - Cargo tank inspections frequency stated as annual, last inspection on 11 & 12 May 2024 except for cargo tanks 4S & 5W. 7.1.3 - Ballast tank inspections frequency stated as annual, apart from forepeak tank, all others were last inspected on 18, 19 & 25 May 2024. 9.6.2, 9.6.6 & 9.17.1- Cargo pump types stated "centrifugal", whereas deep ', 'Some missing or erroneous information was noted within the HVPQ under the following sections: 8.2.1, 9.3.3-4, 9.3.7, 9.6.2, 9.10.10, 9.11.4, 9.15.1, 9.17.1, 9.35.3, 10.1.4, 10.8.1, 12.1.8.']}, {'question_no': '7.1.6', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Structural assessment / tank coating', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ published to the OCIMF website on 24 Sept 2024 was randomly reviewed on 25 Sept 2024. Some questions were not responded and some questions were wrongly responded. For eg - 1.1.1, 1.2.4, 1.5.4, 1.9.8, 2.2.1, 5.3.2, 6.1.12, 7.1.6, 9.59.5, 9.68.6, 10.1.3, 10.4.2, 10.10.6, 11.10.1, 11.10.2, 12.4.1', 'HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo']}, {'question_no': '1.4', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Mooring brake test date / brake holding capacity', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following error was recorded in the latest HVPQ dated 02 January 2025: HVPQ 10. 1.4 last brake holding capacity test dated 10 January 2024 instead of 07 January 2025.', 'HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe']}, {'question_no': '1.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'It was noted in the pre-board review of the HVPQ uploaded that the annual survey date was incorrectly uploaded as 23 Dec. 2024, but the last annual survey was completed on 29 Sep. 2025. \nAlso, the bunker tanks were protected by the double hull construction required by MARPOL Annex I, Reg. 12A, and it was correctly identified on the IOPPC, Form B, 2A.1.1, but the HVPQ 6.1.19 ‘Are all oil fuel tanks protected by a double hull?" was noted as NO.']}, {'question_no': '9.34.7', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Venting / P-V valves / IGS', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed, wrongly filled, not answered for the following sections as below: 1.1. 13, 1 .2.1, 1.2.4, 1.3.1, 1.3.2, 2. 1.4, 3.3.1, 4. 1. 1, 7. 1 .1, 7. 1.3, 9. 1 .1, 9.8.22, 9. 16.6, 9.17.1, 9.34.7, 10.1.3, 10. 1.4, 10.2.1, 10.4.2, 10.7.1, 10.8.1, 12. 1.14. For example: 1.1. 13 P and I Club# 3 Amount of P&I Cover; 9.16.6 What is the capacity of the IGS?-not responded; 1.3. 1 Registered Owner# 9 Number of years this ship has been owned by Registe', 'The following discrepancies were noted in the HVPQ document: - Item 1.3.1.6: Lack of the necessary information. - Item 1.5.10: Error in the recording of the date, listed incorrectly as 28 September 2022 instead of 19 September 2022.. - Item 1.5.12: Lack of the necessary information. - Item 3.1.1: Error in the recording of the quantity, listed incorrectly as 07 instead of 06. - Item 3.1.9: Error in the recording of the quantity, listed incorrectly as 08 instead of 07. - Item 9.10.4: Error in the ']}, {'question_no': '6.1.13', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Pollution prevention', 'topic': 'Pollution prevention', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following discrepancies were noted in the HVPQ: - Item 1.5.4.2: Lack of necessary information. - Item 1.5.5.1: Error in the due date recording, listed incorrectly as 03 April 2024 instead of 03 April 2022. - Item 1.5.11: Lack of necessary information. - Item 1.5.12: Lack of necessary information. - Item 1.5.16: An error discovered in the recording of the answer, which was incorrectly marked as NO instead of YES. - Item 1.5.17: Lack of necessary information. - Item 3.1.3: The number of rating', 'Reference HVPQ 6.1.13 specified, Cargo lines were subjected to 24 bars pressure at intervals not greater than 12 months, onboard records indicated the annual pressure test was done to 16 bars as the MAWP was also 16 bars.']}, {'question_no': '10.9.4', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following HVPQ Entries were not updated – The date of last winch test (10.1.4): 05-Aug-2025. There were no restrictions noted for the hose handling crane’s capability to maintain it’s design SWL when plumbing a point one metre outboard from the ship’s side over the full length of the manifold (10.9.1). the vessel was capable of carrying out operations at SBM /CBM but the arrangement at the vapor manifold area did not have arrangements for securing floating hoses. (10.9.4)', "The HVPQ data entered either in error or not populated for the following HVPQ numbers were noted:\n9.1.1 tank plan incomplete\n9.2.1 1 & 2 not populated\n9.15.1 heat exchanger internal, heating coils were fitted.\n10.1.6.4 All mooring ropes had indicator strands\n10.9.4 not populated\n11.1.9 not populated\n11.3.1 A/E fuel HFO only. (The HVPQ only allows one selection) the A/E's can use either HFO or MDO.\nRECTIFIED, where possible, during the inspection."]}, {'question_no': '1.9', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'PSC inspection / detention / deficiency declaration', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['On the uploaded HVPQ the following items were recorded with inaccurate information: 1.9.(5,6) (LTI on 04-Jun-2025), 1.9.8 (Last PSC inspection was at Nha Be, Vietnam on 24-Jun-2025), 10.9.1 (Last 5 yearly test was on 04-Jun-2025).', 'The following items mentioned in the HVPQ were not correct: 1.9. I; 1.9.2; I I. 9. I.']}, {'question_no': '10.10.2', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following information was either not completed or was not accurately updated in the HVPQ dated 14-Sep-2025: (i) Date of last in water survey (1. 5. 5. 1 ): 16-Jan-2025; (ii) Assigned dead weight 4 1.e. 34,999 MT that was available was not included (1.8.6); (iii) The following ballast tank inspection dates were not updated (7.1.3): 1P on 08-Jul-2025, 2P on 08-Jul-2025, 3P on 08-Jul-2025, 5S on 7 7-Aug-2025; (iv) Accommodation ladder wire renewal date (10.10.2). 05-Jun-2025; (v) The renewal da', 'The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol']}, {'question_no': '9.30.6', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Cargo systems / IGS / venting / pumps', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Following were noted in HVPQ last updated 07 Feb 2025: - Entries missing in 1.5.14 & 10.1.8. Incorrect entries in 9.30.6, 10.6.3 & 10.9.1', 'The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6']}, {'question_no': '9.2.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ["The HVPQ data entered either in error or not populated for the following HVPQ numbers were noted:\n9.1.1 tank plan incomplete\n9.2.1 1 & 2 not populated\n9.15.1 heat exchanger internal, heating coils were fitted.\n10.1.6.4 All mooring ropes had indicator strands\n10.9.4 not populated\n11.1.9 not populated\n11.3.1 A/E fuel HFO only. (The HVPQ only allows one selection) the A/E's can use either HFO or MDO.\nRECTIFIED, where possible, during the inspection.", 'In HVPQ dated 14 Jan 2025, the following items were either missing or not provided correct information: 1.5.4.3 / 9.1.1 / 9.2.1 / 9.10.2 / 10.7.1 / 10.8.1']}, {'question_no': '10.1.6', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ["The HVPQ data entered either in error or not populated for the following HVPQ numbers were noted:\n9.1.1 tank plan incomplete\n9.2.1 1 & 2 not populated\n9.15.1 heat exchanger internal, heating coils were fitted.\n10.1.6.4 All mooring ropes had indicator strands\n10.9.4 not populated\n11.1.9 not populated\n11.3.1 A/E fuel HFO only. (The HVPQ only allows one selection) the A/E's can use either HFO or MDO.\nRECTIFIED, where possible, during the inspection.", 'Question no. 4.1.1, 10.1.3.2, 10.1.6, 10.2.1, 10.8, 10.10.6, 10.10.7 & 11.3 were incomplete or blank.']}, {'question_no': '9.32.2', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['(i) The HVPQ entries inside section Ref: 1.5.5.2/ 9.16.18/ 9.32.2(Dehumidifier not fitted)/ 11.3.1(KW incorrect) /11.7.1/ 11.7.4/ 12.1.4 did not accurately reflect the information relating to the ship at the time of inspection. The incorrect info & particulars were brought to the attention of Master.\n(ii) The vessel designation as recorded as per IOPP certificate was not declared inside the PIQ.', 'The HVPQ uploaded by the Operator on 12 Mar 2025 had errors including:\na) 6.1.1.4- Incorrect distance for coaming of height 260mm.\nb) 9.32.2.1- The vessel has a dehumidifier.\nc) 10.6.2- The vessel was fitted with only 1 bow stopper.']}, {'question_no': '10.6.2', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring / lifting / SPM / ETA', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ uploaded by the Operator on 12 Mar 2025 had errors including:\na) 6.1.1.4- Incorrect distance for coaming of height 260mm.\nb) 9.32.2.1- The vessel has a dehumidifier.\nc) 10.6.2- The vessel was fitted with only 1 bow stopper.', 'The following deficiencies were listed in the ship\'s HVPQ (dated 30 October 2025): Item 1.5.5.1 IWS listed on 2 July 2024 (when SSH was also carried out as per item 1.5.6.1). Item 5.3.2.8 Fuel gas system fitted with fixed CO2 fixed fire fighting system (no Fuel Gas system fitted on this Crude oil/ Product carrier ship). Item 5.3.2.10 Hydraulic room fitted with fixed CO2 fixed fire fighting system (not correct). Item 9.8.13.2 Listed manufacturer of UTI tapes as "Hermetic" (not correct). Item 10.1']}, {'question_no': '10.4.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Review of the uploaded HVPQ dated 14 Apr 2025 indicated the following were not correctly updated. 1. HVPQ Q1.1.8 was not correctly updated to indicate the type of ship as an "Oil Tanker," as specified in the International Oil Pollution Prevention Certificate (IOPPC). 2. HVPQ Q10.4.1 was answered in negative and the question required to ignore the remainder of the section, but Item Q10.4.7 and Q10.5.3 was provided with information which generated a question in CVIQ for emergency towing equipment ', 'HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo']}, {'question_no': '1.4.2', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'General / certificates / PSC / ownership', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following entries were either incorrect or incomplete :- 1.2.4.3, 1.3.1.7 & 8, 1.4.2, 1.5.4.1, 1.5.6, 3.1.6.2, 3.2.1, 3.2.2, 6.1.8, 7.1.1, 9.15.1, 9.15.3.5, 9.16.10, 9.16.29.2, 10.1.7 and 12.1.9.', 'According to attached HVPQ, following items were kept in blank or wrongly entered: 1.3.1.5/1.4.2/1.9.6/10.1.3.2']}, {'question_no': '3.1.6', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Crew / training / operator assessments', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following entries were either incorrect or incomplete :- 1.2.4.3, 1.3.1.7 & 8, 1.4.2, 1.5.4.1, 1.5.6, 3.1.6.2, 3.2.1, 3.2.2, 6.1.8, 7.1.1, 9.15.1, 9.15.3.5, 9.16.10, 9.16.29.2, 10.1.7 and 12.1.9.', 'The HVPQ showed erroneous dates and data as follows:\n1.1.13.4: P&I cover include wreck removal no response\n1.5.5.2: incorrect date\n1.5.6.5: next special date no response\n1.9.8.1: PSC date incorrect\n3.1.6.1: should be yes\n3.1.6.2: should be no\n3.1.10: same as for officers no response needed\n4.1.1: type of navigation equipments not completed\n10.9.1: crane annual test date incorrect\n11.1.13.1: quick closing valves fitted\n11.1.13.2: no response\n11.4.3: no response\n11.10.1: no response\n12.1.1: should']}, {'question_no': '3.2.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Crew / training / operator assessments', 'topic': 'Crew / training / operator assessments', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following entries were either incorrect or incomplete :- 1.2.4.3, 1.3.1.7 & 8, 1.4.2, 1.5.4.1, 1.5.6, 3.1.6.2, 3.2.1, 3.2.2, 6.1.8, 7.1.1, 9.15.1, 9.15.3.5, 9.16.10, 9.16.29.2, 10.1.7 and 12.1.9.', 'HVPQ had some minor errors as follows: (1.1.7/3) Ship\'s email entered was ineffective as senders\' emails may be rejected & not received by vessel. (Only by adding "master." was ship receiving all emails. For information, using email given in HVPQ, Inspector was not able to contact ship for pre-boarding formalities); (3.2.1) Incorrectly entered YES when senior officers in actuality, did not return to same ship on rotational basis; (5.3.1.4) Foam supplied or tested date was entered as 11 November ']}, {'question_no': '9.15.3', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Cargo systems / IGS / venting / pumps', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following entries were either incorrect or incomplete :- 1.2.4.3, 1.3.1.7 & 8, 1.4.2, 1.5.4.1, 1.5.6, 3.1.6.2, 3.2.1, 3.2.2, 6.1.8, 7.1.1, 9.15.1, 9.15.3.5, 9.16.10, 9.16.29.2, 10.1.7 and 12.1.9.', 'Some erroneous or missing information was noted within the HVPQ under the following sections: 5.3.1.4, 9.3.3, 9.3.3.4, 9.15.3.3-4, 9.15.4.4, 10.1.7, 10.8.1.']}, {'question_no': '1.5.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo', 'The following entries were either incomplete or incorrect - 1.5.1, 1.5.12, 6.1.5, 9.6.2, 9.6.6, 9.8.17, 9.15.1, 9.16.11, 9.16.12, 10.9.1, 11.3.4, 11.4.3, 11.5.5.2, 9.10.9.2 to 4.']}, {'question_no': '11.2.2', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Engine room / machinery / generators', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ submitted through the CVIQ was found to be not completed/ wrongly filled/ not answered for the following sections as below: 1.5.1,1.5.5,1.8.7, 4.1.1, 5.3.2, 7.1.6, 9.59.7, 10.2.1, 10.4.1, 10.7.1, 10.8.1, 10.10.7, 11.1.9, 11.2.2, 11.9.3, 12.4.1. For example, 1.5.1 Classification society #2 is Classification society is an IACS member, # does the ship have dual class ? 9.59.7 Compressors # Are they oil free ? There were no responses provided. 4.1.1 Navigational equipment fitted on board? # Glo', 'The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were']}, {'question_no': '1.5.3', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Certificates / class survey dates / endorsements', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['As per HVPQ point 1.4.7 Delivery date as recorder in Form A Q1.5.3 or Form B Q1.8.3 of the IOPPC 13 October 2022.\nAs per IOPPC Form B, point 1.8.3 Date of delivery: 07 October 2022.\nAs per Cargo Ship Safety Construction Certificate. Date of delivery: 13 October 2022.', 'The following discrepancies were found in the HVPQ document:\nItem 1.5.3.1: An error was discovered in the recording of the answer, which was incorrectly marked as NO instead of YES.\nItem 1.5.3.2: Lack of the necessary information.\nItem 1.5.3.3: Lack of the necessary information.\nItem 1.5.5.1: Lack of the necessary information.\nItem 1.5.5.2: Lack of the necessary information.\nItem 1.5.10: Error in recording the date, listed incorrectly 26 March 2024 instead 12 March 2024.\nItem 1.5.12: Lack of the']}, {'question_no': '8.2.3', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo/ballast tank capacity', 'topic': 'Cargo/ballast tank capacity', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6', 'The following discrepancies were found in the HVPQ document:\nItem 1.5.3.1: An error was discovered in the recording of the answer, which was incorrectly marked as NO instead of YES.\nItem 1.5.3.2: Lack of the necessary information.\nItem 1.5.3.3: Lack of the necessary information.\nItem 1.5.5.1: Lack of the necessary information.\nItem 1.5.5.2: Lack of the necessary information.\nItem 1.5.10: Error in recording the date, listed incorrectly 26 March 2024 instead 12 March 2024.\nItem 1.5.12: Lack of the']}, {'question_no': '9.8.14', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Cargo systems / IGS / venting / pumps', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ updated on 04 March 2025 was not accurately completed with respect to following items:\n1.5.9/1.5.10/2.2.1/5.3.2.10/8.2.3.3/9.6.6/9.8.14.3/9.15.1/9.30.6/10.4.2/10.9.1/11.1.6', "Following inaccuracies noted in HVPQ: 4.1.1 Engine order logger was fitted but was recorded as 'No'. 9.8.5 Fixed tank gauging calibration information was incorrect. Calibration was done by the shipyard. 9.8.14 Vapour lock calibration information was incorrect - it was done by the shipyard."]}, {'question_no': '3.3.4', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Crew / training / operator assessments', 'topic': 'Crew training / simulator courses', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The PIQ dated 26 March 2025 was observed not accurately completed with respect to following items:\n3.3.4 ( no evidence that Junior Engineer attended shore based simulator course according IMO 2.07).', 'The HVPQ had incorrect entries for the following sections: 10.9.1 (last annual and 5 yearly tests), 2.2.1 (old edition for publication), 3.3.4, 4.2.2 (survival craft radios not mentioned) & 5.1.1 (ISO mentioned instead of ISM).']}, {'question_no': '5.3.6', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Safety / firefighting / lifeboats', 'topic': 'Safety / firefighting / lifeboats', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The item 5.3.6 reported fixed with the sprinkler system, instead the cargo and bunker sample locker was fitted with a sea water spray fixed system.', 'The item 5.3.6 reported fixed with the sprinkler system, instead the cargo and bunker sample locker was fitted with a sea water spray fixed system.']}, {'question_no': '9.8.8', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ had some minor errors as follows: (1.1.7/3) Ship\'s email entered was ineffective as senders\' emails may be rejected & not received by vessel. (Only by adding "master." was ship receiving all emails. For information, using email given in HVPQ, Inspector was not able to contact ship for pre-boarding formalities); (3.2.1) Incorrectly entered YES when senior officers in actuality, did not return to same ship on rotational basis; (5.3.1.4) Foam supplied or tested date was entered as 11 November ', "The following operator's comments in the HVPQ were not updated or omitted to the question:\na) Not updated: 7.1.3 - Date of last ballast tank inspection.\nb) Omitted to question: 9.8.8 - Bunker tank sounding pipe & 9.8.10 - Bunker tank high level alarm system"]}, {'question_no': '3.5', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Crew / training / operator assessments', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ had some minor errors as follows: (1.1.7/3) Ship\'s email entered was ineffective as senders\' emails may be rejected & not received by vessel. (Only by adding "master." was ship receiving all emails. For information, using email given in HVPQ, Inspector was not able to contact ship for pre-boarding formalities); (3.2.1) Incorrectly entered YES when senior officers in actuality, did not return to same ship on rotational basis; (5.3.1.4) Foam supplied or tested date was entered as 11 November ', 'Below sections of the HVPQ were not correctly updated: 9.5.3 :Cargo pumps were not provided with the external deck mounted heat exchangers. 10.1.7:Mooring ropes no. 3 end for end date was not updated to Jan 2025. 10.9.,1 : Details pertaining to engine overhead crane SWL 3.5 tons, provision crane port side SWL 5 tons and provision crane starboard side SWT 2.5 tons were not updated.']}, {'question_no': '10.6.6', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring / lifting / SPM / ETA', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ submitted through the CVIQ was found to be not completed/wrongly filled/ not answered for the following sections as\nbelow: 1.5.5, 1.5.19, 1.8.1, 1.9.8, 2.2.1, 3.1.9, 4.1.1, 4.2.2, 10.1.3, 10.4.2, 10.6.3, 10.6.6, 10.6.7, 10.7.1, 10.8.1, 10.8.2-10.8.4, 11.1.8,\n11.1.9, 11.1.13, 11.2.2, 11.3.1, 11.3.4, 11.9.1, 12.1.7, 12.1.8, 12.1.14, 12.2.4, 12.4.1. For example: 1.9.8 Port State Control # 1 Date of\nlast Port State Control inspection and # 2 Port of last Port State Control inspection - were', 'The following items were inaccurately declared: 1-9.16.5 Are fixed O2 alarms fitted in inert gas generating or storage spaces? : Yes, actually not fitted; 2-10.6.6 What is the distance between the bow fairlead and stopper/bracket? : 3200.00 Mtrs, actual 3.20 Mtrs.']}, {'question_no': '6.2.2', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Pollution prevention', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Noted following HVPQ item were wrongly marked: Item 1.5.18 - Yes, but the vessel currently did not have any Class dispensation. Item 6.1.7&8 - Yes, but Cargo sea chest was not fitted onboard. Therefore invalid question 6.2.2 generated.', "On HVPQ, several items were recorded with inaccurate information: \n- The HVPQ declared a No to the item 1.9.5, however the vessel had three reported incidents on record in the previous 12 months. \n- The HVPQ declared a Yes to the items 6.2.1, 6.2.2 & 6.2.3, but the vessel didn't hold a valid USCG VRP Approval Letter or COFR. \n- The HVPQ declared a Yes to the item 9.7.3, actually all manifold valves were manual. \n- The safe working load (SWL) of each provision crane and engine room crane was ente"]}, {'question_no': '10.8', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Mooring / lifting / SPM / ETA', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Question no. 4.1.1, 10.1.3.2, 10.1.6, 10.2.1, 10.8, 10.10.6, 10.10.7 & 11.3 were incomplete or blank.', 'The following errors were noted in HVPQ uploaded on SIRE. - 3. 1. 1 - Minimum officers required as \nper MSMD were 6. - 9. 16. 10. 1 I 2 - Details not provided. - 9. 17. 1 - The cargo pump details of slop wing tanks were not recorded. - 9.30.1- Vessel was assigned IMO Type 2 I 3 chemical tanker notation. - 9.31. 10-IGS composition details not completed. - 10.1.4- The mooring winches were \nfitted with split drums. - 10.8. 1 - Manifold arrangement diagram not completed. - 10. 9. 1 - Last periodical']}, {'question_no': '11.3', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Question no. 4.1.1, 10.1.3.2, 10.1.6, 10.2.1, 10.8, 10.10.6, 10.10.7 & 11.3 were incomplete or blank.', 'The following errors were noted in HVPQ uploaded on SIRE. - 3. 1. 1 - Minimum officers required as \nper MSMD were 6. - 9. 16. 10. 1 I 2 - Details not provided. - 9. 17. 1 - The cargo pump details of slop wing tanks were not recorded. - 9.30.1- Vessel was assigned IMO Type 2 I 3 chemical tanker notation. - 9.31. 10-IGS composition details not completed. - 10.1.4- The mooring winches were \nfitted with split drums. - 10.8. 1 - Manifold arrangement diagram not completed. - 10. 9. 1 - Last periodical']}, {'question_no': '1.6.13', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol', 'Missing information in the following: 1.6.13/1.6.14/ 1.6.15/1.6.17/1.6.18/ 1.6.19/ 1.6.21/1.6.22/1.6.23/1.6.24. Question 11.1.7 no information provided reference another type of fuel used for propulsion. Question 10.9.1 Engine room crane on board is electrical type and reported like Hydraulic type.']}, {'question_no': '1.6.17', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol', 'Missing information in the following: 1.6.13/1.6.14/ 1.6.15/1.6.17/1.6.18/ 1.6.19/ 1.6.21/1.6.22/1.6.23/1.6.24. Question 11.1.7 no information provided reference another type of fuel used for propulsion. Question 10.9.1 Engine room crane on board is electrical type and reported like Hydraulic type.']}, {'question_no': '1.6.19', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol', 'Missing information in the following: 1.6.13/1.6.14/ 1.6.15/1.6.17/1.6.18/ 1.6.19/ 1.6.21/1.6.22/1.6.23/1.6.24. Question 11.1.7 no information provided reference another type of fuel used for propulsion. Question 10.9.1 Engine room crane on board is electrical type and reported like Hydraulic type.']}, {'question_no': '1.6.21', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The following items of the HVPQ dated 30 November 2024 were not updated : 1.3.1.5 (IMO of Owner); 1.3.1.10(Date when registered); 1.5.10(Date of last thickness measurements); 1.6.13-15, 1.6.17-1.6.19, 1.6.21-25, 1.6.28 (Distances and parallel body); 4.2.2(Communication equipment on board);9.16.18, 9.16.21 (Type of the deck seal and non-return valve);9.17.1 (Details of cargo pump); 10.1.8(Retirement policy); 10.2.2-3 (Details of bollards and fairleads); 10.4.2 ( Details of ETA); 10.8.1-4 (Manifol', 'Missing information in the following: 1.6.13/1.6.14/ 1.6.15/1.6.17/1.6.18/ 1.6.19/ 1.6.21/1.6.22/1.6.23/1.6.24. Question 11.1.7 no information provided reference another type of fuel used for propulsion. Question 10.9.1 Engine room crane on board is electrical type and reported like Hydraulic type.']}, {'question_no': '9.15.4', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Cargo systems / IGS / venting / pumps', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['On the uploaded HVPQ dated 4 March 2025, some entries were either missing or not correctly answered: - Items 9.15.4, 10.1.3.2, 10.2.1, 10.5.4, 10.7.1, 10.8.1 & 11.10 had blank responses. - In item 7.1.1, the frequency of inspection for cargo tanks was recorded as 30 months instead of every 12 months.', 'Some erroneous or missing information was noted within the HVPQ under the following sections: 5.3.1.4, 9.3.3, 9.3.3.4, 9.15.3.3-4, 9.15.4.4, 10.1.7, 10.8.1.']}, {'question_no': '1.9.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'General / certificates / PSC / ownership', 'topic': 'Tank coating / structural inspection dates and frequency', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Vessel had suffered contact (collision) incident with another vessel at Tanjung Pelepas on 01 July 2025. Vessel had further carried out repairs using shore fitters inside steering gear room, Fields 1.9.2 and 1.9.3 in HVPQ for unscheduled repairs and collision incident respectively were mentioned as “ No”. Field 1.9.1 which should have been mentioned as “ No” was reported as”Yes”.', 'Question 1.9.1 of the online HVPQ did not include unscheduled repairs carried out in June 2024.\nQuestion 7.1.1 in the HVPQ had cargo tank inspection dates from 2023 and not the latest tank inspections carried out on October\n24.\nQuestion 7.1.3 did not contain the latest tank inspection reports carried out over various dates towards the end of 2024.']}, {'question_no': '6.60', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Pollution prevention', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['PROCESS - The following was noted not updated accurately as per the HVPQ dated 26-Nov-2024: a) 2.2.1 - The edition numbers for the publications were not provided as required. b) 6.1.14 - The bunker pipeline annual pressure test was incorrectly stated as 6.60 bars instead of 4.40 bars. c) 7.1.3 - The FPT, 1W and 3W ballast tanks annual inspection dates were not updated and indicated as overdue instead. d) 10.1.3.2 - The diagram for the mooring winch layout was not provided. e) 10.7.1 - The bow mo', 'The HVPQ was last updated by the operator on 27th March 2025 and the followings were noted - Items 6.1.14: The bunker pipeline annual pressure test was incorrectly stated as 6.60 bars, instead of 4.40 bars. - Item 10.1.3.1: The diagram for the mooring winch layout was not provided. Item 12.1.8 - details for the bollards, chock, rollers and fairleads used for the STS operation indicated that the winches / capstan driven by the electric power, instead of hydraulic power.']}, {'question_no': '4.40', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Navigation and communication', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['PROCESS - The following was noted not updated accurately as per the HVPQ dated 26-Nov-2024: a) 2.2.1 - The edition numbers for the publications were not provided as required. b) 6.1.14 - The bunker pipeline annual pressure test was incorrectly stated as 6.60 bars instead of 4.40 bars. c) 7.1.3 - The FPT, 1W and 3W ballast tanks annual inspection dates were not updated and indicated as overdue instead. d) 10.1.3.2 - The diagram for the mooring winch layout was not provided. e) 10.7.1 - The bow mo', 'The HVPQ was last updated by the operator on 27th March 2025 and the followings were noted - Items 6.1.14: The bunker pipeline annual pressure test was incorrectly stated as 6.60 bars, instead of 4.40 bars. - Item 10.1.3.1: The diagram for the mooring winch layout was not provided. Item 12.1.8 - details for the bollards, chock, rollers and fairleads used for the STS operation indicated that the winches / capstan driven by the electric power, instead of hydraulic power.']}, {'question_no': '5.1.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Safety / firefighting / lifeboats', 'topic': 'Safety / firefighting / lifeboats', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ["Inaccurate information found in HVPQ para 10.9.1 regarding last cargo gear annual survey (24 January 2025), para 5.1.1.4\nregarding approval of the ship's quality management (17 July 2022) and para 1.5.19 regarding flag dispensation which is not\nexisting", 'The HVPQ had incorrect entries for the following sections: 10.9.1 (last annual and 5 yearly tests), 2.2.1 (old edition for publication), 3.3.4, 4.2.2 (survival craft radios not mentioned) & 5.1.1 (ISO mentioned instead of ISM).']}, {'question_no': '9.3.7', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'PSC inspection / detention / deficiency declaration', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['On the uploaded HVPQ the following items were not correct: 1.8.6 (LL #6 -33497 MT), 1.8.7 (Active DW was 39996 MT), 1.9.8.2 (Last PSC was at Dumaguete, Philippines), 6.1.14.2 (Bunker lines tested to 7.0 Bar), 9.3.7 (Total capacity of cargo tanks value was not correct), 10.1.4 (Vessel was provided with split drums).', 'Some missing or erroneous information was noted within the HVPQ under the following sections: 8.2.1, 9.3.3-4, 9.3.7, 9.6.2, 9.10.10, 9.11.4, 9.15.1, 9.17.1, 9.35.3, 10.1.4, 10.8.1, 12.1.8.']}, {'question_no': '9.16.1', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Mooring brake test date / brake holding capacity', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['The HVPQ uploaded on 23 January 2026 indicated wrong or not updated information on; 9.16.1 Inert gas system. 10.9.1 Annual examination of the lifting equipment.', 'Erroneous entries on HVPQ 9.16.1 (IGS); 10.1.4 (Brake rendering load); 10.4.2 (Emergency towing equipment SWL).']}, {'question_no': '9.3.3', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Cargo systems / IGS / venting / pumps', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Some missing or erroneous information was noted within the HVPQ under the following sections: 8.2.1, 9.3.3-4, 9.3.7, 9.6.2, 9.10.10, 9.11.4, 9.15.1, 9.17.1, 9.35.3, 10.1.4, 10.8.1, 12.1.8.', 'Some erroneous or missing information was noted within the HVPQ under the following sections: 5.3.1.4, 9.3.3, 9.3.3.4, 9.15.3.3-4, 9.15.4.4, 10.1.7, 10.8.1.']}, {'question_no': '9.35.3', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Mooring line / wire / tail installation age', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['Some missing or erroneous information was noted within the HVPQ under the following sections: 8.2.1, 9.3.3-4, 9.3.7, 9.6.2, 9.10.10, 9.11.4, 9.15.1, 9.17.1, 9.35.3, 10.1.4, 10.8.1, 12.1.8.', 'The uploaded HVPQ had the following discrepancies: 1. 5.4 and 1. 5. 5 last IWS was on 29th January 2024 and the last dry dock on 6th February 2024 just a week after 1.8.1 summer, winter and tropical details for free board, draft, dead weight and displacement were all stated as same 9.16.5 fixed 02 alarms in IG spaces stated yes 9.35.3 capacity of tank cleaning machine not stated .']}, {'question_no': '9.8.5', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Cargo systems / IGS / venting / pumps', 'topic': 'Cargo systems / IGS / venting / pumps', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ question 1.3.3.4/1.3.3.5/1.3.3.6/1.3.3.7 Comercial operator information missing. Question 1.5.18 Dispensation of flag state in effect answered YES. 1.5.19 no information regarding the flag state dispensation Question 7.1.3 Ballast tanks coated answer NO instead of YES. Question 9.8.3 answer YES no local readouts sighted. Question 9.8.5 does not provide the name of the inspection company related to question 9.8.4. Question 10.2.1 No diagram layout for mooring fairleads, chocks and bitts disp', "Following inaccuracies noted in HVPQ: 4.1.1 Engine order logger was fitted but was recorded as 'No'. 9.8.5 Fixed tank gauging calibration information was incorrect. Calibration was done by the shipyard. 9.8.14 Vapour lock calibration information was incorrect - it was done by the shipyard."]}, {'question_no': '11.1.7', 'repeat_count': 2, 'priority': 'LOW_REPEAT', 'category': 'Engine room / machinery / generators', 'topic': 'Lifting appliances annual and five-year tests', 'machine_check_intent': 'Use as repeat-observation priority signal only. Do not create a defect unless actual extracted HVPQ/PIQ/Q88/Class data is missing, stale, contradictory, or illogical.', 'compare_scope': ['HVPQ', 'PIQ', 'Q88', 'CLASS'], 'evidence_examples': ['HVPQ question 1.3.3.4/1.3.3.5/1.3.3.6/1.3.3.7 Comercial operator information missing. Question 1.5.18 Dispensation of flag state in effect answered YES. 1.5.19 no information regarding the flag state dispensation Question 7.1.3 Ballast tanks coated answer NO instead of YES. Question 9.8.3 answer YES no local readouts sighted. Question 9.8.5 does not provide the name of the inspection company related to question 9.8.4. Question 10.2.1 No diagram layout for mooring fairleads, chocks and bitts disp', 'Missing information in the following: 1.6.13/1.6.14/ 1.6.15/1.6.17/1.6.18/ 1.6.19/ 1.6.21/1.6.22/1.6.23/1.6.24. Question 11.1.7 no information provided reference another type of fuel used for propulsion. Question 10.9.1 Engine room crane on board is electrical type and reported like Hydraulic type.']}], 'validation_rules': [{'rule_id': 'HVPQ-BLANK-001', 'source_scope': ['HVPQ'], 'question_refs': ['ALL'], 'category': 'Completeness', 'rule_type': 'blank_check', 'severity': 'MEDIUM', 'statement': 'No applicable HVPQ question should be blank.', 'machine_logic': 'Flag blank/NA unless parent response is No/not applicable or section is explicitly exempt.', 'evidence_required': 'Question text, parent answer, extracted answer.', 'action_if_fail': 'Update missing HVPQ response or mark as N/A with valid parent logic.', 'skip_when': ['Section 13 combination carriers', 'Section 9.6 LNG bunkers', 'chemical-only sections for pure oil ship']}, {'rule_id': 'HVPQ-CERT-001', 'source_scope': ['HVPQ', 'CLASS'], 'question_refs': ['2.1.5', '1.5.11', '1.5.12'], 'category': 'Certificates', 'rule_type': 'date_validity', 'severity': 'HIGH', 'statement': 'No certificate should be expired.', 'machine_logic': 'For each certificate expiry date, fail if expiry < reference date.', 'evidence_required': 'Certificate name, issue date, annual/intermediate endorsement, expiry.', 'action_if_fail': 'Renew certificate or correct HVPQ/Class entry.', 'skip_when': []}, {'rule_id': 'HVPQ-CERT-002', 'source_scope': ['HVPQ', 'CLASS'], 'question_refs': ['2.1.5', '1.5.11'], 'category': 'Certificates', 'rule_type': 'endorsement_interval', 'severity': 'HIGH', 'statement': 'Certificates issued more than 1 year ago require annual endorsement within 12 months and alignment with 1.5.11.', 'machine_logic': 'If issue_date + 12 months < reference_date, latest annual endorsement must be within 12 months and match HVPQ 1.5.11 where applicable.', 'evidence_required': 'Issue date, latest annual endorsement, HVPQ 1.5.11.', 'action_if_fail': 'Correct endorsement date or update HVPQ annual survey response.', 'skip_when': []}, {'rule_id': 'HVPQ-CERT-003', 'source_scope': ['HVPQ', 'CLASS'], 'question_refs': ['2.1.5', '1.5.12'], 'category': 'Certificates', 'rule_type': 'endorsement_interval', 'severity': 'HIGH', 'statement': 'Certificates issued more than 2.5 years ago require intermediate endorsement within 30 months and alignment with 1.5.12.', 'machine_logic': 'If issue_date + 30 months < reference_date, latest intermediate endorsement must be within 30 months and match HVPQ 1.5.12 where applicable.', 'evidence_required': 'Issue date, intermediate endorsement, HVPQ 1.5.12.', 'action_if_fail': 'Correct endorsement date or update HVPQ intermediate survey response.', 'skip_when': []}, {'rule_id': 'HVPQ-INS-001', 'source_scope': ['HVPQ'], 'question_refs': ['1.1.13.4'], 'category': 'Insurance', 'rule_type': 'expected_boolean', 'severity': 'HIGH', 'statement': 'P&I wreck removal cover must be Yes.', 'machine_logic': 'Normalize response; pass only if Yes.', 'evidence_required': 'HVPQ 1.1.13.4 answer and P&I evidence.', 'action_if_fail': 'Correct declaration or obtain P&I evidence.', 'skip_when': []}, {'rule_id': 'HVPQ-CAP-001', 'source_scope': ['HVPQ'], 'question_refs': ['1.4.7', '1.5.19'], 'category': 'Class / CAP', 'rule_type': 'conditional_required', 'severity': 'HIGH', 'statement': 'If vessel age is above 15 years, CAP rating is applicable and should be 1.', 'machine_logic': 'Compute age from delivery/build date; if >15 years, CAP response must exist and rating must equal 1.', 'evidence_required': 'Delivery/build date, CAP applicability, CAP rating.', 'action_if_fail': 'Update CAP declaration/rating or provide justification.', 'skip_when': []}, {'rule_id': 'HVPQ-CLASS-001', 'source_scope': ['HVPQ'], 'question_refs': ['1.5.1.2'], 'category': 'Class', 'rule_type': 'expected_boolean', 'severity': 'HIGH', 'statement': 'Class society IACS member response must be Yes.', 'machine_logic': 'Normalize response; pass only if Yes.', 'evidence_required': 'HVPQ 1.5.1.2 answer.', 'action_if_fail': 'Correct IACS response or class details.', 'skip_when': []}, {'rule_id': 'HVPQ-DD-001', 'source_scope': ['HVPQ', 'CLASS'], 'question_refs': ['1.5.4.1', '1.5.6.1'], 'category': 'Dry dock / survey', 'rule_type': 'date_alignment', 'severity': 'HIGH', 'statement': 'Last dry dock should not be older than 5 years and must match last special/dry dock response where applicable.', 'machine_logic': 'Fail if last dry dock date + 5 years < reference date; compare HVPQ 1.5.4.1 with 1.5.6.1/Class status date.', 'evidence_required': 'Last dry dock date, special survey date, Class status.', 'action_if_fail': 'Correct HVPQ/Class data or verify survey evidence.', 'skip_when': []}, {'rule_id': 'HVPQ-INC-001', 'source_scope': ['HVPQ'], 'question_refs': ['1.9.1', '1.9.2'], 'category': 'Incidents', 'rule_type': 'conditional_consistency', 'severity': 'MEDIUM', 'statement': 'If 1.9.1 is No, 1.9.2 cannot also be No/blank where follow-up details are required.', 'machine_logic': 'Check parent/child incident logic; blank/no contradiction must be flagged for manual review.', 'evidence_required': 'HVPQ 1.9.1 and 1.9.2.', 'action_if_fail': 'Clarify incident declaration logic.', 'skip_when': []}, {'rule_id': 'HVPQ-CREW-001', 'source_scope': ['HVPQ'], 'question_refs': ['3.2.1'], 'category': 'Crew / operator assessment', 'rule_type': 'expected_boolean', 'severity': 'MEDIUM', 'statement': 'Response for 3.2.1 should be No.', 'machine_logic': 'Normalize response; pass only if No.', 'evidence_required': 'HVPQ 3.2.1 answer.', 'action_if_fail': 'Correct answer or provide justification.', 'skip_when': []}, {'rule_id': 'HVPQ-TRAIN-001', 'source_scope': ['HVPQ', 'PIQ'], 'question_refs': ['3.3.4', 'PIQ 3.3.1', 'PIQ 3.3.3', 'PIQ 3.3.4'], 'category': 'Training', 'rule_type': 'keyword_presence', 'severity': 'MEDIUM', 'statement': 'HVPQ 3.3.4 courses should include ERM simulator, cargo simulator, and ship handling type courses and align with PIQ training entries.', 'machine_logic': 'Extract course text; require concepts engine-room resource management/simulator, cargo simulator, ship handling; compare with PIQ courses.', 'evidence_required': 'Course names in HVPQ and PIQ.', 'action_if_fail': 'Update course list or clarify equivalence.', 'skip_when': []}, {'rule_id': 'HVPQ-FIRE-001', 'source_scope': ['HVPQ'], 'question_refs': ['5.3.1.4'], 'category': 'Safety / firefighting', 'rule_type': 'date_validity', 'severity': 'MEDIUM', 'statement': '5.3.1.4 date should not be older than 12 months.', 'machine_logic': 'Fail if date + 12 months < reference date.', 'evidence_required': 'HVPQ 5.3.1.4 date.', 'action_if_fail': 'Update date/evidence.', 'skip_when': []}, {'rule_id': 'HVPQ-TANK-001', 'source_scope': ['HVPQ', 'PIQ'], 'question_refs': ['7.1.1', 'PIQ 2.3.3001'], 'category': 'Tank coating / cargo tanks', 'rule_type': 'date_frequency', 'severity': 'HIGH', 'statement': 'Cargo/slop tank coating inspection dates by ship staff must be within stated frequency and align with PIQ 2.3.3001.', 'machine_logic': 'Read table last inspection date column, not original coating date. Oldest last inspection + frequency months must be >= reference date. Compare PIQ oldest/frequency.', 'evidence_required': 'Frequency, all last inspection dates, oldest inspection date.', 'action_if_fail': 'Update actual coating inspection dates/frequency.', 'skip_when': []}, {'rule_id': 'HVPQ-TANK-002', 'source_scope': ['HVPQ', 'PIQ'], 'question_refs': ['7.1.3', 'PIQ 2.3.3002'], 'category': 'Tank coating / ballast tanks', 'rule_type': 'date_frequency', 'severity': 'HIGH', 'statement': 'Ballast tank coating inspections by competent person must be within stated frequency and align with PIQ 2.3.3002.', 'machine_logic': 'Read table last inspection date column, not coating application date. Oldest last inspection + frequency months must be >= reference date.', 'evidence_required': 'Frequency, all last inspection dates, oldest inspection date.', 'action_if_fail': 'Update actual coating inspection dates/frequency.', 'skip_when': []}, {'rule_id': 'HVPQ-TANK-003', 'source_scope': ['HVPQ'], 'question_refs': ['7.1.4.5'], 'category': 'Tank coating', 'rule_type': 'numeric_unit', 'severity': 'MEDIUM', 'statement': '7.1.4.5 response should be greater than zero and expressed in percent.', 'machine_logic': 'Parse numeric value and unit; fail if value <=0 or no % unit/percentage context.', 'evidence_required': 'HVPQ 7.1.4.5.', 'action_if_fail': 'Correct percentage value.', 'skip_when': []}, {'rule_id': 'HVPQ-PUMP-001', 'source_scope': ['HVPQ', 'Q88'], 'question_refs': ['1.6.1', '9.6.2', '9.17.1'], 'category': 'Cargo pumps', 'rule_type': 'conditional_value', 'severity': 'MEDIUM', 'statement': 'If cargo tank capacity/parameter in 1.6.1 is greater than 200, pump type should be Centrifugal; otherwise Deepwell.', 'machine_logic': 'Parse 1.6.1 numeric and pump type. If >200 require Centrifugal; else require Deepwell. Cross-check Q88 pump type.', 'evidence_required': 'HVPQ 1.6.1, HVPQ 9.6.2/9.17.1, Q88 pump table.', 'action_if_fail': 'Correct pump type or verify mapping.', 'skip_when': []}, {'rule_id': 'HVPQ-MOOR-001', 'source_scope': ['HVPQ', 'Q88'], 'question_refs': ['10.1.4'], 'category': 'Mooring', 'rule_type': 'date_frequency', 'severity': 'HIGH', 'statement': 'Date of last brake holding capacity test must be within brake test frequency.', 'machine_logic': 'Extract brake test date and frequency; fail if last test + frequency < reference date.', 'evidence_required': 'HVPQ/Q88 brake test date and frequency.', 'action_if_fail': 'Update brake test date or conduct test.', 'skip_when': []}, {'rule_id': 'HVPQ-MOOR-002', 'source_scope': ['HVPQ', 'Q88'], 'question_refs': ['10.1.7'], 'category': 'Mooring', 'rule_type': 'age_limit', 'severity': 'HIGH', 'statement': 'Wire, tails and ropes must be within allowed age: wire 10 years, tails 18 months, ropes 5 years.', 'machine_logic': 'For each mooring line row, parse type and installed date; fail if age exceeds type limit.', 'evidence_required': 'Line type and installed date for each wire/tail/rope.', 'action_if_fail': 'Replace overdue line or correct date/type.', 'skip_when': []}, {'rule_id': 'HVPQ-LIFT-001', 'source_scope': ['HVPQ', 'Q88'], 'question_refs': ['10.9.1'], 'category': 'Lifting appliances', 'rule_type': 'date_frequency', 'severity': 'HIGH', 'statement': 'Last annual and five-year lifting appliance tests must not be expired.', 'machine_logic': 'Annual test <=12 months; five-year test <=60 months from reference date.', 'evidence_required': 'Annual test date, 5-year test date.', 'action_if_fail': 'Update test details or arrange test.', 'skip_when': []}, {'rule_id': 'PIQ-TYPE-001', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 1.1.1', 'HVPQ 2.1.4', 'HVPQ 1.1.8'], 'category': 'Vessel type', 'rule_type': 'cross_document_match', 'severity': 'MEDIUM', 'statement': 'PIQ vessel type must match HVPQ vessel type.', 'machine_logic': 'Normalize vessel type categories and compare.', 'evidence_required': 'PIQ 1.1.1, HVPQ vessel type.', 'action_if_fail': 'Correct one document or justify terminology difference.', 'skip_when': []}, {'rule_id': 'PIQ-NAV-001', 'source_scope': ['PIQ'], 'question_refs': ['PIQ 3.2.1', 'PIQ 3.2.2'], 'category': 'Navigation assessment', 'rule_type': 'mutual_exclusive_boolean', 'severity': 'MEDIUM', 'statement': 'Static and dynamic navigational assessments cannot both be Yes or both be No; responses must be opposite.', 'machine_logic': 'Normalize both answers; fail if equal or blank.', 'evidence_required': 'PIQ 3.2.1 and 3.2.2.', 'action_if_fail': 'Correct assessment type declaration.', 'skip_when': []}, {'rule_id': 'PIQ-NAV-002', 'source_scope': ['PIQ'], 'question_refs': ['PIQ 3.2.1', 'PIQ 3.2.2'], 'category': 'Navigation assessment', 'rule_type': 'date_validity', 'severity': 'HIGH', 'statement': 'Last navigational assessment date must not be older than 12 months.', 'machine_logic': 'Use whichever assessment is marked Yes; latest date + 12 months must be >= reference date.', 'evidence_required': 'Assessment type, date.', 'action_if_fail': 'Update assessment date/evidence.', 'skip_when': []}, {'rule_id': 'PIQ-AUDIT-001', 'source_scope': ['PIQ'], 'question_refs': ['PIQ 3.5', 'PIQ 3.6', 'PIQ 3.7'], 'category': 'Audits', 'rule_type': 'conditional_date_validity', 'severity': 'MEDIUM', 'statement': 'If Chapter 3.5, 3.6 or 3.7 is marked Yes, last audit date must not be older than 12 months.', 'machine_logic': 'For each Yes audit, parse date; fail if date +12 months < reference date.', 'evidence_required': 'Audit answer and date.', 'action_if_fail': 'Update audit evidence.', 'skip_when': []}, {'rule_id': 'PIQ-MAST-001', 'source_scope': ['PIQ'], 'question_refs': ['PIQ 3.4.2001', 'PIQ 3.4.2002'], 'category': 'Master review / office assessment', 'rule_type': 'date_validity', 'severity': 'MEDIUM', 'statement': 'PIQ 3.4.2001 date must be within 12 months and 3.4.2002 within 3 months.', 'machine_logic': 'Fail if 3.4.2001 +12 months or 3.4.2002 +3 months is before reference date.', 'evidence_required': 'PIQ dates.', 'action_if_fail': 'Update/revalidate dates.', 'skip_when': []}, {'rule_id': 'PIQ-FIRE-001', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 5.2.4', 'HVPQ 5.3.2.4'], 'category': 'Safety / firefighting', 'rule_type': 'cross_document_match', 'severity': 'MEDIUM', 'statement': 'PIQ 5.2.4 must match HVPQ 5.3.2 sub question 4.', 'machine_logic': 'Normalize and compare answers.', 'evidence_required': 'PIQ and HVPQ relevant answers.', 'action_if_fail': 'Correct mismatch.', 'skip_when': []}, {'rule_id': 'PIQ-INC-001', 'source_scope': ['PIQ', 'HVPQ', 'CLASS'], 'question_refs': ['PIQ 5.7.1001-1029', 'HVPQ 1.9.1-1.9.7', 'PIQ 2.1.1'], 'category': 'Incidents / damage survey', 'rule_type': 'cross_document_alignment', 'severity': 'HIGH', 'statement': 'PIQ incident declarations must align with HVPQ incident responses, and damage/other/occasional Class visit purpose may imply damage/repair verification.', 'machine_logic': 'Compare PIQ incident yes/no matrix with HVPQ 1.9.1-1.9.7. If Class visit purpose includes damage/other/occasional, require incident/repair explanation.', 'evidence_required': 'PIQ incident matrix, HVPQ incidents, Class/PIQ survey purpose.', 'action_if_fail': 'Correct declarations or add explanation.', 'skip_when': []}, {'rule_id': 'PIQ-PSC-001', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 2.8', 'HVPQ 1.9.8', 'HVPQ 1.9.9'], 'category': 'PSC', 'rule_type': 'cross_document_alignment', 'severity': 'HIGH', 'statement': 'PIQ PSC information must align with HVPQ PSC responses.', 'machine_logic': 'Compare last PSC date/port/detention/deficiency data.', 'evidence_required': 'PIQ Chapter 2.8 and HVPQ 1.9.8/1.9.9.', 'action_if_fail': 'Update PSC records.', 'skip_when': []}, {'rule_id': 'PIQ-VEC-001', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 8.3', 'HVPQ 9.9', 'HVPQ 9.10'], 'category': 'VEC / venting', 'rule_type': 'cross_document_alignment', 'severity': 'MEDIUM', 'statement': 'PIQ Section 8.3 responses must align with HVPQ vapor emission control and venting sections.', 'machine_logic': 'Map VEC/venting fitted/operational/arrangement answers and compare.', 'evidence_required': 'PIQ 8.3, HVPQ 9.9/9.10.', 'action_if_fail': 'Correct inconsistent VEC/venting declarations.', 'skip_when': []}, {'rule_id': 'PIQ-GEN-001', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 10.2.1', 'HVPQ 11.3.3'], 'category': 'Machinery / generators', 'rule_type': 'cross_document_match', 'severity': 'MEDIUM', 'statement': 'PIQ 10.2.1 must match HVPQ 11.3.3.', 'machine_logic': 'Normalize and compare answer/value.', 'evidence_required': 'PIQ 10.2.1 and HVPQ 11.3.3.', 'action_if_fail': 'Correct mismatch.', 'skip_when': []}, {'rule_id': 'PIQ-ENG-001', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 10.2.3', 'HVPQ 11.9.1'], 'category': 'Machinery / alarms / safety', 'rule_type': 'cross_document_match', 'severity': 'MEDIUM', 'statement': 'PIQ 10.2.3 must match HVPQ 11.9.1.', 'machine_logic': 'Normalize and compare answer/value.', 'evidence_required': 'PIQ 10.2.3 and HVPQ 11.9.1.', 'action_if_fail': 'Correct mismatch.', 'skip_when': []}, {'rule_id': 'PIQ-SUPT-001', 'source_scope': ['PIQ'], 'question_refs': ['PIQ 2.2.1001'], 'category': 'Management oversight', 'rule_type': 'strict_interval', 'severity': 'HIGH', 'statement': 'Technical Superintendent visit must be within 7 months and successive visit gaps must not exceed 7.0 months.', 'machine_logic': 'Sort visit date ranges; latest visit end/date must be <=7.0 months old and every successive gap <=7.0 months. Strict no tolerance.', 'evidence_required': 'PIQ 2.2.1001 visit table dates.', 'action_if_fail': 'Arrange/update inspection or explain non-compliance.', 'skip_when': []}, {'rule_id': 'PIQ-SUPT-002', 'source_scope': ['PIQ'], 'question_refs': ['PIQ 2.2.1002'], 'category': 'Management oversight', 'rule_type': 'strict_interval', 'severity': 'HIGH', 'statement': 'Marine Superintendent visit must be within 12 months and successive visit gaps must not exceed 12.0 months.', 'machine_logic': 'Sort visit date ranges; latest visit end/date must be <=12.0 months old and every successive gap <=12.0 months. Strict no tolerance.', 'evidence_required': 'PIQ 2.2.1002 visit table dates.', 'action_if_fail': 'Arrange/update inspection or explain non-compliance.', 'skip_when': []}, {'rule_id': 'PIQ-TANK-001', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 2.3.3001', 'HVPQ 7.1.1'], 'category': 'Structural assessment', 'rule_type': 'date_frequency_alignment', 'severity': 'HIGH', 'statement': 'PIQ cargo/slop tank inspection frequency and oldest date must align with HVPQ 7.1.1.', 'machine_logic': 'Compare PIQ required frequency and oldest inspection date against HVPQ tank coating last inspection dates and frequency.', 'evidence_required': 'PIQ 2.3.3001 and HVPQ 7.1.1 table.', 'action_if_fail': 'Correct stale/mismatched tank inspection data.', 'skip_when': []}, {'rule_id': 'PIQ-TANK-002', 'source_scope': ['PIQ', 'HVPQ'], 'question_refs': ['PIQ 2.3.3002', 'HVPQ 7.1.3'], 'category': 'Structural assessment', 'rule_type': 'date_frequency_alignment', 'severity': 'HIGH', 'statement': 'PIQ ballast tank inspection frequency and oldest date must align with HVPQ 7.1.3.', 'machine_logic': 'Compare PIQ required frequency and oldest inspection date against HVPQ tank coating last inspection dates and frequency.', 'evidence_required': 'PIQ 2.3.3002 and HVPQ 7.1.3 table.', 'action_if_fail': 'Correct stale/mismatched ballast tank inspection data.', 'skip_when': []}]}
 
 
+# v20 rule corrections and additions. These are applied after loading the
+# historical v18 knowledge base so older deployments remain readable while the
+# active app exposes the current decision logic.
+for _rule in EMBEDDED_KNOWLEDGE_BASE.get("validation_rules", []):
+    if _rule.get("rule_id") == "PIQ-NAV-001":
+        _rule.update({
+            "statement": "If both static and dynamic navigational assessment responses are No, verify applicability and assessment coverage; both Yes is not an automatic contradiction.",
+            "machine_logic": "Do not fail when both are Yes. If both are No or either is blank, create a verification item only.",
+            "severity": "MEDIUM",
+            "action_if_fail": "Confirm assessment applicability, type, date and evidence.",
+        })
+    elif _rule.get("rule_id") == "HVPQ-MOOR-002":
+        _rule.update({
+            "rule_type": "retirement_criteria_check",
+            "statement": "Line and tail service/retirement life must be checked against the applicable LMP/MSMP, manufacturer, certificates and company criteria; installation date alone does not establish a universal limit.",
+            "machine_logic": "Extract type, installation/service date, material and strength. Flag a discrepancy only when the uploaded evidence contains the applicable criterion and shows it is breached; otherwise create a verification item.",
+            "evidence_required": "Line/tail identity, certificate, inspection history and documented retirement criterion.",
+            "action_if_fail": "Verify every line/tail against the documented retirement criteria; replace or correct records only when a breach is supported.",
+        })
+
+EMBEDDED_KNOWLEDGE_BASE["schema_version"] = "2026-09-18.v20"
+EMBEDDED_KNOWLEDGE_BASE["description"] = "Evidence-led DocuSure rule base. Observation history prioritises review; only supported contradictions or explicit rule breaches become discrepancies, while extraction gaps remain Not verified."
+
+ENHANCED_VALIDATION_RULES = [
+    {"rule_id":"DOC-CLASS-001","source_scope":["ALL"],"question_refs":["UPLOAD"],"category":"Document recognition","rule_type":"classification_confidence","severity":"HIGH","statement":"Each uploaded document must be classified with adequate evidence before its values drive a finding.","machine_logic":"Low-confidence or unknown documents are excluded from deterministic conclusions.","evidence_required":"Filename, text signatures and extraction quality.","action_if_fail":"Confirm document type or provide a searchable copy.","skip_when":[]},
+    {"rule_id":"DOC-ID-001","source_scope":["ALL"],"question_refs":["IMO"],"category":"Identity","rule_type":"vessel_grouping","severity":"CRITICAL","statement":"Documents are grouped by checksum-valid IMO; cross-document comparison is blocked across different vessels.","machine_logic":"Validate IMO checksum and compare only within the selected vessel group.","evidence_required":"IMO number from each document.","action_if_fail":"Correct the upload set or assign ungrouped documents manually.","skip_when":[]},
+    {"rule_id":"CERT-WATCH-001","source_scope":["CERTIFICATE","CLASS","HVPQ"],"question_refs":["2.1.5"],"category":"Certificates","rule_type":"expiry_watch","severity":"HIGH","statement":"List expired certificates and certificates expiring within 30, 90 and 180 days separately.","machine_logic":"Use original certificate first, then Class Status, then HVPQ; calculate days remaining from review/operation date.","evidence_required":"Labelled expiry and evidence source.","action_if_fail":"Renew, verify voyage coverage or resolve before fixture/operation.","skip_when":["Certificates without an expiry requirement"]},
+    {"rule_id":"CLASS-OPEN-001","source_scope":["CLASS","HVPQ","Q88"],"question_refs":["1.5.14","1.5.16","1.5.18"],"category":"Class / chartering","rule_type":"open_item_watch","severity":"CRITICAL","statement":"Open Conditions of Class, significant memoranda/recommendations and dispensations must be highlighted with their actual text and due date where visible.","machine_logic":"A heading alone is not an open item; require explicit Nil/None or an actual open/status marker.","evidence_required":"Current Class Status context.","action_if_fail":"Review restriction, due date and acceptance before fixture/STS clearance.","skip_when":[]},
+    {"rule_id":"MOOR-FACTS-001","source_scope":["HVPQ","Q88","LMP","MSMP"],"question_refs":["10.1.3","10.1.4","10.1.7"],"category":"Mooring","rule_type":"key_fact_inventory","severity":"HIGH","statement":"Surface brake-test date, SDMBL/LDBF/TDBF and recognised rope/wire/tail particulars with evidence confidence.","machine_logic":"Only structure a line/tail row when at least two local attributes are visible; otherwise show a verification gap.","evidence_required":"HVPQ/LMP row context and certificates.","action_if_fail":"Verify every line/tail against LMP, certificates and retirement criteria.","skip_when":[]},
+    {"rule_id":"STS-PRE-001","source_scope":["TWO_VESSELS"],"question_refs":["STS"],"category":"STS clearance","rule_type":"pre_clearance_screen","severity":"CRITICAL","statement":"STS pre-check separates holds, review points, missing evidence and compatible particulars for both vessels.","machine_logic":"Group by IMO; review certificates/class/insurance/plans and compare available principal, manifold, transfer and mooring particulars.","evidence_required":"Both vessel packs and operation-specific JPO/risk assessment.","action_if_fail":"Do not treat the screening result as final operational clearance.","skip_when":[]},
+]
+
+
 def embedded_observation_df() -> pd.DataFrame:
     """Return observation history in the same row format expected by older helper functions.
 
@@ -2447,7 +2933,7 @@ def embedded_observation_df() -> pd.DataFrame:
 def embedded_validation_rules_df() -> pd.DataFrame:
     """Machine-readable validation rule register for display/export/debug."""
     rows = []
-    for r in EMBEDDED_KNOWLEDGE_BASE.get("validation_rules", []):
+    for r in EMBEDDED_KNOWLEDGE_BASE.get("validation_rules", []) + ENHANCED_VALIDATION_RULES:
         rows.append({
             "Rule ID": r.get("rule_id", ""),
             "Source scope": ", ".join(r.get("source_scope", [])),
@@ -2620,23 +3106,24 @@ def add_v15_validation_findings(findings: List[Finding], fields: List[FieldRecor
     else:
         add_finding(findings, area="Lifting gear", check="Annual and 5-year lifting gear test dates", status="MANUAL CHECK", risk="MEDIUM", hvpq_value="Section not reliably extracted", reason="HVPQ 10.9.1 was not reliably located in extraction.", action="Vessel to verify lifting gear/crane entries.")
 
-    static=normalize_bool(first_field(fields,"PIQ","piq.static_nav_assessment"))
-    dyn=normalize_bool(first_field(fields,"PIQ","piq.dynamic_nav_assessment_shore"))
-    if static and dyn and static==dyn:
-        add_finding(findings, area="PIQ Navigational Assessment", check="Static and dynamic assessment responses", status="MISMATCH", risk="HIGH", piq_value=f"Static {static}; dynamic {dyn}", reason="PIQ 3.2.1 and 3.2.2 should not both be Yes or both be No as per provided rule.", action="Verify PIQ navigation assessment responses and dates.")
-    elif not static or not dyn:
-        add_finding(findings, area="PIQ Navigational Assessment", check="Static and dynamic assessment responses", status="MANUAL CHECK", risk="MEDIUM", piq_value=f"Static {static or 'not extracted'}; dynamic {dyn or 'not extracted'}", reason="PIQ 3.2.1/3.2.2 could not be fully extracted for rule check.", action="Verify static/dynamic navigational assessment responses and last assessment date.")
+    if any(f.source == "PIQ" for f in fields):
+        static=normalize_bool(first_field(fields,"PIQ","piq.static_nav_assessment"))
+        dyn=normalize_bool(first_field(fields,"PIQ","piq.dynamic_nav_assessment_shore"))
+        if static == "no" and dyn == "no":
+            add_finding(findings, area="PIQ Navigational Assessment", check="Static and dynamic assessment coverage", status="MANUAL CHECK", risk="MEDIUM", piq_value=f"Static {static}; dynamic {dyn}", reason="Both extracted assessment responses are No. This is a readiness concern, not an automatic PIQ logic defect; applicability and the operator's assessment programme must be verified.", action="Confirm assessment applicability, latest completed assessment type/date and supporting evidence.")
+        elif not static or not dyn:
+            add_finding(findings, area="PIQ Navigational Assessment", check="Static and dynamic assessment responses", status="MANUAL CHECK", risk="MEDIUM", piq_value=f"Static {static or 'not extracted'}; dynamic {dyn or 'not extracted'}", reason="PIQ 3.2.1/3.2.2 could not be fully extracted for rule check.", action="Verify static/dynamic navigational assessment responses and last assessment date.")
 
-    for fid,label,q in [("piq.cargo_audit","Cargo audit","PIQ 3.2.5"),("piq.engineering_audit","Engineering audit","PIQ 3.2.6"),("piq.mooring_anchoring_audit","Mooring/anchoring audit","PIQ 3.2.7")]:
-        v=normalize_bool(first_field(fields,"PIQ",fid))
-        raw=next((f.raw for f in fields if f.source=="PIQ" and f.field_id==fid),"")
-        dates=all_dates_in_text(raw)
-        if v=="yes" and dates:
-            latest=max(dates)
-            if latest + relativedelta(months=12) < ref_date:
-                add_finding(findings, area="PIQ Audit", check=f"{label} date", status="MISMATCH", risk="HIGH", piq_value=latest.isoformat(), reason=f"{q} is marked Yes but latest visible date appears older than 12 months.", action="Verify latest audit date and update PIQ.")
-        elif v=="yes" and not dates:
-            add_finding(findings, area="PIQ Audit", check=f"{label} date", status="MANUAL CHECK", risk="MEDIUM", piq_value="Yes, date not reliably extracted", reason=f"{q} is marked Yes but date could not be reliably checked.", action="Verify audit date is within 12 months.")
+        for fid,label,q in [("piq.cargo_audit","Cargo audit","PIQ 3.2.5"),("piq.engineering_audit","Engineering audit","PIQ 3.2.6"),("piq.mooring_anchoring_audit","Mooring/anchoring audit","PIQ 3.2.7")]:
+            v=normalize_bool(first_field(fields,"PIQ",fid))
+            raw=next((f.raw for f in fields if f.source=="PIQ" and f.field_id==fid),"")
+            dates=all_dates_in_text(raw)
+            if v=="yes" and dates:
+                latest=max(dates)
+                if latest + relativedelta(months=12) < ref_date:
+                    add_finding(findings, area="PIQ Audit", check=f"{label} date", status="MISMATCH", risk="HIGH", piq_value=latest.isoformat(), reason=f"{q} is marked Yes but latest visible date appears older than 12 months.", action="Verify latest audit date and update PIQ.")
+            elif v=="yes" and not dates:
+                add_finding(findings, area="PIQ Audit", check=f"{label} date", status="MANUAL CHECK", risk="MEDIUM", piq_value="Yes, date not reliably extracted", reason=f"{q} is marked Yes but date could not be reliably checked.", action="Verify audit date is within 12 months.")
 
     return dedupe_findings(findings)
 
@@ -2658,7 +3145,7 @@ def build_hvpq_checks_v15(fields: List[FieldRecord], findings: List[Finding], re
             add_row(f.risk, qno_for_finding(f), f.area, f.check, f.status, f.hvpq_value, "Class Status" if f.class_value else ("Q88" if f.q88_value else "PIQ/manual"), f.class_value or f.q88_value or f.piq_value, f.reason, f.action)
     for r in cert_validity_rows(fields, ref_date):
         add_row(r["Priority"], r["Question / Section"], r["Area"], r["Check"], r["Status"], r["Document value"], "Class Status/latest certificate", r["Reference value"], r["Finding / interpretation"], r["Action requested"])
-    for row in [_hvpq_ops_row(fields, ref_date, "Brake testing", "mooring.brake_test_date", 12, "10.1.4", "Mooring", "Latest brake test date found in HVPQ/Q88 text"), _hvpq_ops_row(fields, ref_date, "Mooring ropes age / visible date", "mooring.ropes.latest_visible_date", 60, "10.1.7", "Mooring", "Latest rope/tail visible date found; verify every rope individually")]:
+    for row in [_hvpq_ops_row(fields, ref_date, "Brake testing", "mooring.brake_test_date", 12, "10.1.4", "Mooring", "Latest brake test date found in HVPQ/Q88 text")]:
         if row["Priority"] != "Manual":
             add_row(row["Priority"], row["Question / Section"], row["Area"], row["Check"], row["Status"], row["HVPQ value"], row["Reference source"], row["Reference value"], row["Finding / interpretation"], row["Action requested"])
     # Positive tank coating checks: only show if extraction is reliable and no overdue issue was found.
@@ -2774,9 +3261,366 @@ def make_excel_v15(hvpq_df: pd.DataFrame, q88_df: pd.DataFrame, piq_df: pd.DataF
                 ws.row_dimensions[r].height=62
     return bio.getvalue()
 
+
+# ----------------------------- v20 decision and readiness views -----------------------------
+
+def _preferred_record(fields: List[FieldRecord], field_id: str, sources: List[str]) -> Optional[FieldRecord]:
+    for source in sources:
+        record = best_field_record(fields, source, field_id)
+        if record:
+            return record
+    return None
+
+
+def _record_source(record: Optional[FieldRecord]) -> str:
+    if not record:
+        return ""
+    source = record.document_name or record.source
+    return f"{source}{f' p.{record.page}' if record.page else ''}"
+
+
+def build_key_facts_v20(fields: List[FieldRecord], ref_date: date, cert_watch: pd.DataFrame, mooring_summary: pd.DataFrame) -> pd.DataFrame:
+    definitions = [
+        ("Identity", "Vessel name", "vessel.name", ["HVPQ", "PIQ", "Q88", "CLASS", "CERTIFICATE"], True),
+        ("Identity", "IMO number", "vessel.imo", ["HVPQ", "XML", "PIQ", "Q88", "CLASS", "CERTIFICATE"], True),
+        ("Identity", "Flag", "vessel.flag", ["HVPQ", "CLASS", "Q88"], True),
+        ("Identity", "Vessel type", "vessel.type", ["PIQ", "HVPQ", "Q88"], True),
+        ("Identity", "Call sign", "vessel.call_sign", ["HVPQ", "Q88"], False),
+        ("Ownership / insurance", "Registered owner", "owner.registered_owner", ["CLASS", "HVPQ", "Q88"], True),
+        ("Ownership / insurance", "Technical operator", "owner.technical_operator", ["HVPQ", "Q88", "CLASS"], True),
+        ("Ownership / insurance", "Commercial operator", "owner.commercial_operator", ["HVPQ", "Q88"], False),
+        ("Ownership / insurance", "P&I club", "insurance.pni_club", ["CERTIFICATE", "HVPQ", "Q88"], True),
+        ("Class", "Class society", "classification.class_society", ["CLASS", "HVPQ", "Q88"], True),
+        ("Class", "Class notation", "classification.class_notation", ["CLASS", "HVPQ", "Q88"], True),
+        ("Class", "Conditions of Class", "classification.conditions_of_class", ["CLASS", "HVPQ", "Q88"], True),
+        ("Class", "Memoranda / recommendations", "classification.memo_of_class", ["CLASS", "HVPQ", "Q88"], True),
+        ("Class", "Flag/Class dispensations", "classification.flag_dispensation", ["CLASS", "HVPQ", "Q88"], True),
+        ("Surveys", "Last dry dock", "surveys.last_drydock", ["CLASS", "HVPQ", "Q88"], True),
+        ("Surveys", "Next dry dock due", "surveys.next_drydock_due", ["CLASS", "HVPQ", "Q88"], True),
+        ("Surveys", "Next special survey due", "surveys.next_special_due", ["CLASS", "HVPQ", "Q88"], True),
+        ("Surveys", "Next annual survey due", "surveys.next_annual_due", ["CLASS", "HVPQ", "Q88"], False),
+        ("Survey / vetting", "HVPQ completion date", "hvpq.date_completed", ["HVPQ"], True),
+        ("Survey / vetting", "CII rating", "environment.cii_rating", ["HVPQ", "Q88"], False),
+        ("Survey / vetting", "Last PSC date", "psc.last_date", ["PIQ", "HVPQ", "Q88"], True),
+        ("Survey / vetting", "PSC detention in 36 months", "psc.detained_36m", ["PIQ", "HVPQ", "Q88"], True),
+        ("Mooring", "Latest visible brake test", "mooring.brake_test_date", ["HVPQ", "Q88"], True),
+        ("Mooring", "SDMBL", "mooring.sdmbl", ["HVPQ", "Q88"], True),
+        ("Mooring", "LDBF", "mooring.ldbf", ["HVPQ", "Q88"], False),
+        ("Mooring", "TDBF", "mooring.tdbf", ["HVPQ", "Q88"], False),
+        ("Mooring", "Visible rope/tail materials", "mooring.materials_visible", ["HVPQ", "Q88"], False),
+        ("Mooring", "Oldest visible rope/tail date", "mooring.ropes.oldest_visible_date", ["HVPQ", "Q88"], False),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for category, item, fid, sources, important in definitions:
+        record = _preferred_record(fields, fid, sources)
+        value = clean_text(record.value) if record else "Not reliably extracted"
+        status = "Information"
+        action = "Use as a quick reference; verify against source before operational use."
+        confidence = "High" if record and field_quality_score(record) >= 82 else ("Medium" if record and field_quality_score(record) >= 60 else "Low")
+        norm = normalize_bool(value)
+        parsed = parse_date_any(value)
+        if not record:
+            status = "Not verified" if important else "Not extracted"
+            action = "Check the source document; absence here does not prove the document is blank."
+        elif fid in {"classification.conditions_of_class", "classification.memo_of_class", "classification.flag_dispensation"}:
+            if norm == "no" or normalize_value(value) in {"none", "nil", "zero"}:
+                status, action = "Clear from extracted declaration", "Retain current Class Status as evidence."
+            else:
+                status, action = "Potential acceptance concern", "Review full item, restriction and due date before fixture/operation."
+        elif fid.startswith("surveys.next_") and parsed:
+            days = (parsed - ref_date).days
+            if days < 0:
+                status, action = "Past due / stale declaration", "Verify current Class Status immediately."
+            elif days <= 90:
+                status, action = f"Due within {days} days", "Plan/confirm survey and ensure trading window is covered."
+            else:
+                status, action = f"Due in {days} days", "Monitor against fixture/voyage dates."
+        elif fid == "hvpq.date_completed" and parsed:
+            age = (ref_date - parsed).days
+            status = f"Updated {age} days ago" if age >= 0 else "Future date — verify"
+            action = "Confirm all changes since completion are reflected before SIRE submission."
+        elif fid == "environment.cii_rating" and normalize_value(value) in {"d", "e"}:
+            status, action = "Chartering watch", "Review latest verified CII/AER and any improvement plan before submission."
+        elif fid == "psc.detained_36m" and norm == "yes":
+            status, action = "Chartering concern", "Provide detention report, root-cause response and closure evidence."
+        elif fid == "vessel.imo" and not valid_imo_number(value):
+            status, action, confidence = "Invalid IMO checksum", "Correct identity before relying on any comparison.", "High"
+        rows.append({
+            "Category": category, "Key information": item, "Value": value,
+            "Status / significance": status, "Source": _record_source(record),
+            "Confidence": confidence, "What to do": action,
+        })
+
+    if cert_watch is not None and not cert_watch.empty:
+        nearest = cert_watch.sort_values("Days remaining").iloc[0]
+        rows.append({
+            "Category": "Certificates", "Key information": "Nearest certificate expiry",
+            "Value": f"{nearest['Certificate']} — {nearest['Expiry used']} ({nearest['Days remaining']} days)",
+            "Status / significance": nearest["Status"], "Source": nearest.get("Evidence file / page", "") or nearest["Preferred source"],
+            "Confidence": nearest["Confidence"], "What to do": nearest["Action"],
+        })
+    if mooring_summary is not None and not mooring_summary.empty:
+        for _, item in mooring_summary.head(12).iterrows():
+            if str(item.get("Item", "")) in {"Latest visible mooring brake test", "SDMBL", "LDBF", "TDBF", "Tail records recognised", "Rope / line records recognised", "Wire records recognised"}:
+                rows.append({
+                    "Category": "Mooring", "Key information": item.get("Item", ""), "Value": item.get("Value", ""),
+                    "Status / significance": item.get("Status", ""), "Source": item.get("Source", ""),
+                    "Confidence": item.get("Confidence", ""), "What to do": "Confirm against the complete HVPQ 10.1.7 table, LMP/MSMP and certificates.",
+                })
+    return pd.DataFrame(rows).drop_duplicates(subset=["Category", "Key information", "Value", "Source"])
+
+
+def build_class_watch_v20(fields: List[FieldRecord], ref_date: date) -> pd.DataFrame:
+    rows = []
+    items = [
+        ("Conditions of Class", "classification.conditions_of_class", "classification.conditions_of_class.details"),
+        ("Memoranda / recommendations", "classification.memo_of_class", "classification.memo_of_class.details"),
+        ("Flag/Class dispensations", "classification.flag_dispensation", "classification.flag_dispensation.details"),
+    ]
+    for title, fid, details_fid in items:
+        record = _preferred_record(fields, fid, ["CLASS", "HVPQ", "Q88"])
+        detail = _preferred_record(fields, details_fid, ["CLASS", "HVPQ", "Q88"])
+        value = record.value if record else "Not reliably extracted"
+        norm = normalize_bool(value)
+        if not record:
+            conclusion, urgency = "Not verified", "Obtain current Class Status / evidence"
+        elif norm == "no" or normalize_value(value) in {"none", "nil", "zero"}:
+            conclusion, urgency = "Declared Nil / No", "No concern from extracted declaration"
+        else:
+            conclusion, urgency = "Open or listed item indicated", "Review before fixture/STS clearance"
+        rows.append({
+            "Class item": title, "Conclusion": conclusion, "Declaration": value,
+            "Details / evidence": (detail.value if detail else (record.raw if record else ""))[:900],
+            "Source": _record_source(record),
+            "Confidence": "High" if record and field_quality_score(record) >= 82 else ("Medium" if record else "Low"),
+            "Action": urgency,
+        })
+    for label, fid in [("Next annual survey", "surveys.next_annual_due"), ("Next special survey", "surveys.next_special_due"), ("Next dry dock", "surveys.next_drydock_due"), ("Next IWS", "surveys.next_iws_due")]:
+        record = _preferred_record(fields, fid, ["CLASS", "HVPQ", "Q88"])
+        parsed = parse_date_any(record.value) if record else None
+        if parsed:
+            days = (parsed - ref_date).days
+            conclusion = "Past due / stale" if days < 0 else (f"Due within {days} days" if days <= 180 else f"Due in {days} days")
+            action = "Verify current status immediately" if days < 0 else ("Confirm trading/operation window coverage" if days <= 180 else "Monitor")
+        else:
+            conclusion, action = "Not verified", "Check current Class Status"
+        rows.append({"Class item": label, "Conclusion": conclusion, "Declaration": record.value if record else "Not reliably extracted", "Details / evidence": record.raw[:900] if record else "", "Source": _record_source(record), "Confidence": "High" if record and field_quality_score(record) >= 82 else ("Medium" if record else "Low"), "Action": action})
+    return pd.DataFrame(rows)
+
+
+def build_readiness_watchlist_v20(findings: List[Finding], fields: List[FieldRecord], cert_watch: pd.DataFrame, class_watch: pd.DataFrame, mooring_summary: pd.DataFrame, ref_date: date) -> pd.DataFrame:
+    rows: List[Dict[str, str]] = []
+    for finding in findings:
+        if finding.conclusion in {"In order", ""} or finding.status == "BLOCKED":
+            continue
+        if finding.conclusion == "Document-supported discrepancy":
+            urgency = "Immediate" if finding.risk.upper() in {"CRITICAL", "HIGH"} else "Before submission"
+        elif finding.conclusion == "Potential concern":
+            urgency = "High review" if finding.risk.upper() in {"CRITICAL", "HIGH"} else "Review"
+        elif finding.conclusion == "Not verified":
+            urgency = "Evidence required"
+        else:
+            urgency = "Review"
+        why = "Incorrect source data can generate a vetting observation or chartering query."
+        if "certificate" in finding.area.lower():
+            why = "Certificate validity or stale repository data can affect statutory/trading acceptance."
+        elif "class" in finding.area.lower():
+            why = "Open class items, memoranda or stale survey data may affect acceptance or impose restrictions."
+        elif "moor" in finding.area.lower() or "moor" in finding.check.lower():
+            why = "Mooring design, brake-test and line/tail records are high-value SIRE, terminal and STS review items."
+        elif "incident" in finding.area.lower() or "psc" in finding.area.lower():
+            why = "History declarations are routinely scrutinised during vetting and chartering review."
+        rows.append({
+            "Urgency": urgency, "Classification": finding.conclusion, "Domain": finding.area,
+            "Potential SIRE / chartering concern": finding.check, "Evidence": finding.evidence,
+            "Why it matters": why, "Required action": finding.action,
+            "Confidence": f"{finding.confidence} ({finding.confidence_score}%)", "Reference": qno_for_finding(finding),
+        })
+
+    if cert_watch is not None and not cert_watch.empty:
+        for _, item in cert_watch.iterrows():
+            status = str(item["Status"])
+            if status.startswith("Valid beyond"):
+                continue
+            classification = "Document-supported discrepancy" if status == "Expired" else "Potential concern"
+            urgency = "Immediate" if status == "Expired" or "30 days" in status else ("High review" if "90 days" in status else "Plan renewal")
+            rows.append({
+                "Urgency": urgency, "Classification": classification, "Domain": "Certificates",
+                "Potential SIRE / chartering concern": f"{item['Certificate']}: {status}",
+                "Evidence": f"Expiry {item['Expiry used']}; {item['Days remaining']} days remaining; source {item.get('Evidence file / page', '') or item['Preferred source']}",
+                "Why it matters": "Validity may not cover the intended fixture, voyage or inspection window.",
+                "Required action": item["Action"], "Confidence": item["Confidence"], "Reference": "HVPQ 2.1.5 / certificate repository",
+            })
+    if class_watch is not None and not class_watch.empty:
+        for _, item in class_watch.iterrows():
+            conclusion = str(item["Conclusion"])
+            if conclusion == "Declared Nil / No" or conclusion.startswith("Due in "):
+                continue
+            rows.append({
+                "Urgency": "Immediate" if conclusion.startswith("Open") or conclusion.startswith("Past") else "Evidence required",
+                "Classification": "Potential concern" if conclusion.startswith(("Open", "Past", "Due within")) else "Not verified",
+                "Domain": "Class / survey", "Potential SIRE / chartering concern": item["Class item"],
+                "Evidence": str(item["Declaration"]), "Why it matters": "May affect vessel acceptability, trading window or operational restrictions.",
+                "Required action": item["Action"], "Confidence": item["Confidence"], "Reference": "Current Class Status",
+            })
+    if mooring_summary is not None and not mooring_summary.empty:
+        for _, item in mooring_summary.iterrows():
+            status = str(item.get("Status", ""))
+            if not re.search(r"overdue|older than|needs verification|partial inventory", status, re.I):
+                continue
+            age_concern = bool(re.search(r"overdue|older than", status, re.I))
+            rows.append({
+                "Urgency": "High review" if age_concern else "Evidence required",
+                "Classification": "Potential concern" if age_concern else "Not verified",
+                "Domain": "Mooring", "Potential SIRE / chartering concern": str(item.get("Item", "")),
+                "Evidence": str(item.get("Value", "")), "Why it matters": "Incomplete or stale line/tail/brake information can trigger SIRE, terminal or STS questions.",
+                "Required action": "Verify every applicable row against the LMP/MSMP, certificates and brake-test record.",
+                "Confidence": str(item.get("Confidence", "")), "Reference": "HVPQ 10.1.3 / 10.1.4 / 10.1.7",
+            })
+    columns = ["Urgency", "Classification", "Domain", "Potential SIRE / chartering concern", "Evidence", "Why it matters", "Required action", "Confidence", "Reference"]
+    df = pd.DataFrame(rows, columns=columns).drop_duplicates(subset=["Classification", "Domain", "Potential SIRE / chartering concern", "Evidence"])
+    if df.empty:
+        return df
+    ranks = {"Immediate": 0, "High review": 1, "Before submission": 2, "Evidence required": 3, "Review": 4, "Plan renewal": 5}
+    df["_rank"] = df["Urgency"].map(ranks).fillna(9)
+    return df.sort_values(["_rank", "Domain", "Potential SIRE / chartering concern"]).drop(columns="_rank")
+
+
+def build_document_pack_v20(documents: List[ProcessedDocument], group: str) -> pd.DataFrame:
+    group_docs = documents_for_group(documents, group)
+    types = {doc.profile.doc_type for doc in group_docs}
+    files_by_type: Dict[str, List[str]] = defaultdict(list)
+    for doc in group_docs:
+        files_by_type[doc.profile.doc_type].append(doc.profile.filename)
+    requirements = [
+        ("Data accuracy", "HVPQ particulars", {"HVPQ", "HVPQ_XML"}, "Required"),
+        ("Data accuracy", "PIQ operational declarations", {"PIQ"}, "Recommended"),
+        ("Data accuracy", "Current Class Status", {"CLASS"}, "Required for authoritative class/certificate comparison"),
+        ("Data accuracy", "Q88 cross-check", {"Q88"}, "Optional value-add"),
+        ("SIRE / chartering", "HVPQ", {"HVPQ", "HVPQ_XML"}, "Required"),
+        ("SIRE / chartering", "PIQ", {"PIQ"}, "Required for PIQ review"),
+        ("SIRE / chartering", "Original certificates", {"CERTIFICATE"}, "Strongly recommended"),
+        ("SIRE / chartering", "P&I / insurance evidence", {"PNI"}, "Strongly recommended"),
+        ("SIRE / chartering", "Class Status", {"CLASS"}, "Required for reliable class status"),
+        ("STS clearance", "Vessel particulars", {"HVPQ", "Q88"}, "Required"),
+        ("STS clearance", "Class Status", {"CLASS"}, "Required"),
+        ("STS clearance", "P&I / insurance", {"PNI"}, "Required"),
+        ("STS clearance", "Certificate evidence", {"CERTIFICATE"}, "Required for final clearance"),
+        ("STS clearance", "STS plan / procedure", {"STS_PLAN"}, "Required onboard"),
+        ("STS clearance", "Compatibility / JPO / risk assessment", {"STS_ASSESSMENT"}, "Operation-specific requirement"),
+        ("STS clearance", "Mooring LMP/MSMP or HVPQ data", {"MOORING_PLAN", "HVPQ"}, "Required for mooring compatibility"),
+    ]
+    rows = []
+    for use_case, item, alternatives, level in requirements:
+        present = sorted(types & alternatives)
+        matched_files = [filename for doc_type in present for filename in files_by_type.get(doc_type, [])]
+        optional = "Optional" in level or "Recommended" in level
+        status = "Present" if present else ("Optional / not provided" if optional else "Missing from uploaded pack")
+        rows.append({"Use case": use_case, "Document / evidence": item, "Requirement": level, "Status": status, "Detected file(s)": "; ".join(matched_files), "What to do": "No upload gap identified" if present else "Add a searchable current copy before relying on that check"})
+    return pd.DataFrame(rows)
+
+
+def make_excel_v20(sheets: List[Tuple[str, pd.DataFrame]]) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for name, frame in sheets:
+            safe_name = re.sub(r"[\\/*?:\[\]]", "-", name)[:31]
+            (frame if frame is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name=safe_name)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            ws.sheet_view.showGridLines = False
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="17365D")
+                cell.alignment = Alignment(wrap_text=True, vertical="center")
+            headers = {str(cell.value): cell.column for cell in ws[1]}
+            decision_col = headers.get("Conclusion") or headers.get("Status") or headers.get("Urgency")
+            for row in ws.iter_rows(min_row=2):
+                marker = str(row[decision_col-1].value).upper() if decision_col and row[decision_col-1].value is not None else ""
+                fill = None
+                if any(token in marker for token in ["HOLD", "IMMEDIATE", "DOCUMENT-SUPPORTED", "EXPIRED", "MISSING"]):
+                    fill = PatternFill("solid", fgColor="FCE4D6")
+                elif any(token in marker for token in ["POTENTIAL", "REVIEW", "SHORT-TERM", "DUE WITHIN"]):
+                    fill = PatternFill("solid", fgColor="FFF2CC")
+                elif any(token in marker for token in ["NOT VERIFIED", "EVIDENCE REQUIRED", "CONDITIONAL"]):
+                    fill = PatternFill("solid", fgColor="DDEBF7")
+                elif any(token in marker for token in ["PASS", "IN ORDER", "PRESENT", "CLEAR"]):
+                    fill = PatternFill("solid", fgColor="E2F0D9")
+                for cell in row:
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+                    if fill:
+                        cell.fill = fill
+            for idx, column in enumerate(ws.columns, start=1):
+                letter = get_column_letter(idx)
+                max_len = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column)
+                ws.column_dimensions[letter].width = min(max(13, max_len + 2), 55)
+            for row_idx in range(2, min(ws.max_row, 600) + 1):
+                ws.row_dimensions[row_idx].height = 54
+    return bio.getvalue()
+
+
+def style_v20_dataframe(df: pd.DataFrame):
+    if df is None or df.empty:
+        return df
+    def row_style(row):
+        text = " ".join(str(value).upper() for value in row.values)
+        if any(token in text for token in ["DOCUMENT-SUPPORTED DISCREPANCY", "HOLD", "EXPIRED", "IMMEDIATE"]):
+            color = "#FCE4D6"
+        elif any(token in text for token in ["POTENTIAL CONCERN", "HIGH REVIEW", "SHORT-TERM", "DUE WITHIN"]):
+            color = "#FFF2CC"
+        elif any(token in text for token in ["NOT VERIFIED", "EVIDENCE REQUIRED", "COULD NOT RELIABLY"]):
+            color = "#DDEBF7"
+        elif any(token in text for token in ["IN ORDER", "PASS", "PRESENT", "DECLARED NIL"]):
+            color = "#E2F0D9"
+        else:
+            color = ""
+        return [f"background-color: {color}" if color else "" for _ in row]
+    return df.style.apply(row_style, axis=1)
+
+
+def analyse_vessel_group_v20(group_documents: List[ProcessedDocument], ref_date: date, watch_days: int = 180, show_low: bool = False) -> Dict[str, Any]:
+    fields, page_cache, text_by_source = merge_group_content(group_documents)
+    has_hvpq = any(doc.profile.doc_type in {"HVPQ", "HVPQ_XML"} for doc in group_documents)
+    has_piq = any(doc.profile.doc_type == "PIQ" for doc in group_documents)
+    has_q88 = any(doc.profile.doc_type == "Q88" for doc in group_documents)
+    obs_df = embedded_observation_df()
+    findings = run_rules(fields, ref_date, {"show_low": show_low}, obs_df) if fields else []
+    if has_hvpq:
+        findings = add_v15_validation_findings(findings, fields, ref_date)
+    if not show_low:
+        findings = [finding for finding in findings if finding.risk.upper() != "LOW"]
+    findings, same_vessel, imo_by_source = apply_vessel_identity_gate(findings, fields)
+    findings = calibrate_findings(dedupe_findings(findings), fields)
+
+    hvpq_text = text_by_source.get("HVPQ", "")
+    obs_qids = extract_qids_from_obs(obs_df)
+    hvpq_df = enhance_register(build_hvpq_checks_v15(fields, findings, ref_date, obs_qids)) if has_hvpq else pd.DataFrame()
+    piq_df = enhance_register(build_piq_checks_v15(fields, findings, ref_date)) if has_piq else pd.DataFrame()
+    q88_df = enhance_register(build_q88_checks_v15(fields, findings)) if has_q88 else pd.DataFrame()
+
+    mooring_texts: Dict[str, str] = {}
+    for doc in group_documents:
+        if doc.profile.doc_type in {"HVPQ", "Q88", "MOORING_PLAN", "STS_PLAN"}:
+            mooring_texts.setdefault(doc.profile.doc_label, "")
+            mooring_texts[doc.profile.doc_label] += "\n" + doc.text
+    mooring_summary, mooring_inventory = extract_mooring_summary(mooring_texts, ref_date)
+    cert_watch = certificate_watch_df(fields, ref_date, horizon_days=watch_days)
+    class_watch = build_class_watch_v20(fields, ref_date)
+    key_facts = build_key_facts_v20(fields, ref_date, cert_watch, mooring_summary)
+    readiness = build_readiness_watchlist_v20(findings, fields, cert_watch, class_watch, mooring_summary, ref_date)
+    return {
+        "fields": fields, "page_cache": page_cache, "text_by_source": text_by_source,
+        "findings": findings, "same_vessel": same_vessel, "imo_by_source": imo_by_source,
+        "hvpq": hvpq_df, "piq": piq_df, "q88": q88_df,
+        "mooring_summary": mooring_summary, "mooring_inventory": mooring_inventory,
+        "certificate_watch": cert_watch, "class_watch": class_watch,
+        "key_facts": key_facts, "readiness": readiness,
+    }
+
 # ----------------------------- Streamlit app -----------------------------
 
-def main():
+def main_legacy():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption(APP_SUBTITLE)
@@ -2866,29 +3710,341 @@ def main():
     with tabs[0]:
         st.subheader("HVPQ checks — main correction register")
         st.caption("HVPQ is the document to correct. Class Status is used as authority for certificate/survey dates; Q88 is only value-add.")
-        st.dataframe(style_priority_dataframe(hvpq_checks_df), use_container_width=True, height=680)
+        st.dataframe(style_priority_dataframe(hvpq_checks_df), width="stretch", height=680)
     with tabs[1]:
         st.subheader("Q88 checks — value-add consistency")
         st.caption("Q88 is not authoritative by itself. Use this to identify Q88/HVPQ blanks or mismatches requiring review.")
-        st.dataframe(style_priority_dataframe(q88_checks_df), use_container_width=True, height=680)
+        st.dataframe(style_priority_dataframe(q88_checks_df), width="stretch", height=680)
     with tabs[2]:
         st.subheader("PIQ checks — operational declarations and intervals")
         st.caption("Includes PIQ superintendent intervals, tank inspection cycles, MOC/retrofit, PSC, incidents and key PIQ rule checks.")
-        st.dataframe(style_priority_dataframe(piq_checks_df), use_container_width=True, height=680)
+        st.dataframe(style_priority_dataframe(piq_checks_df), width="stretch", height=680)
     with tabs[3]:
         st.subheader("Built-in machine-readable rule base")
         st.caption("Rules and repeated-observation priorities are bundled inside the app. Observation rows are sorted by repeat count and used only as priority signals, not standalone defects.")
         kb1, kb2 = st.tabs(["Validation rules", "Observation priorities"])
         with kb1:
-            st.dataframe(embedded_validation_rules_df(), use_container_width=True, height=650)
+            st.dataframe(embedded_validation_rules_df(), width="stretch", height=650)
         with kb2:
-            st.dataframe(embedded_observation_rules_df(), use_container_width=True, height=650)
+            st.dataframe(embedded_observation_rules_df(), width="stretch", height=650)
     with tabs[4]:
         st.subheader("Advanced extraction review")
         st.caption("For troubleshooting extraction only. This is not intended as the main user workflow.")
-        st.dataframe(df_from_fields(all_fields), use_container_width=True, height=600)
+        st.dataframe(df_from_fields(all_fields), width="stretch", height=600)
         if st.checkbox("Show raw detailed findings"):
-            st.dataframe(df_from_findings(findings), use_container_width=True, height=600)
+            st.dataframe(df_from_findings(findings), width="stretch", height=600)
+
+
+def _group_display_name(documents: List[ProcessedDocument], group: str) -> str:
+    names = [doc.profile.vessel_name for doc in documents_for_group(documents, group) if doc.profile.vessel_name]
+    name = Counter(names).most_common(1)[0][0] if names else "Vessel not named"
+    if valid_imo_number(group):
+        return f"{name} / IMO {group}"
+    return f"{name} / IMO not reliably identified"
+
+
+def findings_decision_df(findings: List[Finding]) -> pd.DataFrame:
+    rows = []
+    for finding in findings:
+        rows.append({
+            "Conclusion": finding.conclusion,
+            "Priority": finding.risk,
+            "Area": finding.area,
+            "Check": finding.check,
+            "Evidence": finding.evidence,
+            "Reason": finding.reason,
+            "Required action": finding.action,
+            "Confidence": f"{finding.confidence} ({finding.confidence_score}%)",
+            "Rule basis": finding.rule_basis,
+            "Reference": qno_for_finding(finding),
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    order = {"Document-supported discrepancy": 0, "Potential concern": 1, "Not verified": 2, "Needs review": 3, "Not assessed — vessel identity conflict": 4}
+    df["_rank"] = df["Conclusion"].map(order).fillna(9)
+    return df.sort_values(["_rank", "Priority", "Area"]).drop(columns="_rank")
+
+
+def _show_dataframe_or_message(df: pd.DataFrame, empty_message: str, height: int = 620):
+    if df is None or df.empty:
+        st.info(empty_message)
+    else:
+        st.dataframe(style_v20_dataframe(df), width="stretch", height=height, hide_index=True)
+
+
+def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="wide")
+    st.markdown(
+        """
+        <style>
+        .block-container {padding-top: 1.7rem; padding-bottom: 3rem; max-width: 1550px;}
+        div[data-testid="stMetric"] {background: #f7f9fc; border: 1px solid #e2e8f0; padding: 0.8rem 1rem; border-radius: 0.65rem;}
+        div[data-testid="stFileUploader"] {border: 1px dashed #6b8db3; border-radius: 0.7rem; padding: 0.45rem; background: #f8fbff;}
+        .privacy-box {background:#eef8f3; border:1px solid #b7ddc8; border-left:5px solid #23845b; border-radius:8px; padding:0.85rem 1rem; margin:0.5rem 0 1rem 0;}
+        .subtle-box {background:#f7f9fc; border:1px solid #e2e8f0; border-radius:8px; padding:0.8rem 1rem;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.title(APP_TITLE)
+    st.caption(APP_SUBTITLE)
+    st.markdown(
+        """<div class="privacy-box"><b>🔒 Your documents are not saved by DocuSure</b><br>
+        The app code processes files in the active Streamlit session and does not write them to a DocuSure database or permanent document store. No external AI service is called by default. Use <b>Clear documents from this session</b> to remove the processed session cache. If optional Ollama assist is enabled, document excerpts go to the configured endpoint; your hosting platform's transport, memory and logging policy still applies.</div>""",
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.header("Review settings")
+        ref_date_input = st.date_input("Review / intended operation date", value=date.today(), help="Certificate and due-date checks are measured against this date.")
+        watch_days = st.slider("Certificate watch window", min_value=30, max_value=365, value=180, step=30, help="Highlights certificates expiring inside this window.")
+        enable_ocr = st.checkbox("Try OCR on scanned pages", value=True, help="Uses OCR only when a PDF page has almost no searchable text and OCR is available on the host.")
+        show_low = st.checkbox("Include low-priority checks", value=False)
+        with st.expander("Optional local AI assist"):
+            use_llm = st.checkbox("Use local Ollama extraction assist", value=False)
+            ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", disabled=not use_llm)
+            ollama_model = st.text_input("Model", value="qwen2.5:14b", disabled=not use_llm)
+            st.caption("Only enable this when the Ollama endpoint is controlled by your organisation. Deterministic rules remain the decision authority.")
+        st.divider()
+        if st.button("Clear documents from this session", width="stretch"):
+            st.session_state.pop("docusure_processed_documents", None)
+            st.session_state.pop("docusure_upload_fingerprint", None)
+            st.session_state.pop("docusure_mode", None)
+            st.session_state["docusure_uploader_version"] = st.session_state.get("docusure_uploader_version", 0) + 1
+            st.rerun()
+
+    st.subheader("1. Upload the document pack")
+    st.write("Drop everything together. DocuSure will identify the document type and vessel automatically—no separate HVPQ, PIQ, Q88 or Class upload boxes.")
+    uploaded_files = st.file_uploader(
+        "PDF or XML files",
+        type=["pdf", "xml"],
+        accept_multiple_files=True,
+        key=f"docusure_upload_{st.session_state.get('docusure_uploader_version', 0)}",
+        help="Examples: HVPQ, PIQ, Q88, Class Status, certificates, P&I, PSC reports, LMP/MSMP, STS plan, compatibility study, JPO or risk assessment.",
+    )
+    st.caption("Useful pack: HVPQ/XML • PIQ • Q88 (optional value-add) • current Class Status • original certificates • P&I evidence • PSC/incident records • LMP/MSMP • STS plan/JPO where applicable.")
+
+    if not uploaded_files:
+        st.markdown(
+            """<div class="subtle-box"><b>What happens next</b><br>
+            1) Files are classified and grouped by checksum-valid IMO. &nbsp; 2) You confirm the recognised pack. &nbsp; 3) Choose the exact check you need. &nbsp; 4) Download a clear Excel decision register.</div>""",
+            unsafe_allow_html=True,
+        )
+        return
+
+    with st.spinner("Reading, OCR-checking and classifying the uploaded pack..."):
+        documents = process_uploaded_documents(uploaded_files, enable_ocr, use_llm, ollama_url, ollama_model)
+
+    st.subheader("2. Confirm what DocuSure recognised")
+    profiles = [doc.profile for doc in documents]
+    identified_groups = sorted({profile.assigned_group for profile in profiles if profile.assigned_group and profile.assigned_group != "Unassigned"})
+    uncertain_documents = [
+        doc for doc in documents
+        if doc.profile.assigned_group == "Unassigned" or doc.profile.grouping_confidence in {"Low", "Medium", "User confirmed"}
+    ]
+    if identified_groups and uncertain_documents:
+        with st.expander("Review uncertain vessel grouping (optional)"):
+            st.caption("Only uncertain or multi-IMO files appear here. A correction applies to this active session and does not alter the uploaded file.")
+            assignment_options = ["Unassigned"] + identified_groups
+            for doc in uncertain_documents:
+                current = doc.profile.assigned_group if doc.profile.assigned_group in assignment_options else "Unassigned"
+                selected_assignment = st.selectbox(
+                    doc.profile.filename,
+                    assignment_options,
+                    index=assignment_options.index(current),
+                    key=f"group_assignment_{doc.file_hash}",
+                    help=doc.profile.grouping_evidence,
+                )
+                if selected_assignment != doc.profile.assigned_group:
+                    doc.profile.assigned_group = selected_assignment
+                    doc.profile.grouping_confidence = "User confirmed" if selected_assignment != "Unassigned" else "Unassigned"
+                    doc.profile.grouping_evidence = "User-confirmed session assignment" if selected_assignment != "Unassigned" else "Left unassigned by user"
+    inventory = document_inventory_df(profiles)
+    _show_dataframe_or_message(inventory, "No documents could be classified.", height=min(520, 95 + len(inventory) * 42))
+    unknown_count = sum(doc.profile.doc_type == "UNKNOWN" for doc in documents)
+    poor_count = sum(doc.profile.text_quality.startswith("Poor") for doc in documents)
+    provisional_count = sum(doc.profile.grouping_confidence == "Low" for doc in documents)
+    unassigned_count = sum(doc.profile.assigned_group == "Unassigned" for doc in documents)
+    if unknown_count:
+        st.warning(f"{unknown_count} file(s) could not be classified reliably. They remain visible but are excluded from deterministic conclusions.")
+    if poor_count:
+        st.warning(f"{poor_count} file(s) have poor searchable text. Provide a searchable/OCR copy before treating missing data as a document error.")
+    if provisional_count:
+        st.warning(f"{provisional_count} file(s) were provisionally grouped because only one vessel was identified. Confirm the vessel in the inventory before relying on comparisons involving those files.")
+    if unassigned_count:
+        st.info(f"{unassigned_count} file(s) remain unassigned because no checksum-valid IMO or reliable vessel-name match was found. Their contents are not silently mixed into another vessel's results.")
+
+    groups = sorted({doc.profile.assigned_group for doc in documents}, key=lambda value: (value == "Unassigned", value))
+    valid_groups = [group for group in groups if group != "Unassigned" and valid_imo_number(group)]
+    group_labels = {group: _group_display_name(documents, group) for group in groups}
+    selected_group = st.selectbox("Vessel for single-vessel checks", groups, format_func=lambda group: group_labels[group])
+
+    st.subheader("3. Choose the check")
+    a1, a2, a3 = st.columns(3)
+    a4, a5, a6 = st.columns(3)
+    if a1.button("Data Accuracy", width="stretch", type="primary"):
+        st.session_state["docusure_mode"] = "accuracy"
+    if a2.button("SIRE / Chartering", width="stretch"):
+        st.session_state["docusure_mode"] = "readiness"
+    if a3.button("STS Clearance Pre-Check", width="stretch"):
+        st.session_state["docusure_mode"] = "sts"
+    if a4.button("Certificate & Class Watch", width="stretch"):
+        st.session_state["docusure_mode"] = "cert_class"
+    if a5.button("Mooring Readiness", width="stretch"):
+        st.session_state["docusure_mode"] = "mooring"
+    if a6.button("Document Pack Completeness", width="stretch"):
+        st.session_state["docusure_mode"] = "pack"
+
+    mode = st.session_state.get("docusure_mode")
+    if not mode:
+        st.info("Choose one of the checks above. The uploaded files stay available for every check during this session.")
+        return
+    if selected_group == "Unassigned" and mode != "sts":
+        st.error("Assign the files to a recognised vessel group before running vessel-level conclusions. DocuSure will not silently compare unrelated unassigned documents.")
+        return
+
+    selected_documents = documents_for_group(documents, selected_group)
+    result = analyse_vessel_group_v20(selected_documents, ref_date_input, watch_days, show_low)
+    action_df = findings_decision_df(result["findings"])
+
+    common_sheets = [
+        ("Key Vessel Facts", result["key_facts"]),
+        ("SIRE Chartering Watch", result["readiness"]),
+        ("Certificate Watch", result["certificate_watch"]),
+        ("Class Watch", result["class_watch"]),
+        ("Mooring Summary", result["mooring_summary"]),
+        ("Mooring Inventory", result["mooring_inventory"]),
+        ("HVPQ Checks", result["hvpq"]),
+        ("PIQ Checks", result["piq"]),
+        ("Q88 Value Add", result["q88"]),
+        ("Detailed Findings", action_df),
+        ("Extracted Evidence", df_from_fields(result["fields"])),
+        ("Document Inventory", inventory),
+    ]
+
+    if mode == "accuracy":
+        st.header("Data Accuracy & Consistency")
+        if not result["same_vessel"]:
+            st.error("Cross-document comparisons were blocked: the selected pack contains different checksum-valid IMO numbers. Separate the documents by vessel before relying on mismatches.")
+        unique_counts = Counter(finding.conclusion for finding in result["findings"])
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Document-supported discrepancies", unique_counts.get("Document-supported discrepancy", 0))
+        m2.metric("Potential concerns", unique_counts.get("Potential concern", 0))
+        m3.metric("Not verified", unique_counts.get("Not verified", 0))
+        m4.metric("Extracted fields", len(result["fields"]))
+        st.caption("Red means the uploaded documents support a discrepancy. Amber means a credible concern still needs source verification. Blue means the app could not prove the point—it is not an error count.")
+        _show_dataframe_or_message(action_df, "No data-accuracy finding was generated from the reliably extracted fields.", height=640)
+        tabs = st.tabs(["HVPQ", "PIQ", "Q88 value-add", "Key facts", "Extraction evidence", "Rules"])
+        with tabs[0]: _show_dataframe_or_message(result["hvpq"], "No HVPQ was identified for this vessel group.")
+        with tabs[1]: _show_dataframe_or_message(result["piq"], "No PIQ was identified for this vessel group.")
+        with tabs[2]: _show_dataframe_or_message(result["q88"], "No Q88 was identified; Q88 is optional value-add and is not treated as SIRE authority.")
+        with tabs[3]: _show_dataframe_or_message(result["key_facts"], "No key facts were reliably extracted.")
+        with tabs[4]: _show_dataframe_or_message(df_from_fields(result["fields"]), "No structured evidence was extracted.")
+        with tabs[5]: st.dataframe(embedded_validation_rules_df(), width="stretch", height=620, hide_index=True)
+        export_name = "docusure_data_accuracy.xlsx"
+
+    elif mode == "readiness":
+        st.header("SIRE / Chartering Readiness")
+        st.caption("This is an evidence-led pre-screen. It highlights likely questions and acceptance concerns; it does not claim to predict a particular charterer's proprietary decision.")
+        readiness = result["readiness"]
+        immediate = int((readiness.get("Urgency", pd.Series(dtype=str)) == "Immediate").sum())
+        high = int((readiness.get("Urgency", pd.Series(dtype=str)) == "High review").sum())
+        gaps = int((readiness.get("Classification", pd.Series(dtype=str)) == "Not verified").sum())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Immediate items", immediate)
+        c2.metric("High-review items", high)
+        c3.metric("Evidence gaps", gaps)
+        c4.metric("Certificates in watch", int((result["certificate_watch"].get("Days remaining", pd.Series(dtype=float)) <= watch_days).sum()) if not result["certificate_watch"].empty else 0)
+        if immediate:
+            st.error("The uploaded evidence contains item(s) requiring immediate resolution before submission, fixture or operation review.")
+        elif high:
+            st.warning("No immediate hold was proven, but high-value concerns should be resolved before submission or chartering review.")
+        else:
+            st.success("No immediate document-supported SIRE/chartering concern was identified. Review all blue evidence gaps before relying on this result.")
+        _show_dataframe_or_message(readiness, "No readiness concern was generated from the available evidence.", height=680)
+        tabs = st.tabs(["Key vessel facts", "Certificate watch", "Class watch", "Mooring"])
+        with tabs[0]: _show_dataframe_or_message(result["key_facts"], "No key facts were reliably extracted.")
+        with tabs[1]: _show_dataframe_or_message(result["certificate_watch"], "No labelled certificate expiry was reliably extracted.")
+        with tabs[2]: _show_dataframe_or_message(result["class_watch"], "No class information was reliably extracted.")
+        with tabs[3]: _show_dataframe_or_message(result["mooring_summary"], "No mooring section or plan was reliably identified.")
+        export_name = "docusure_sire_chartering_readiness.xlsx"
+
+    elif mode == "cert_class":
+        st.header("Certificate & Class Watch")
+        st.caption(f"Expiry and survey windows are measured against {ref_date_input.isoformat()}; Class Status is preferred over HVPQ for class/survey facts, while an original certificate is preferred for its own labelled validity.")
+        expired = int((result["certificate_watch"].get("Days remaining", pd.Series(dtype=float)) < 0).sum()) if not result["certificate_watch"].empty else 0
+        short = int(result["certificate_watch"].get("Days remaining", pd.Series(dtype=float)).between(0, 90).sum()) if not result["certificate_watch"].empty else 0
+        cm1, cm2, cm3 = st.columns(3)
+        cm1.metric("Expired", expired)
+        cm2.metric("Within 90 days", short)
+        cm3.metric("Certificate expiries read", len(result["certificate_watch"]))
+        _show_dataframe_or_message(result["certificate_watch"], "No labelled certificate expiry was reliably extracted.")
+        st.subheader("Class conditions, memoranda, dispensations and survey windows")
+        _show_dataframe_or_message(result["class_watch"], "No current Class Status facts were reliably extracted.")
+        export_name = "docusure_certificate_class_watch.xlsx"
+
+    elif mode == "mooring":
+        st.header("Mooring Readiness")
+        st.caption("DocuSure surfaces brake-test, SDMBL/LDBF/TDBF and rope/wire/tail information. Because PDF tables can merge cells, an individual line is only structured when multiple attributes occur in the same local row context.")
+        _show_dataframe_or_message(result["mooring_summary"], "No HVPQ 10.1.4/10.1.7, Q88 mooring section or LMP/MSMP content was reliably recognised.")
+        st.subheader("Recognised rope / wire / tail rows")
+        _show_dataframe_or_message(result["mooring_inventory"], "The mooring section was found, but individual table rows were not reliable enough to list. Check the HVPQ/LMP directly.")
+        export_name = "docusure_mooring_readiness.xlsx"
+
+    elif mode == "pack":
+        st.header("Document Pack Completeness")
+        pack_df = build_document_pack_v20(documents, selected_group)
+        common_sheets.insert(0, ("Document Pack", pack_df))
+        _show_dataframe_or_message(pack_df, "No document requirements could be evaluated.")
+        st.info("A missing upload means only that DocuSure could not review that evidence in this session. It does not prove the vessel lacks the document.")
+        export_name = "docusure_document_pack.xlsx"
+
+    elif mode == "sts":
+        st.header("STS Clearance Pre-Check")
+        st.caption("Pre-screen only—not final STS approval. Final clearance still requires verified operation-specific compatibility, JPO/risk assessment, weather/location limits, authority/terminal requirements and responsible-person approval.")
+        if len(valid_groups) < 2:
+            st.error("At least two different checksum-valid vessel IMO groups are required. Upload searchable documents identifying both vessels.")
+            st.dataframe(inventory, width="stretch", hide_index=True)
+            return
+        s1, s2 = st.columns(2)
+        primary_imo = s1.selectbox("Primary vessel", valid_groups, format_func=lambda group: group_labels[group], key="sts_primary")
+        counterpart_options = [group for group in valid_groups if group != primary_imo]
+        counterpart_imo = s2.selectbox("STS counterpart", counterpart_options, format_func=lambda group: group_labels[group], key="sts_counterpart")
+        fields_by_vessel: Dict[str, List[FieldRecord]] = {}
+        texts_by_vessel: Dict[str, List[str]] = {}
+        for group in valid_groups:
+            group_docs = documents_for_group(documents, group)
+            group_fields, _, _ = merge_group_content(group_docs)
+            fields_by_vessel[group] = group_fields
+            texts_by_vessel[group] = [doc.text for doc in group_docs]
+        decision, sts_screen, sts_facts, sts_cert_watch = build_sts_screen(profiles, fields_by_vessel, texts_by_vessel, primary_imo, counterpart_imo, ref_date_input, watch_days)
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Pre-screen decision", decision)
+        h2.metric("Holds", int((sts_screen["Status"] == "HOLD").sum()))
+        h3.metric("Review items", int((sts_screen["Status"] == "REVIEW").sum()))
+        h4.metric("Not verified", int((sts_screen["Status"] == "NOT VERIFIED").sum()))
+        if decision == "HOLD":
+            st.error("Do not treat the pack as cleared: at least one document-supported hold item was found.")
+        elif decision == "CONDITIONAL / INCOMPLETE":
+            st.warning("No automatic final clearance: resolve the review and missing-evidence items first.")
+        else:
+            st.success("No hold/review item was found in the uploaded evidence. This remains a preliminary screen, not final operational clearance.")
+        _show_dataframe_or_message(sts_screen, "No STS screening row was generated.", height=680)
+        st.subheader("Side-by-side compatibility facts")
+        _show_dataframe_or_message(sts_facts, "No comparable STS particulars were reliably extracted.")
+        sts_pack = pd.concat([
+            build_document_pack_v20(documents, primary_imo).assign(Vessel=group_labels[primary_imo]),
+            build_document_pack_v20(documents, counterpart_imo).assign(Vessel=group_labels[counterpart_imo]),
+        ], ignore_index=True)
+        common_sheets = [("STS Decision", pd.DataFrame([{"Decision": decision, "Reference date": ref_date_input.isoformat(), "Important": "Pre-screen only; not final operational clearance"}])), ("STS Screening", sts_screen), ("STS Compatibility", sts_facts), ("STS Certificate Watch", sts_cert_watch), ("STS Document Packs", sts_pack), ("Document Inventory", inventory)]
+        export_name = "docusure_sts_clearance_precheck.xlsx"
+    else:
+        st.error("Unknown check mode.")
+        return
+
+    export = make_excel_v20(common_sheets)
+    st.download_button("Download complete Excel decision register", export, file_name=export_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
 
 
 if __name__ == "__main__":
