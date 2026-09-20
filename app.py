@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import base64
 import io
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import zipfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field as dataclass_field
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,12 +22,26 @@ import pandas as pd
 import pymupdf as fitz
 import requests
 import streamlit as st
+try:
+    import pymupdf4llm
+except Exception:
+    pymupdf4llm = None
+try:
+    from docx import Document as DocxDocument
+    from docx.table import Table as DocxTable
+    from docx.text.paragraph import Paragraph as DocxParagraph
+except Exception:
+    DocxDocument = None
+    DocxTable = None
+    DocxParagraph = None
+from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from dateutil import parser as dateparser
 from dateutil.relativedelta import relativedelta
 
 from docusure_engine import (
+    DOC_LABELS,
     DocumentProfile,
     best_field as engine_best_field,
     build_sts_screen,
@@ -34,12 +53,13 @@ from docusure_engine import (
     extract_mooring_summary,
     extract_numbered_section,
     extract_sts_particulars,
+    sts_document_check_rows,
     profile_document,
     valid_imo as engine_valid_imo,
 )
 
-APP_TITLE = "DocuSure — SIRE & Chartering Readiness v20"
-APP_SUBTITLE = "Evidence-led review of HVPQ, PIQ, Q88 and Class Status. Confirmed discrepancies, potential concerns and extraction gaps are kept separate."
+APP_TITLE = "DocuSure — SIRE & Chartering Readiness v22"
+APP_SUBTITLE = "Accuracy-first, multi-engine reading of vessel document packs. Every conclusion retains page evidence; extraction gaps stay separate from confirmed discrepancies."
 
 # ----------------------------- Data models -----------------------------
 
@@ -84,14 +104,21 @@ class ProcessedDocument:
     text: str
     fields: List[FieldRecord]
     file_hash: str
+    document_format: str = "pdf"
+    machine_text: str = ""
+    structured_tables: List[Dict[str, Any]] = dataclass_field(default_factory=list)
+    sheet_names: List[str] = dataclass_field(default_factory=list)
+    reading_methods: List[str] = dataclass_field(default_factory=list)
+    reading_notes: List[str] = dataclass_field(default_factory=list)
 
 # ----------------------------- General helpers -----------------------------
 
 MONTHS_7_DAYS = 7 * 30.4375
 MONTHS_12_DAYS = 12 * 30.4375
+MONTH_TOKEN = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 DATE_PATTERNS = [
-    r"\b\d{1,2}[\s./-]+[A-Za-z]{3,9}[\s,./-]+\d{2,4}\b",
-    r"\b[A-Za-z]{3,9}[\s./-]+\d{1,2},?[\s./-]+\d{2,4}\b",
+    rf"\b\d{{1,2}}[\s./-]+{MONTH_TOKEN}[\s,./-]+\d{{2,4}}\b",
+    rf"\b{MONTH_TOKEN}[\s./-]+\d{{1,2}},?[\s./-]+\d{{2,4}}\b",
     r"\b\d{4}-\d{2}-\d{2}\b",
     r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b",
 ]
@@ -161,6 +188,7 @@ FIELD_LABELS = {
     "owner.technical_operator": "Technical operator",
     "owner.commercial_operator": "Commercial operator",
     "insurance.pni_club": "P&I club",
+    "insurance.international_group_member": "P&I International Group member",
     "classification.class_society": "Class society",
     "classification.class_notation": "Class notation",
     "classification.conditions_of_class": "Conditions of class",
@@ -187,6 +215,14 @@ FIELD_LABELS = {
     "moc.retrofit": "Equipment retrofitted",
     "moc.structural_change": "Structural change",
     "moc.equipment_replaced": "Equipment replaced non-like-for-like",
+    "crew.matrix": "Crew matrix evidence",
+    "crew.ranks": "Crew ranks identified",
+    "crew.total": "Crew total / complement",
+    "port.history": "Last 10 ports / port history",
+    "port.history.count": "Port history rows identified",
+    "sanctions.screening_status": "Sanctions screening status",
+    "sts.q88_marked": "STS in Q88",
+    "mooring.brc_test_date": "Winch BRC / brake test date",
 }
 
 
@@ -330,7 +366,7 @@ def parse_table_dates_by_last_inspection(section: str) -> List[date]:
     if not section:
         return []
     txt = clean_text(section)
-    date_pat = r"(\d{1,2}[\s./-]+[A-Za-z]{3,9}[\s,./-]+\d{2,4}|[A-Za-z]{3,9}[\s./-]+\d{1,2},?[\s./-]+\d{2,4}|\d{1,2}[./-]\d{1,2}[./-]\d{4})"
+    date_pat = rf"(\d{{1,2}}[\s./-]+{MONTH_TOKEN}[\s,./-]+\d{{2,4}}|{MONTH_TOKEN}[\s./-]+\d{{1,2}},?[\s./-]+\d{{2,4}}|\d{{1,2}}[./-]\d{{1,2}}[./-]\d{{4}})"
     pairs = re.findall(date_pat + r"\s+" + date_pat + r"\s+(?:Annual|12\s*months?|[0-9]+\s*months?)", txt, flags=re.I)
     out=[]
     for _, insp in pairs:
@@ -461,32 +497,378 @@ def semantically_equivalent(a: str, b: str, field_id: str = "") -> bool:
 
 # ----------------------------- PDF/Text extraction -----------------------------
 
-def extract_pdf_pages(file_obj, enable_ocr: bool = True) -> List[Tuple[int, str]]:
+def _bytes_from_file(file_obj: Any) -> bytes:
     if file_obj is None:
-        return []
-    data = file_obj if isinstance(file_obj, (bytes, bytearray)) else (file_obj.getvalue() if hasattr(file_obj, "getvalue") else file_obj.read())
-    pages = []
+        return b""
+    if isinstance(file_obj, (bytes, bytearray)):
+        return bytes(file_obj)
+    if hasattr(file_obj, "getvalue"):
+        return file_obj.getvalue()
+    return file_obj.read()
+
+
+def _normalise_table_rows(rows: Any) -> List[List[str]]:
+    """Turn a table-like object into stable, non-empty string rows."""
+    result: List[List[str]] = []
+    for row in rows or []:
+        values = [clean_text(cell) for cell in (row or [])]
+        if any(values):
+            result.append(values)
+    return result
+
+
+def _table_text(rows: List[List[str]]) -> str:
+    return "\n".join(" | ".join(cell for cell in row if cell) for row in rows if any(row))
+
+
+def _visible_char_count(text: str) -> int:
+    return len(re.sub(r"[^A-Za-z0-9]+", "", text or ""))
+
+
+def _layout_text_score(text: str) -> int:
+    """Prefer text that retains useful rows/columns, not merely more bytes."""
+    value = text or ""
+    aligned_rows = sum(1 for line in value.splitlines() if re.search(r"\S\s{2,}\S", line))
+    markdown_rows = sum(1 for line in value.splitlines() if line.count("|") >= 2)
+    markdown_heads = sum(1 for line in value.splitlines() if re.match(r"^#{1,6}\s+\S", line))
+    labelled_rows = sum(1 for line in value.splitlines() if re.search(r"\b(?:valid\s+until|expiry|issued|IMO|certificate|class|port|rank)\b", line, re.I))
+    return _visible_char_count(value) + aligned_rows * 18 + markdown_rows * 24 + markdown_heads * 8 + labelled_rows * 8
+
+
+def _extract_pymupdf4llm_markdown(data: bytes, enable_ocr: bool = True) -> Tuple[List[Tuple[int, str]], str]:
+    """Return layout-aware, page-chunked Markdown when PyMuPDF4LLM exists."""
+    if pymupdf4llm is None:
+        return [], "PyMuPDF4LLM is not available"
+    try:
+        with fitz.open(stream=data, filetype="pdf") as document:
+            chunks = pymupdf4llm.to_markdown(
+                document,
+                page_chunks=True,
+                use_ocr=enable_ocr,
+                ocr_language="eng",
+                ocr_dpi=250,
+                force_ocr=False,
+                force_text=True,
+                show_progress=False,
+            )
+        pages: List[Tuple[int, str]] = []
+        for index, chunk in enumerate(chunks or [], 1):
+            metadata = chunk.get("metadata", {}) if isinstance(chunk, dict) else {}
+            page_number = int(metadata.get("page_number") or index)
+            text = str(chunk.get("text", "") if isinstance(chunk, dict) else chunk)
+            pages.append((page_number, text))
+        return pages, ""
+    except Exception as exc:
+        return [], f"PyMuPDF4LLM layout extraction unavailable: {exc}"
+
+
+def _extract_poppler_layout(data: bytes) -> Tuple[List[Tuple[int, str]], str]:
+    """Read a PDF with Poppler's layout engine when available.
+
+    PyMuPDF and Poppler use different reading-order algorithms. Comparing both
+    is materially safer for forms and certificate tables than trusting one PDF
+    text stream.
+    """
+    executable = shutil.which("pdftotext")
+    if not executable:
+        return [], "Poppler pdftotext is not available"
+    try:
+        with tempfile.TemporaryDirectory(prefix="docusure_poppler_") as temp_dir:
+            source_path = os.path.join(temp_dir, "source.pdf")
+            with open(source_path, "wb") as handle:
+                handle.write(data)
+            result = subprocess.run(
+                [executable, "-layout", "-enc", "UTF-8", source_path, "-"],
+                capture_output=True,
+                timeout=180,
+                check=False,
+            )
+        if result.returncode != 0:
+            return [], clean_text(result.stderr.decode("utf-8", errors="replace") or "Poppler extraction failed")
+        decoded = result.stdout.decode("utf-8", errors="replace")
+        parts = decoded.split("\f")
+        if parts and not parts[-1].strip():
+            parts.pop()
+        return [(index, part.rstrip()) for index, part in enumerate(parts, 1)], ""
+    except Exception as exc:
+        return [], f"Poppler extraction unavailable: {exc}"
+
+
+def _ocrmypdf_layout(data: bytes) -> Tuple[List[Tuple[int, str]], str]:
+    """Create a temporary deskewed/rotated OCR copy, then read it by layout."""
+    executable = shutil.which("ocrmypdf")
+    if not executable:
+        return [], "OCRmyPDF is not available"
+    try:
+        with tempfile.TemporaryDirectory(prefix="docusure_ocr_") as temp_dir:
+            source_path = os.path.join(temp_dir, "source.pdf")
+            output_path = os.path.join(temp_dir, "ocr.pdf")
+            with open(source_path, "wb") as handle:
+                handle.write(data)
+            result = subprocess.run(
+                [
+                    executable,
+                    "--skip-text",
+                    "--rotate-pages",
+                    "--deskew",
+                    "--optimize",
+                    "0",
+                    source_path,
+                    output_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+            if result.returncode != 0 or not os.path.exists(output_path):
+                return [], clean_text(result.stderr or result.stdout or "OCRmyPDF failed")
+            with open(output_path, "rb") as handle:
+                return _extract_poppler_layout(handle.read())
+    except Exception as exc:
+        return [], f"OCRmyPDF unavailable: {exc}"
+
+
+def _extract_pdf_machine_readable(
+    data: bytes,
+    enable_ocr: bool = True,
+    accuracy_first: bool = True,
+    reading_methods: Optional[List[str]] = None,
+    reading_notes: Optional[List[str]] = None,
+) -> Tuple[List[Tuple[int, str]], List[Dict[str, Any]]]:
+    """Extract page text plus table rows, retaining provenance for each page."""
+    pages: List[Tuple[int, str]] = []
+    tables: List[Dict[str, Any]] = []
+    selected_source_by_page: Dict[int, str] = {}
+    methods = reading_methods if reading_methods is not None else []
+    notes = reading_notes if reading_notes is not None else []
+    poppler_pages: Dict[int, str] = {}
+    markdown_pages: Dict[int, str] = {}
+    if accuracy_first:
+        markdown, markdown_error = _extract_pymupdf4llm_markdown(data, enable_ocr=enable_ocr)
+        markdown_pages = dict(markdown)
+        if markdown_pages:
+            methods.append("PyMuPDF4LLM layout-aware Markdown")
+        elif markdown_error:
+            notes.append(markdown_error)
+        poppler, poppler_error = _extract_poppler_layout(data)
+        poppler_pages = dict(poppler)
+        if poppler_pages:
+            methods.append("Poppler layout text")
+        elif poppler_error:
+            notes.append(poppler_error)
     try:
         with fitz.open(stream=data, filetype="pdf") as doc:
-            for i, page in enumerate(doc, 1):
-                txt = page.get_text("text", sort=True) or ""
-                # PyMuPDF can call Tesseract when it is installed. The fallback is
-                # intentionally silent: document diagnostics will identify a sparse
-                # page and ask for a searchable/OCR copy rather than pretending a
-                # blank extraction is a document defect.
-                visible = len(re.sub(r"[^A-Za-z0-9]+", "", txt))
+            for page_number, page in enumerate(doc, 1):
+                pymupdf_text = page.get_text("text", sort=True) or ""
+                poppler_text = poppler_pages.get(page_number, "")
+                markdown_text = markdown_pages.get(page_number, "")
+                candidates = [
+                    ("PyMuPDF native", pymupdf_text),
+                    ("Poppler layout", poppler_text),
+                    ("PyMuPDF4LLM Markdown", markdown_text),
+                ]
+                selected_source, txt = max(candidates, key=lambda item: _layout_text_score(item[1]))
+                visible = _visible_char_count(txt)
                 if enable_ocr and visible < 50:
                     try:
-                        text_page = page.get_textpage_ocr(language="eng", dpi=200, full=True)
+                        text_page = page.get_textpage_ocr(language="eng", dpi=250, full=True)
                         ocr_text = page.get_text("text", textpage=text_page, sort=True) or ""
-                        if len(re.sub(r"[^A-Za-z0-9]+", "", ocr_text)) > visible:
+                        if _visible_char_count(ocr_text) > visible:
                             txt = ocr_text
+                            selected_source = "Tesseract page OCR"
+                            methods.append("Tesseract page OCR")
                     except Exception:
                         pass
-                pages.append((i, txt))
+                selected_source_by_page[page_number] = selected_source
+                # Keep the ordinary text and append a second, explicit table
+                # channel. This prevents date columns from being silently
+                # re-ordered by PDF reading order when a table is detectable.
+                try:
+                    finder = page.find_tables()
+                    for table_index, table in enumerate(getattr(finder, "tables", []) or [], 1):
+                        rows = _normalise_table_rows(table.extract())
+                        if not rows:
+                            continue
+                        value = _table_text(rows)
+                        tables.append({"page": page_number, "table": table_index, "rows": rows, "text": value, "source": "pdf-table"})
+                        txt += f"\n[TABLE page {page_number}.{table_index}]\n{value}\n[/TABLE]\n"
+                except Exception:
+                    pass
+                pages.append((page_number, txt))
+        methods.append("PyMuPDF native text")
+        if tables:
+            methods.append("PyMuPDF table detection")
     except Exception as e:
         st.warning(f"PDF extraction failed: {e}")
-    return pages
+
+    # If pages remain unreadable, use a second OCR engine that can rotate and
+    # deskew the temporary copy. This runs only in accuracy-first mode and all
+    # temporary files disappear with the TemporaryDirectory.
+    sparse_pages = {page_number for page_number, text in pages if _visible_char_count(text) < 80}
+    if accuracy_first and enable_ocr and sparse_pages:
+        ocr_pages, ocr_error = _ocrmypdf_layout(data)
+        ocr_by_page = dict(ocr_pages)
+        replacements = 0
+        repaired: List[Tuple[int, str]] = []
+        for page_number, text in pages:
+            candidate = ocr_by_page.get(page_number, "")
+            if page_number in sparse_pages and _visible_char_count(candidate) > _visible_char_count(text):
+                repaired.append((page_number, candidate))
+                selected_source_by_page[page_number] = "OCRmyPDF rotate/deskew"
+                replacements += 1
+            else:
+                repaired.append((page_number, text))
+        pages = repaired
+        if replacements:
+            methods.append(f"OCRmyPDF rotate/deskew fallback ({replacements} page(s))")
+        elif ocr_error:
+            notes.append(ocr_error)
+    selected_sources = Counter(selected_source_by_page.values())
+    if selected_sources:
+        methods.append("Chosen page representations: " + ", ".join(f"{name}={count}" for name, count in selected_sources.items() if count))
+    methods[:] = list(dict.fromkeys(methods))
+    notes[:] = list(dict.fromkeys(note for note in notes if note))
+    return pages, tables
+
+
+def extract_pdf_pages(file_obj, enable_ocr: bool = True) -> List[Tuple[int, str]]:
+    return _extract_pdf_machine_readable(_bytes_from_file(file_obj), enable_ocr=enable_ocr)[0]
+
+
+def _extract_docx_machine_readable(data: bytes) -> Tuple[List[Tuple[int, str]], List[Dict[str, Any]]]:
+    """Extract Word paragraphs and tables without flattening table columns."""
+    if DocxDocument is None:
+        return [(1, "[DOCX extraction unavailable: python-docx is not installed]")], []
+    try:
+        document = DocxDocument(io.BytesIO(data))
+    except Exception as exc:
+        return [(1, f"[DOCX extraction failed: {exc}]")], []
+    chunks: List[str] = []
+    tables: List[Dict[str, Any]] = []
+    table_index = 0
+    # Iterate the XML body so headings, paragraphs and tables remain in their
+    # original order. Paragraphs-then-tables loses the labels that make a date
+    # or answer meaningful in Word forms.
+    for child in document.element.body.iterchildren():
+        if DocxParagraph is not None and child.tag.endswith("}p"):
+            paragraph = DocxParagraph(child, document)
+            value = clean_text(paragraph.text)
+            if value:
+                chunks.append(value)
+        elif DocxTable is not None and child.tag.endswith("}tbl"):
+            table_index += 1
+            table = DocxTable(child, document)
+            rows = _normalise_table_rows([[cell.text for cell in row.cells] for row in table.rows])
+            if not rows:
+                continue
+            value = _table_text(rows)
+            tables.append({"page": 1, "table": table_index, "rows": rows, "text": value, "source": "docx-table"})
+            chunks.append(f"[TABLE word 1.{table_index}]\n{value}\n[/TABLE]")
+    return [(1, "\n".join(chunks))], tables
+
+
+def _extract_legacy_doc_machine_readable(filename: str, data: bytes) -> Tuple[List[Tuple[int, str]], List[Dict[str, Any]]]:
+    """Convert legacy .doc through LibreOffice when the host provides it."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="docusure_doc_") as temp_dir:
+            source_path = os.path.join(temp_dir, os.path.basename(filename) or "document.doc")
+            with open(source_path, "wb") as handle:
+                handle.write(data)
+            result = subprocess.run(
+                ["soffice", "--headless", "--convert-to", "docx", "--outdir", temp_dir, source_path],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            converted = os.path.join(temp_dir, os.path.splitext(os.path.basename(source_path))[0] + ".docx")
+            if result.returncode == 0 and os.path.exists(converted):
+                with open(converted, "rb") as handle:
+                    return _extract_docx_machine_readable(handle.read())
+            detail = clean_text(result.stderr or result.stdout or "LibreOffice conversion failed")
+            return [(1, f"[Legacy .doc conversion failed: {detail}]")], []
+    except Exception as exc:
+        return [(1, f"[Legacy .doc conversion unavailable: {exc}]")], []
+
+
+def _extract_excel_machine_readable(filename: str, data: bytes) -> Tuple[List[Tuple[int, str]], List[Dict[str, Any]], List[str]]:
+    """Extract workbook/CSV cells with sheet provenance and row boundaries."""
+    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    pages: List[Tuple[int, str]] = []
+    tables: List[Dict[str, Any]] = []
+    sheet_names: List[str] = []
+
+    def add_sheet(sheet_name: str, rows: List[List[str]], page_number: int):
+        if not rows:
+            return
+        sheet_names.append(sheet_name)
+        value = _table_text(rows)
+        pages.append((page_number, f"[SHEET {sheet_name}]\n{value}\n[/SHEET {sheet_name}]"))
+        tables.append({"page": page_number, "sheet": sheet_name, "rows": rows, "text": value, "source": "excel-table"})
+
+    try:
+        if extension in {"xlsx", "xlsm", "xltx", "xltm"}:
+            workbook = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+            for page_number, sheet_name in enumerate(workbook.sheetnames, 1):
+                sheet = workbook[sheet_name]
+                rows = _normalise_table_rows([["" if cell is None else str(cell) for cell in row] for row in sheet.iter_rows(values_only=True)])
+                add_sheet(sheet_name, rows, page_number)
+            workbook.close()
+        elif extension == "xls":
+            excel = pd.ExcelFile(io.BytesIO(data), engine="xlrd")
+            for page_number, sheet_name in enumerate(excel.sheet_names, 1):
+                frame = pd.read_excel(excel, sheet_name=sheet_name, header=None, dtype=str).fillna("")
+                add_sheet(sheet_name, _normalise_table_rows(frame.astype(str).values.tolist()), page_number)
+        elif extension == "csv":
+            frame = pd.read_csv(io.BytesIO(data), header=None, dtype=str, keep_default_na=False)
+            add_sheet("CSV", _normalise_table_rows(frame.astype(str).values.tolist()), 1)
+    except Exception as exc:
+        pages = [(1, f"[{extension.upper() or 'office'} extraction failed: {exc}]")]
+    return pages, tables, sheet_names
+
+
+def extract_document_machine_readable(
+    filename: str,
+    data: bytes,
+    enable_ocr: bool = True,
+    accuracy_first: bool = True,
+    reading_methods: Optional[List[str]] = None,
+    reading_notes: Optional[List[str]] = None,
+) -> Tuple[List[Tuple[int, str]], str, List[Dict[str, Any]], str, List[str]]:
+    """Normalise PDF/XML/Word/Excel/CSV into one evidence model."""
+    methods = reading_methods if reading_methods is not None else []
+    notes = reading_notes if reading_notes is not None else []
+    lower = filename.lower()
+    if lower.endswith(".xml"):
+        decoded = data.decode("utf-8", errors="replace")
+        methods.append("Native XML structure")
+        return [(1, decoded)], decoded, [], "xml", []
+    if lower.endswith(".pdf"):
+        pages, tables = _extract_pdf_machine_readable(
+            data,
+            enable_ocr=enable_ocr,
+            accuracy_first=accuracy_first,
+            reading_methods=methods,
+            reading_notes=notes,
+        )
+        return pages, join_pages(pages), tables, "pdf", []
+    if lower.endswith((".docx", ".docm")):
+        pages, tables = _extract_docx_machine_readable(data)
+        methods.extend(["Word paragraph order", "Word table structure"] if tables else ["Word paragraph order"])
+        return pages, join_pages(pages), tables, lower.rsplit(".", 1)[-1], []
+    if lower.endswith(".doc"):
+        pages, tables = _extract_legacy_doc_machine_readable(filename, data)
+        methods.append("LibreOffice DOC-to-DOCX conversion")
+        methods.extend(["Word paragraph order", "Word table structure"] if tables else ["Word paragraph order"])
+        return pages, join_pages(pages), tables, "doc", []
+    if lower.endswith((".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".csv")):
+        pages, tables, sheets = _extract_excel_machine_readable(filename, data)
+        methods.append("Spreadsheet sheet/row structure")
+        return pages, join_pages(pages), tables, lower.rsplit(".", 1)[-1], sheets
+    message = f"[Unsupported document format: {filename}]"
+    notes.append(message)
+    return [(1, message)], message, [], lower.rsplit(".", 1)[-1] if "." in lower else "", []
 
 
 def join_pages(pages: List[Tuple[int, str]]) -> str:
@@ -634,12 +1016,108 @@ def labelled_cert_dates(block: str) -> Tuple[str, str]:
     return "", ""
 
 
+CERT_DATE_LABELS = {
+    "issue": re.compile(r"\b(?:date\s+of\s+issue|date\s+issued|issued\s+date|issue\s+date|issued)\b", re.I),
+    "expiry": re.compile(r"\b(?:valid\s*(?:until|to)|validity\s+date|expiry\s+date|date\s+expires?|expiration\s+date|expires?)\b", re.I),
+    "last_annual": re.compile(r"\b(?:last\s+annual(?:\s+endorsement)?|annual\s+endorsement(?:\s+date)?|date\s+of\s+last\s+annual)\b", re.I),
+    "last_intermediate": re.compile(r"\b(?:last\s+intermediate(?:\s+endorsement)?|intermediate\s+endorsement(?:\s+date)?|date\s+of\s+last\s+intermediate)\b", re.I),
+}
+
+
+def date_near_label(text: str, label_re: re.Pattern, after_chars: int = 180, before_chars: int = 55) -> str:
+    """Return a date tied to a specific label, never a nearby unrelated column."""
+    txt = clean_text(text)
+    for match in label_re.finditer(txt):
+        after = extract_dates(txt[match.end():match.end() + after_chars])
+        if after:
+            return after[0]
+        before = extract_dates(txt[max(0, match.start() - before_chars):match.start()])
+        if before:
+            return before[-1]
+    return ""
+
+
+def labelled_cert_date_roles(block: str) -> Dict[str, str]:
+    """Extract certificate dates only when the date role is visible in the row/table."""
+    txt = clean_text(block)
+    return {
+        role: value
+        for role, label_re in CERT_DATE_LABELS.items()
+        if (value := date_near_label(txt, label_re))
+    }
+
+
+def add_cert_date_roles(
+    fields: List[FieldRecord],
+    source: str,
+    key: str,
+    roles: Dict[str, str],
+    raw: str,
+    confidence: str = "table-aware",
+):
+    """Store labelled certificate dates and reject an impossible expiry/issue pair."""
+    issue = roles.get("issue", "")
+    expiry = roles.get("expiry", "")
+    issue_date = parse_date_any(issue)
+    expiry_date = parse_date_any(expiry)
+    if issue and expiry and issue_date and expiry_date and expiry_date < issue_date:
+        add_field(
+            fields,
+            source,
+            f"cert.{key}.expiry_extraction_issue",
+            f"Visible expiry {expiry} precedes visible issue {issue}; expiry withheld",
+            label=f"{key} expiry extraction issue",
+            raw=raw,
+            confidence="manual-needed",
+            extraction_method="date-role-validation",
+        )
+        roles = dict(roles)
+        roles.pop("expiry", None)
+    for role, value in roles.items():
+        add_field(
+            fields,
+            source,
+            f"cert.{key}.{role}",
+            value,
+            raw=raw,
+            confidence=confidence,
+            extraction_method=f"labelled-{role}",
+        )
+
+
 def add_q88_block_field(fields: List[FieldRecord], blocks: Dict[str, List[str]], qno: str, source: str, field_id: str, label: str = ''):
     b = blocks.get(qno.lower(), [])
     if not b:
         return
     ans = block_answer(b)
     add_field(fields, source, field_id, ans, label=label, raw=" | ".join(b))
+
+
+def _header_role_order(header: str) -> List[str]:
+    """Return certificate date roles in the visible table-header order."""
+    positions: List[Tuple[int, str]] = []
+    for role, label_re in CERT_DATE_LABELS.items():
+        match = label_re.search(header or "")
+        if match:
+            positions.append((match.start(), role))
+    return [role for _, role in sorted(positions)]
+
+
+def certificate_row_roles(block: str, header: str = "", cert_order: str = "hvpq") -> Dict[str, str]:
+    """Extract certificate date roles without guessing from a date-only row."""
+    roles = labelled_cert_date_roles(block)
+    if roles:
+        return roles
+    dates = extract_dates(block)
+    order = _header_role_order(header)
+    if not dates or not order:
+        return {}
+    # Positional mapping is permitted only when an explicit issue/expiry table
+    # header is visible. Otherwise the second date may simply be an endorsement
+    # or a date from the next column and must not become an expiry.
+    if "expiry" not in order or "issue" not in order:
+        return {}
+    return {role: value for role, value in zip(order, dates)}
 
 def parse_cert_rows_from_sequence(lines: List[str], source: str, cert_order: str = 'hvpq') -> List[FieldRecord]:
     """Parse certificate rows by partitioning between certificate labels, avoiding bleed into next row."""
@@ -662,33 +1140,18 @@ def parse_cert_rows_from_sequence(lines: List[str], source: str, cert_order: str
         dates = extract_dates(block)
         if not dates:
             continue
-        # Special rows with issue date only
-        if key in ["tonnage"]:
-            add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block)
+        header = " ".join(lines[:min(12, len(lines))] + lines[max(0, pos - 4):pos])
+        roles = certificate_row_roles(block, header, cert_order=cert_order)
+        if roles:
+            add_cert_date_roles(fields, source, key, roles, block, confidence="table-aware")
             continue
-        # VGP in HVPQ often has issue date and an old second date, but Class Status usually has issue only. Keep both for review.
-        if cert_order == 'q88':
-            if len(dates) >= 1: add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block)
-            if len(dates) >= 4: add_field(fields, source, f"cert.{key}.expiry", dates[3], raw=block)
-            elif len(dates) >= 2: add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=block)
-            if len(dates) >= 2: add_field(fields, source, f"cert.{key}.last_annual", dates[1], raw=block)
-            if len(dates) >= 3: add_field(fields, source, f"cert.{key}.last_intermediate", dates[2], raw=block)
-        elif cert_order == 'class':
-            issue_dt, expiry_dt = labelled_cert_dates(block)
-            if issue_dt:
-                add_field(fields, source, f"cert.{key}.issue", issue_dt, raw=block)
-            elif len(dates) >= 1 and not has_expiry_label(block):
-                # Conservative fallback: an unlabelled/lone Class Status date is issue/review data, not expiry.
-                add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block)
-            if expiry_dt:
-                add_field(fields, source, f"cert.{key}.expiry", expiry_dt, raw=block)
-            elif has_expiry_label(block) and len(dates) >= 2:
-                add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=block)
-        else:
-            if len(dates) >= 1: add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block)
-            if len(dates) >= 2: add_field(fields, source, f"cert.{key}.expiry", dates[1], raw=block)
-            if len(dates) >= 3: add_field(fields, source, f"cert.{key}.last_annual", dates[2], raw=block)
-            if len(dates) >= 4: add_field(fields, source, f"cert.{key}.last_intermediate", dates[3], raw=block)
+        # A date-only row is not enough to assign an expiry.  Preserve one
+        # likely issue date for class/tonnage review, but never manufacture a
+        # validity date from column position.
+        if key == "tonnage" or (cert_order == "class" and not has_expiry_label(block)):
+            add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block, confidence="best-effort", extraction_method="row-order-issue-review")
+        elif has_issue_label(block) and len(dates) == 1:
+            add_field(fields, source, f"cert.{key}.issue", dates[0], raw=block, confidence="table-aware", extraction_method="labelled-issue")
     return fields
 
 # ----------------------------- Document-specific extractors -----------------------------
@@ -764,6 +1227,7 @@ def extract_hvpq(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     add_field(fields, source, "classification.conditions_of_class", next_value_after(lines, r"Does Vessel have any open Conditions of Class"))
     add_field(fields, source, "classification.memo_of_class", next_value_after(lines, r"Does Vessel have any Memoranda of Class"))
     add_field(fields, source, "classification.flag_dispensation", next_value_after(lines, r"Does vessel have any flag state dispensations"))
+    add_international_group_evidence(fields, source, text)
 
     # Incidents / PSC
     add_field(fields, source, "incidents.pollution_grounding_collision_allision", next_value_after(lines, r"pollution, grounding, collision or allision"))
@@ -779,6 +1243,7 @@ def extract_hvpq(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     fields += parse_cert_rows_from_sequence(cert_lines, source, cert_order="hvpq")
     add_section_and_operational_fields(fields, source, text)
     extract_hvpq_tank_coating_fields(fields, source, text)
+    fields += extract_port_history(pages, source=source)
     return dedupe_fields(fields)
 
 
@@ -828,12 +1293,9 @@ def extract_q88(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
             blocktxt = " ".join(block)
             key = cert_key_from_label(blocktxt)
             if key:
-                dates = extract_dates(blocktxt)
-                if len(dates)>=1: add_field(fields, source, f"cert.{key}.issue", dates[0], raw=blocktxt)
-                if len(dates)>=4: add_field(fields, source, f"cert.{key}.expiry", dates[3], raw=blocktxt)
-                elif len(dates)>=2: add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=blocktxt)
-                if len(dates)>=2: add_field(fields, source, f"cert.{key}.last_annual", dates[1], raw=blocktxt)
-                if len(dates)>=3: add_field(fields, source, f"cert.{key}.last_intermediate", dates[2], raw=blocktxt)
+                roles = certificate_row_roles(blocktxt, " ".join(lines[:60]), cert_order="q88")
+                if roles:
+                    add_cert_date_roles(fields, source, key, roles, blocktxt, confidence="table-aware")
     # Q88 line-based extraction fallback
     for line in lines:
         if re.search(r"1\.1\s+Date updated", line, re.I):
@@ -879,16 +1341,14 @@ def extract_q88(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
                 elif qno == "1.25a" and dates:
                     add_field(fields, source, "surveys.last_iws", dates[0], raw=line)
                     if len(dates) > 1: add_field(fields, source, "surveys.next_iws_due", dates[1], raw=line)
-        # Certificate rows Q88 order: issued, last annual, last intermediate, expires
+        # Certificate rows are accepted only when labels or a visible table
+        # header identify the date roles; date position alone is unsafe.
         if re.match(r"^2\.\d+\s+", line):
             key = cert_key_from_label(line)
             if key:
-                dates = extract_dates(line)
-                if len(dates) >= 1: add_field(fields, source, f"cert.{key}.issue", dates[0], raw=line)
-                if len(dates) >= 4: add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=line)
-                elif len(dates) >= 2: add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=line)
-                if len(dates) >= 2: add_field(fields, source, f"cert.{key}.last_annual", dates[1], raw=line)
-                if len(dates) >= 3: add_field(fields, source, f"cert.{key}.last_intermediate", dates[2], raw=line)
+                roles = certificate_row_roles(line, " ".join(lines[:60]), cert_order="q88")
+                if roles:
+                    add_cert_date_roles(fields, source, key, roles, line, confidence="table-aware")
         m = re.search(r"CII rating.*?\b([A-E])\b", line, re.I)
         if m:
             add_field(fields, source, "environment.cii_rating", m.group(1), raw=line)
@@ -899,6 +1359,9 @@ def extract_q88(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
 
     add_section_and_operational_fields(fields, source, text)
     extract_q88_coating_fields(fields, source, text)
+    add_international_group_evidence(fields, source, text)
+    add_q88_sts_marker(fields, source, text)
+    fields += extract_port_history(pages, source=source)
 
     # Certificate special: P&I coverage/expiration contains expiry only
     for line in lines:
@@ -912,6 +1375,147 @@ def extract_q88(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
     if win:
         add_field(fields, source, "classification.class_notation", re.sub(r"^1\.19\s+Class notation:\s*", "", win, flags=re.I), raw=win)
 
+    return dedupe_fields(fields)
+
+
+def _add_general_identity(fields: List[FieldRecord], source: str, text: str):
+    imo_match = re.search(r"\bIMO(?:\s+(?:No\.?|Number|/LR))?\s*[:#|\-]?\s*(\d{7})\b", text or "", re.I)
+    if imo_match:
+        add_field(fields, source, "vessel.imo", imo_match.group(1), raw=imo_match.group(0), confidence="table-aware")
+    name_match = re.search(r"(?:Name\s+of\s+(?:the\s+)?(?:Ship|Vessel)|Ship\s+Name|Vessel\s+Name)\s*[:#|\-]?\s*\n?\s*([A-Z0-9][A-Z0-9 '\-/]{2,70})", text or "", re.I)
+    if name_match:
+        value = clean_text(name_match.group(1)).split(" Date ")[0]
+        value = re.split(r"\s{2,}|\n", value)[0]
+        if value and not re.search(r"questionnaire|report|number", value, re.I):
+            add_field(fields, source, "vessel.name", value, raw=name_match.group(0), confidence="table-aware")
+
+
+def add_international_group_evidence(fields: List[FieldRecord], source: str, text: str):
+    """Capture explicit International Group membership; wording alone is not a Yes."""
+    body = text or ""
+    explicit = re.search(
+        r"(?:member|membership|club)\s+(?:of\s+)?(?:the\s+)?international\s+group|international\s+group(?:\s+of\s+p\s*(?:&|and)\s*i\s+clubs?)?\s+(?:member|membership)",
+        body,
+        re.I,
+    )
+    if not explicit:
+        return
+    window = body[max(0, explicit.start() - 140):min(len(body), explicit.end() + 160)]
+    yes_no = re.search(r"\b(yes|no)\b", window, re.I)
+    if yes_no:
+        value = yes_no.group(1).title()
+        confidence = "table-aware"
+    else:
+        value = "International Group wording visible — membership not explicit"
+        confidence = "best-effort"
+    add_field(fields, source, "insurance.international_group_member", value, label="P&I International Group membership", raw=window, confidence=confidence, extraction_method="international-group-context")
+
+
+def add_q88_sts_marker(fields: List[FieldRecord], source: str, text: str):
+    """Read a Q88 STS answer only from a local STS-labelled context."""
+    body = text or ""
+    for match in re.finditer(r"(?:ship\s*[- ]?to\s*[- ]?ship|\bSTS\b|ship-to-ship\s+transfer)", body, re.I):
+        window = clean_text(body[max(0, match.start() - 130):min(len(body), match.end() + 220)])
+        if not re.search(r"(?:operation|transfer|approved|compatible|conduct|capabil|allowed|available|perform|question)", window, re.I):
+            continue
+        yes_no = re.findall(r"\b(Yes|No)\b", window, re.I)
+        if yes_no:
+            add_field(fields, source, "sts.q88_marked", yes_no[-1].title(), label="STS in Q88", raw=window, confidence="table-aware", extraction_method="q88-sts-local-answer")
+        else:
+            add_field(fields, source, "sts.q88_marked", "STS wording visible — answer not explicit", label="STS in Q88", raw=window, confidence="best-effort", extraction_method="q88-sts-local-context")
+        break
+
+
+def _port_history_block(text: str) -> str:
+    body = text or ""
+    heading = re.search(r"last\s+(?:10|ten)\s+ports?|port\s+history|previous\s+ports?|ports?\s+of\s+call", body, re.I)
+    if not heading:
+        return ""
+    tail = body[heading.start():heading.start() + 18000]
+    # Stop at the next numbered section or a clearly unrelated document chapter.
+    # Table markers are part of the machine-readable evidence channel. Do not
+    # stop at [TABLE ...] before the rows are parsed; remove those markers
+    # after the relevant section boundary is found instead.
+    stop = re.search(r"\n\s*(?:\d{1,2}(?:\.\d+){1,3})\s+\S|\b(?:crew|certificates?|class status)\b", tail[40:], re.I)
+    if stop:
+        tail = tail[:40 + stop.start()]
+    # Keep row/newline boundaries for port-table parsing; only collapse runs of
+    # horizontal whitespace. Flattening here would merge all ten ports into one
+    # pseudo-row and lose the date-to-port relationship.
+    tail = re.sub(r"\[/?(?:TABLE|SHEET)[^\]]*\]", " ", tail, flags=re.I)
+    tail = re.sub(r"[ \t]+", " ", tail)
+    tail = re.sub(r"\n{2,}", "\n", tail)
+    return tail.strip()[:12000]
+
+
+def extract_port_history(pages: List[Tuple[int, str]], source: str = "PORT_HISTORY") -> List[FieldRecord]:
+    """Identify last-port history and expose sanctions cues without legal clearance."""
+    text = join_pages(pages)
+    fields: List[FieldRecord] = []
+    _add_general_identity(fields, source, text)
+    block = _port_history_block(text)
+    if not block:
+        return dedupe_fields(fields)
+    add_field(fields, source, "port.history", block, label="Last 10 ports / port history", raw=block, confidence="section-snippet", extraction_method="port-history-section")
+
+    rows: List[Tuple[str, str]] = []
+    for line in lines_from_text(block):
+        dates = extract_dates(line)
+        if not dates:
+            continue
+        date_value = dates[0]
+        remainder = clean_text(DATE_RE.sub("", line, count=1))
+        remainder = re.sub(r"^(?:last\s+(?:10|ten)\s+ports?|port\s+history|previous\s+ports?|ports?\s+of\s+call)\s*", "", remainder, flags=re.I)
+        remainder = re.sub(r"\[/?SHEET[^\]]*\]|\[/?TABLE[^\]]*\]", "", remainder, flags=re.I)
+        remainder = re.sub(r"^(?:[-|:;,]+|arrival|departure|port\s+of\s+call)\s*", "", remainder, flags=re.I)
+        remainder = re.split(r"\b(?:arrival|departure|sailing|country|terminal|remarks?)\b", remainder, maxsplit=1, flags=re.I)[0].strip(" |,;:-")
+        if remainder and len(remainder) > 1:
+            rows.append((remainder[:120], date_value))
+    if rows:
+        for index, (port, date_value) in enumerate(rows[:10], 1):
+            add_field(fields, source, f"port.{index}.name", port, label=f"Port history {index} name", raw=block, confidence="best-effort", extraction_method="date-row-port")
+            add_field(fields, source, f"port.{index}.date", date_value, label=f"Port history {index} date", raw=block, confidence="best-effort", extraction_method="date-row-port")
+    add_field(fields, source, "port.history.count", str(min(10, len(rows))), label="Port history rows identified", raw=block, confidence="best-effort", extraction_method="port-row-count")
+
+    risk_tokens = r"iran|iranian|syria|syrian|north\s+korea|dprk|crimea|sevastopol|donetsk|luhansk|cuba|sudan|libya"
+    risky = re.findall(rf"\b(?:{risk_tokens})\b", block, re.I)
+    if risky:
+        status = "Potential sanctions screening cue — verify against current company list"
+    else:
+        status = "No obvious sanctions keyword in extracted ports — current-list verification still required"
+    add_field(fields, source, "sanctions.screening_status", status, label="Sanctions screening status", raw=block, confidence="best-effort", extraction_method="port-history-cue")
+    return dedupe_fields(fields)
+
+
+def extract_crew_matrix(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
+    text = join_pages(pages)
+    fields: List[FieldRecord] = []
+    _add_general_identity(fields, "CREW_MATRIX", text)
+    add_field(fields, "CREW_MATRIX", "crew.matrix", clean_text(text)[:12000], label="Crew matrix evidence", raw=text[:1800], confidence="section-snippet", extraction_method="office/table-normalized")
+    ranks = []
+    for label in ("Master", "Chief Officer", "Second Officer", "Third Officer", "Chief Engineer", "Second Engineer", "Third Engineer", "Fourth Engineer", "Bosun", "Able Seaman", "AB", "Oiler", "Motorman", "Cook", "ETO", "Electrician"):
+        if re.search(rf"\b{re.escape(label)}\b", text, re.I):
+            ranks.append(label)
+    if ranks:
+        add_field(fields, "CREW_MATRIX", "crew.ranks", ", ".join(ranks), label="Crew ranks identified", raw=text[:2400], confidence="table-aware", extraction_method="rank-detection")
+    total = re.search(r"(?:total\s+crew|crew\s+(?:complement|on\s+board)|number\s+of\s+crew|total\s+persons?)\D{0,20}(\d{1,3})\b", text, re.I)
+    if total:
+        add_field(fields, "CREW_MATRIX", "crew.total", total.group(1), label="Crew total / complement", raw=total.group(0), confidence="table-aware", extraction_method="labelled-total")
+    add_field(fields, "CREW_MATRIX", "crew.manning_status", "Identified — compare with current Safe Manning Certificate and crew certificates", label="Manning review status", raw=text[:1600], confidence="best-effort", extraction_method="crew-review-gate")
+    return dedupe_fields(fields)
+
+
+def extract_sanctions_document(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
+    text = join_pages(pages)
+    fields: List[FieldRecord] = []
+    _add_general_identity(fields, "SANCTIONS", text)
+    window = clean_text(text)[:16000]
+    yes = re.search(r"(?:screened|screening|sanctions?).{0,120}\b(yes|no|clear|passed|failed)\b", window, re.I | re.S)
+    if yes:
+        value = yes.group(1).title()
+        add_field(fields, "SANCTIONS", "sanctions.screening_status", value, label="Sanctions screening status", raw=yes.group(0), confidence="table-aware", extraction_method="labelled-sanctions-answer")
+    else:
+        add_field(fields, "SANCTIONS", "sanctions.screening_status", "Sanctions evidence identified — current-list verification required", label="Sanctions screening status", raw=window[:1800], confidence="best-effort", extraction_method="sanctions-review-gate")
     return dedupe_fields(fields)
 
 
@@ -1073,16 +1677,11 @@ def extract_class_status(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
         if key:
             win = " ".join(lines[max(0, i-2):min(len(lines), i+3)])
             dates = extract_dates(win)
-            issue_dt, expiry_dt = labelled_cert_dates(win)
-            if issue_dt and not sources_value(fields, f"cert.{key}.issue").get(source):
-                add_field(fields, source, f"cert.{key}.issue", issue_dt, raw=win)
-            if expiry_dt and not sources_value(fields, f"cert.{key}.expiry").get(source):
-                add_field(fields, source, f"cert.{key}.expiry", expiry_dt, raw=win)
-            # Safe fallback: multiple dates can be issue+validity only if an expiry label exists in the same window.
-            if has_expiry_label(win) and len(dates) >= 2 and not sources_value(fields, f"cert.{key}.expiry").get(source):
-                add_field(fields, source, f"cert.{key}.expiry", dates[-1], raw=win)
+            roles = labelled_cert_date_roles(win)
+            if roles:
+                add_cert_date_roles(fields, source, key, roles, win, confidence="table-aware")
             elif has_issue_label(win) and len(dates) >= 1 and not sources_value(fields, f"cert.{key}.issue").get(source):
-                add_field(fields, source, f"cert.{key}.issue", dates[0], raw=win)
+                add_field(fields, source, f"cert.{key}.issue", dates[0], raw=win, extraction_method="labelled-issue")
     # Last chance expiry extraction: only if an expiry/validity label is present nearby.
     for i, line in enumerate(lines):
         key = cert_key_from_label(line)
@@ -1090,8 +1689,10 @@ def extract_class_status(pages: List[Tuple[int, str]]) -> List[FieldRecord]:
             win = " ".join(lines[max(0, i-2):min(len(lines), i+4)])
             dates = extract_dates(win)
             if dates and has_expiry_label(win):
-                issue_dt, expiry_dt = labelled_cert_dates(win)
-                add_field(fields, source, f"cert.{key}.expiry", expiry_dt or dates[-1], raw=win)
+                roles = labelled_cert_date_roles(win)
+                expiry_dt = roles.get("expiry", "")
+                if expiry_dt:
+                    add_cert_date_roles(fields, source, key, roles, win, confidence="table-aware")
 
     # Survey status rows KR/NK
     for line in lines:
@@ -1233,11 +1834,8 @@ def extract_generic_certificate(pages: List[Tuple[int, str]]) -> List[FieldRecor
             if cert_key:
                 break
     if cert_key:
-        issue, expiry = labelled_cert_dates(text[:12000])
-        if issue:
-            add_field(fields, source, f"cert.{cert_key}.issue", issue, raw=text[:1800], confidence="table-aware")
-        if expiry:
-            add_field(fields, source, f"cert.{cert_key}.expiry", expiry, raw=text[:1800], confidence="table-aware")
+        roles = labelled_cert_date_roles(text[:12000])
+        add_cert_date_roles(fields, source, cert_key, roles, text[:1800], confidence="table-aware")
         # Capture certificate number for key-facts/export; it is not used as a
         # validity decision when the label is unclear.
         number_match = re.search(r"(?:Certificate\s+(?:No\.?|Number)|Cert\.?\s*No\.?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9/._-]{3,40})", text, re.I)
@@ -1258,26 +1856,198 @@ def extract_insurance_evidence(pages: List[Tuple[int, str]]) -> List[FieldRecord
     club_match = re.search(r"(?:P\s*(?:&|and)\s*I\s+Club|Club)\s*[:\-]?\s*([^\n]{3,100})", text, re.I)
     if club_match:
         add_field(fields, source, "insurance.pni_club", club_match.group(1), raw=club_match.group(0), confidence="deterministic")
-    _, expiry = labelled_cert_dates(text[:14000])
-    if expiry:
-        add_field(fields, source, "cert.pni_cover.expiry", expiry, label="P&I cover expiry", raw=text[:2200], confidence="table-aware")
+    roles = labelled_cert_date_roles(text[:14000])
+    if roles.get("expiry"):
+        add_field(fields, source, "cert.pni_cover.expiry", roles["expiry"], label="P&I cover expiry", raw=text[:2200], confidence="table-aware", extraction_method="labelled-expiry")
+    add_international_group_evidence(fields, source, text)
     return dedupe_fields(fields)
 
 
-def _source_for_document_type(doc_type: str) -> str:
-    return {"HVPQ": "HVPQ", "PIQ": "PIQ", "Q88": "Q88", "CLASS": "CLASS", "HVPQ_XML": "XML", "CERTIFICATE": "CERTIFICATE", "PNI": "CERTIFICATE"}.get(doc_type, doc_type)
+VISION_PRIORITY_RE = re.compile(
+    r"certificate|valid\s+until|expiry|date\s+of\s+issue|class\s+status|condition(?:s)?\s+of\s+class|"
+    r"P\s*(?:&|and)\s*I|international\s+group|mooring|rope|tail|BRC|brake|ship\s*[- ]?to\s*[- ]?ship|\bSTS\b|"
+    r"last\s+(?:10|ten)\s+ports?|port\s+history|crew\s+(?:matrix|list)|safe\s+manning|PSC|sanction|IMO",
+    re.I,
+)
 
 
-def process_document_bytes(filename: str, data: bytes, enable_ocr: bool = True, use_llm: bool = False, ollama_url: str = "", ollama_model: str = "") -> ProcessedDocument:
-    is_xml = filename.lower().endswith(".xml")
-    if is_xml:
-        decoded = data.decode("utf-8", errors="replace")
-        pages: List[Tuple[int, str]] = [(1, decoded)]
-        text = decoded
+def _ollama_vision_page(base_url: str, model: str, image_bytes: bytes, page_number: int, timeout: int = 300) -> str:
+    """Ask a local vision model for a literal Markdown transcription."""
+    url = base_url.rstrip("/") + "/api/chat"
+    prompt = f"""
+Transcribe page {page_number} of a marine vessel document into faithful Markdown.
+Preserve headings, question numbers, row/column relationships, checkboxes, Yes/No answers,
+certificate names, every date label, every date value, IMO/name, and table cells.
+Do not summarise, correct, infer, or decide compliance. If text is unreadable write [[unclear]].
+Return only the transcription.
+""".strip()
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [{
+            "role": "user",
+            "content": prompt,
+            "images": [base64.b64encode(image_bytes).decode("ascii")],
+        }],
+        "options": {"temperature": 0.0},
+    }
+    response = requests.post(url, json=payload, timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    value = str((body.get("message") or {}).get("content") or body.get("response") or "")
+    return value.replace("\x00", " ").strip()
+
+
+def local_vision_read_pdf(
+    data: bytes,
+    pages: List[Tuple[int, str]],
+    base_url: str,
+    model: str,
+    scope: str = "Critical and unreadable pages",
+    page_limit: int = 30,
+) -> Tuple[List[Tuple[int, str]], List[str], List[str]]:
+    """Add an independent page-image transcription channel from local AI."""
+    methods: List[str] = []
+    notes: List[str] = []
+    if not data or not clean_text(model):
+        return pages, methods, ["Local AI vision model was not configured"]
+    text_by_page = dict(pages)
+    available = [page_number for page_number, _ in pages]
+    if scope == "Every page":
+        selected = available
     else:
-        pages = extract_pdf_pages(data, enable_ocr=enable_ocr)
+        selected = [
+            page_number
+            for page_number, text in pages
+            if _visible_char_count(text) < 180 or VISION_PRIORITY_RE.search(text or "")
+        ]
+        if available:
+            selected = list(dict.fromkeys(available[:2] + selected))
+    selected = selected[:max(1, int(page_limit or 1))]
+    if not selected:
+        return pages, methods, ["No page met the local AI vision selection rule"]
+
+    successes = 0
+    try:
+        with fitz.open(stream=data, filetype="pdf") as document:
+            for page_number in selected:
+                if page_number < 1 or page_number > len(document):
+                    continue
+                page = document[page_number - 1]
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+                image_bytes = pixmap.tobytes("png")
+                try:
+                    transcription = _ollama_vision_page(base_url, model, image_bytes, page_number)
+                except Exception as exc:
+                    notes.append(f"Local AI vision page {page_number} failed: {exc}")
+                    continue
+                if _visible_char_count(transcription) < 20:
+                    notes.append(f"Local AI vision page {page_number} returned too little text")
+                    continue
+                existing = text_by_page.get(page_number, "")
+                text_by_page[page_number] = (
+                    existing
+                    + f"\n[LOCAL AI VISION TRANSCRIPTION page {page_number}]\n"
+                    + transcription
+                    + "\n[/LOCAL AI VISION TRANSCRIPTION]\n"
+                )
+                successes += 1
+    except Exception as exc:
+        notes.append(f"Local AI vision could not open the PDF: {exc}")
+    if successes:
+        methods.append(f"Local AI page-image transcription ({successes} page(s))")
+    return [(page_number, text_by_page.get(page_number, text)) for page_number, text in pages], methods, notes
+
+
+AI_CLASSIFIABLE_TYPES = {
+    "HVPQ", "PIQ", "Q88", "CLASS", "CERTIFICATE", "PNI", "STS_PLAN",
+    "STS_ASSESSMENT", "PSC_REPORT", "MOORING_PLAN", "CREW_MATRIX",
+    "PORT_HISTORY", "SANCTIONS",
+}
+
+
+def local_ai_classify_document(filename: str, pages: List[Tuple[int, str]], base_url: str, model: str) -> Tuple[str, str, str]:
+    """Classify an otherwise unknown file only with a verified source quote."""
+    snippet = join_pages(pages)[:50000]
+    prompt = f"""
+Classify this marine document into exactly one label from this list:
+{', '.join(sorted(AI_CLASSIFIABLE_TYPES))}.
+Return only JSON: {{"document_type":"LABEL","evidence_quote":"literal short quote from the document"}}.
+Do not guess. The evidence_quote must be copied exactly from the supplied text. If unclear, return document_type UNKNOWN.
+Filename: {filename}
+TEXT:
+{snippet}
+"""
+    try:
+        response = ollama_generate(base_url, model, prompt, timeout=180)
+        payload = extract_json_from_llm_response(response)
+    except Exception as exc:
+        return "", "", f"Local AI classification failed: {exc}"
+    doc_type = clean_text(payload.get("document_type", "")).upper()
+    quote = clean_text(payload.get("evidence_quote", ""))
+    if doc_type not in AI_CLASSIFIABLE_TYPES:
+        return "", "", "Local AI did not produce a supported classification"
+    if len(normalize_value(quote)) < 8 or normalize_value(quote) not in normalize_value(snippet):
+        return "", "", "Local AI classification was discarded because its evidence quote could not be matched to the document"
+    return doc_type, quote, ""
+
+
+def _source_for_document_type(doc_type: str) -> str:
+    return {
+        "HVPQ": "HVPQ", "PIQ": "PIQ", "Q88": "Q88", "CLASS": "CLASS",
+        "HVPQ_XML": "XML", "CERTIFICATE": "CERTIFICATE", "PNI": "CERTIFICATE",
+        "CREW_MATRIX": "CREW_MATRIX", "PORT_HISTORY": "PORT_HISTORY", "SANCTIONS": "SANCTIONS",
+    }.get(doc_type, doc_type)
+
+
+def process_document_bytes(
+    filename: str,
+    data: bytes,
+    enable_ocr: bool = True,
+    use_llm: bool = False,
+    ollama_url: str = "",
+    ollama_model: str = "",
+    accuracy_first: bool = True,
+    use_vision: bool = False,
+    ollama_vision_model: str = "",
+    vision_scope: str = "Critical and unreadable pages",
+    vision_page_limit: int = 30,
+) -> ProcessedDocument:
+    is_xml = filename.lower().endswith(".xml")
+    reading_methods: List[str] = []
+    reading_notes: List[str] = []
+    pages, text, structured_tables, document_format, sheet_names = extract_document_machine_readable(
+        filename,
+        data,
+        enable_ocr=enable_ocr,
+        accuracy_first=accuracy_first,
+        reading_methods=reading_methods,
+        reading_notes=reading_notes,
+    )
+    if use_vision and document_format == "pdf":
+        pages, vision_methods, vision_notes = local_vision_read_pdf(
+            data,
+            pages,
+            ollama_url,
+            ollama_vision_model or ollama_model,
+            scope=vision_scope,
+            page_limit=vision_page_limit,
+        )
+        reading_methods.extend(vision_methods)
+        reading_notes.extend(vision_notes)
         text = join_pages(pages)
-    profile = profile_document(filename, pages, text, is_xml=is_xml)
+    profile = profile_document(filename, pages, text, is_xml=is_xml, document_format=document_format)
+    if use_llm and profile.doc_type == "UNKNOWN" and pages:
+        ai_type, ai_quote, ai_note = local_ai_classify_document(filename, pages, ollama_url, ollama_model)
+        if ai_type:
+            profile.doc_type = ai_type
+            profile.doc_label = DOC_LABELS.get(ai_type, ai_type)
+            profile.confidence_score = 68
+            profile.confidence = "Medium"
+            profile.classification_evidence = f"Local AI classification with verified source quote: {ai_quote}"
+            reading_methods.append("Local AI document classification with evidence quote")
+        elif ai_note:
+            reading_notes.append(ai_note)
     fields: List[FieldRecord] = []
     if profile.doc_type == "HVPQ":
         fields = extract_hvpq(pages)
@@ -1293,13 +2063,19 @@ def process_document_bytes(filename: str, data: bytes, enable_ocr: bool = True, 
         fields = extract_insurance_evidence(pages)
     elif profile.doc_type == "HVPQ_XML":
         fields = extract_xml(io.BytesIO(data))
+    elif profile.doc_type == "CREW_MATRIX":
+        fields = extract_crew_matrix(pages)
+    elif profile.doc_type == "PORT_HISTORY":
+        fields = extract_port_history(pages, source="PORT_HISTORY")
+    elif profile.doc_type == "SANCTIONS":
+        fields = extract_sanctions_document(pages)
 
     source = _source_for_document_type(profile.doc_type)
     for extracted_field in fields:
         extracted_field.document_name = filename
     if fields and pages:
         attach_field_evidence(fields, {source: pages})
-    if use_llm and profile.doc_type in {"HVPQ", "PIQ", "Q88", "CLASS"} and pages:
+    if use_llm and profile.doc_type in {"HVPQ", "PIQ", "Q88", "CLASS", "CERTIFICATE", "PNI"} and pages:
         llm_fields = llm_assist_extract(profile.doc_type, pages, ollama_url, ollama_model)
         for extracted_field in llm_fields:
             extracted_field.document_name = filename
@@ -1323,17 +2099,60 @@ def process_document_bytes(filename: str, data: bytes, enable_ocr: bool = True, 
         profile.grouping_evidence = "Checksum-valid IMO extracted" if len(visible_imos) <= 1 else f"Multiple checksum-valid IMOs visible: {profile.related_imos}"
     else:
         profile.assigned_group = "Unassigned"
-    return ProcessedDocument(profile=profile, pages=pages, text=text, fields=fields, file_hash=hashlib.sha256(data).hexdigest())
+    return ProcessedDocument(
+        profile=profile,
+        pages=pages,
+        text=text,
+        fields=fields,
+        file_hash=hashlib.sha256(data).hexdigest(),
+        document_format=document_format,
+        machine_text=text,
+        structured_tables=structured_tables,
+        sheet_names=sheet_names,
+        reading_methods=list(dict.fromkeys(reading_methods)),
+        reading_notes=list(dict.fromkeys(note for note in reading_notes if note)),
+    )
 
 
-def process_uploaded_documents(uploaded_files, enable_ocr: bool = True, use_llm: bool = False, ollama_url: str = "", ollama_model: str = "") -> List[ProcessedDocument]:
+def process_uploaded_documents(
+    uploaded_files,
+    enable_ocr: bool = True,
+    use_llm: bool = False,
+    ollama_url: str = "",
+    ollama_model: str = "",
+    accuracy_first: bool = True,
+    use_vision: bool = False,
+    ollama_vision_model: str = "",
+    vision_scope: str = "Critical and unreadable pages",
+    vision_page_limit: int = 30,
+) -> List[ProcessedDocument]:
     """Process uploaded files once per active Streamlit session."""
     payload = [(file.name, file.getvalue()) for file in uploaded_files]
-    fingerprint = hashlib.sha256(b"|".join(name.encode("utf-8", errors="ignore") + b":" + hashlib.sha256(data).digest() for name, data in payload) + str(enable_ocr).encode() + str(use_llm).encode()).hexdigest()
+    option_fingerprint = "|".join([
+        str(enable_ocr), str(use_llm), str(accuracy_first), str(use_vision),
+        clean_text(ollama_url), clean_text(ollama_model), clean_text(ollama_vision_model),
+        clean_text(vision_scope), str(vision_page_limit),
+    ]).encode("utf-8", errors="ignore")
+    fingerprint = hashlib.sha256(b"|".join(name.encode("utf-8", errors="ignore") + b":" + hashlib.sha256(data).digest() for name, data in payload) + option_fingerprint).hexdigest()
     cache_key = "docusure_processed_documents"
     if st.session_state.get("docusure_upload_fingerprint") == fingerprint and cache_key in st.session_state:
         return st.session_state[cache_key]
-    processed = [process_document_bytes(name, data, enable_ocr, use_llm, ollama_url, ollama_model) for name, data in payload]
+    processed = [
+        process_document_bytes(
+            name,
+            data,
+            enable_ocr,
+            use_llm,
+            ollama_url,
+            ollama_model,
+            accuracy_first,
+            use_vision,
+            ollama_vision_model,
+            vision_scope,
+            vision_page_limit,
+        )
+        for name, data in payload
+    ]
     assign_document_groups(processed)
     st.session_state["docusure_upload_fingerprint"] = fingerprint
     st.session_state[cache_key] = processed
@@ -1411,12 +2230,170 @@ def merge_group_content(documents: List[ProcessedDocument]) -> Tuple[List[FieldR
     for doc in documents:
         fields.extend(doc.fields)
         source = _source_for_document_type(doc.profile.doc_type)
-        if source in {"HVPQ", "PIQ", "Q88", "CLASS", "CERTIFICATE", "XML"}:
+        if source in {"HVPQ", "PIQ", "Q88", "CLASS", "CERTIFICATE", "XML", "CREW_MATRIX", "PORT_HISTORY", "SANCTIONS", "MOORING_PLAN", "STS_PLAN"}:
             page_cache[source].extend(doc.pages)
             text_by_source[source].append(doc.text)
     fields = dedupe_fields(fields)
     attach_field_evidence(fields, dict(page_cache))
     return fields, dict(page_cache), {source: "\n".join(parts) for source, parts in text_by_source.items()}
+
+
+def build_single_sts_screen(documents: List[ProcessedDocument], vessel_group: str, ref_date: date, watch_days: int = 180) -> Tuple[str, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run STS readiness checks for one vessel without requiring a counterpart.
+
+    The output is deliberately a checklist rather than a legal/operational
+    clearance.  PASS means the requested evidence is visible and internally
+    coherent; REVIEW/HOLD means a user should resolve it before relying on the
+    pack; NOT VERIFIED means the evidence was absent or too ambiguous.
+    """
+    fields, _, texts_by_source = merge_group_content(documents)
+    profiles = [doc.profile for doc in documents]
+    label_candidates = [p.vessel_name for p in profiles if p.vessel_name]
+    vessel_label = f"{label_candidates[0]} / {vessel_group}" if label_candidates else vessel_group
+    rows: List[Dict[str, str]] = []
+
+    def add(status: str, area: str, check: str, evidence: str, why: str, action: str, confidence: str = "Medium"):
+        rows.append({
+            "Status": status,
+            "Vessel": vessel_label,
+            "Area": area,
+            "Check": check,
+            "Evidence": evidence or "Not reliably extracted",
+            "Why it matters": why,
+            "Required action": action,
+            "Confidence": confidence,
+        })
+
+    # Baseline document presence is useful in single-vessel mode too.
+    for item in sts_document_check_rows(profiles, vessel_group, vessel_label):
+        rows.append(item)
+
+    # Certificate validity and the explicit no-short-term-certificates rule.
+    cert_watch = certificate_watch_df(fields, ref_date, horizon_days=watch_days)
+    # A short-term/temporary/provisional certificate is a separate acceptance
+    # concern from an ordinary certificate that simply expires soon. Flag the
+    # explicit wording wherever it appears; do not infer it from an
+    # intermediate endorsement date.
+    short_term_hits = []
+    for document in documents:
+        if document.profile.doc_type in {"CERTIFICATE", "PNI"}:
+            hit = re.search(r"\b(?:short[- ]term|temporary|provisional)\s+(?:certificate|cert\.?|document)\b", document.text or "", re.I)
+            if hit:
+                short_term_hits.append(f"{document.profile.filename}: {clean_text(document.text[max(0, hit.start()-80):hit.end()+140])}")
+    if short_term_hits:
+        add("HOLD", "Certificates", "No short-term / temporary certificates", " | ".join(short_term_hits)[:900], "A short-term or temporary certificate may not satisfy charterer, terminal or STS acceptance for the intended operation.", "Obtain the full-term certificate or written acceptance from the relevant authority/charterer before relying on clearance.", "High")
+    if cert_watch.empty:
+        add("NOT VERIFIED", "Certificates", "Certificate expiry evidence", "No labelled expiry was reliably extracted", "An STS acceptance review normally needs the current certificate set, not just a declaration.", "Upload/read the original certificates or current Class Status and verify each expiry/endorsement.", "Low")
+    else:
+        for _, item in cert_watch.iterrows():
+            status_text = clean_text(item.get("Status", ""))
+            evidence = f"{item.get('Expiry used', '')} ({item.get('Days remaining', '')} days); {item.get('Evidence file / page', '') or item.get('Preferred source', '')}"
+            if status_text == "Expired":
+                add("HOLD", "Certificates", clean_text(item.get("Certificate", "")) + " expiry", evidence, "An expired certificate can stop chartering/terminal acceptance and safe operation.", "Resolve or renew before STS planning; confirm corrected source evidence.", clean_text(item.get("Confidence", "High")))
+            elif "30 days" in status_text or "90 days" in status_text:
+                add("REVIEW", "Certificates", clean_text(item.get("Certificate", "")) + " short-term validity", evidence, "Short validity may not cover the intended operation, voyage or charterer acceptance window.", "Confirm validity through completion of the operation or renew before fixture/clearance.", clean_text(item.get("Confidence", "Medium")))
+        if not short_term_hits and not any("short-term" in clean_text(item.get("Status", "")).lower() or "30 days" in clean_text(item.get("Status", "")) for _, item in cert_watch.iterrows()):
+            add("PASS", "Certificates", "No short-term certificate expiry detected", f"{len(cert_watch)} labelled expiry date(s) reviewed against {ref_date.isoformat()}", "Short-term certificates are a common chartering concern.", "Keep original certificates and endorsement records available for final approval.", "Medium")
+
+    # P&I International Group membership must be explicit, not inferred from a
+    # club name or the words 'International Group' alone.
+    pni = engine_best_field(fields, "insurance.international_group_member", ["CERTIFICATE", "HVPQ", "Q88", "PNI"])
+    pni_value = clean_text(getattr(pni, "value", "")) if pni else ""
+    pni_bool = normalize_bool(pni_value)
+    if pni_bool == "yes":
+        add("PASS", "P&I", "P&I is an International Group member", pni_value, "International Group membership is a requested STS/chartering acceptance criterion.", "Retain the current P&I Certificate of Entry/blue card as supporting evidence.", "High")
+    elif pni_bool == "no":
+        add("HOLD", "P&I", "P&I International Group membership", pni_value, "The uploaded evidence explicitly indicates non-membership.", "Obtain acceptable P&I evidence or chartering approval before clearance.", "High")
+    else:
+        add("NOT VERIFIED", "P&I", "P&I is an International Group member", pni_value or "No explicit Yes/No membership answer", "A club name alone does not prove International Group membership.", "Verify the current P&I entry/blue card and the club's International Group status.", "Low")
+
+    # Class Status is the reference. Compare other declarations to it rather
+    # than treating the first extracted class name as authoritative.
+    class_status = engine_best_field(fields, "classification.class_society", ["CLASS"])
+    class_value = clean_text(getattr(class_status, "value", "")) if class_status else ""
+    compared = [f for f in fields if f.field_id == "classification.class_society" and f.source in {"HVPQ", "Q88"} and clean_text(f.value)]
+    if not class_value:
+        add("NOT VERIFIED", "Class", "Class matches provided Class Status", "No Class Status class society was reliably extracted", "Class identity is a gate for certificates and survey status.", "Upload/currently extract Class Status and compare the class society/notation.", "Low")
+    elif not compared:
+        add("NOT VERIFIED", "Class", "Class matches provided Class Status", f"Class Status: {class_value}; no second declaration available", "A single Class Status document cannot prove cross-document consistency.", "Compare the Class Status with HVPQ/Q88 and the certificate set.", "Medium")
+    elif all(semantically_equivalent(class_value, f.value, "classification.class_society") for f in compared):
+        add("PASS", "Class", "Class matches provided Class Status", f"Class Status: {class_value}; compared declarations agree", "Class Status is used as the reference for class identity.", "Retain the current Class Status for final review.", "High")
+    else:
+        add("HOLD", "Class", "Class differs from provided Class Status", f"Class Status: {class_value}; other declaration(s): {', '.join(f.value for f in compared)}", "A class mismatch can invalidate certificate/status assumptions and create chartering concern.", "Resolve the mismatch against the latest Class Status and update stale forms.", "High")
+
+    conditions = engine_best_field(fields, "classification.conditions_of_class", ["CLASS"])
+    conditions_value = clean_text(getattr(conditions, "value", "")) if conditions else ""
+    non_class_conditions = engine_best_field(fields, "classification.conditions_of_class", ["HVPQ", "Q88"])
+    if not conditions:
+        alt_value = clean_text(getattr(non_class_conditions, "value", "")) if non_class_conditions else ""
+        add("NOT VERIFIED", "Class", "No Conditions of Class", alt_value or "No Class Status answer", "HVPQ/Q88 declarations are not a substitute for the current Class Status section.", "Confirm Conditions of Class directly in current Class Status evidence.", "Low")
+    elif normalize_bool(conditions_value) == "no":
+        add("PASS", "Class", "No Conditions of Class", conditions_value, "Open conditions can impose restrictions or prevent acceptance.", "Keep the Class Status evidence available.", "High")
+    elif normalize_bool(conditions_value) == "yes" or re.search(r"\b(open|outstanding|condition\s+no\.?|overdue)\b", conditions_value, re.I):
+        add("HOLD", "Class", "No Conditions of Class", conditions_value, "An open/outstanding condition may carry an operational or acceptance restriction.", "Review the full condition, due date and class acceptance before STS clearance.", "High")
+    else:
+        add("NOT VERIFIED", "Class", "No Conditions of Class", conditions_value or "No explicit Nil/No answer", "A heading or missing value cannot be treated as Nil.", "Confirm the Conditions of Class section in the current Class Status.", "Low")
+
+    # Mooring inventory and last renewal/service dates. No universal age limit
+    # is imposed; the LMP/MSMP/manufacturer criteria remain the authority.
+    mooring_summary, mooring_inventory = extract_mooring_summary(texts_by_source, ref_date)
+    if mooring_inventory.empty:
+        add("NOT VERIFIED", "Mooring", "Mooring ropes/tails last renewal or service dates", "No reliable rope/tail/wire rows identified", "STS suitability depends on line/tail identity, history and retirement criteria.", "Provide the LMP/MSMP, certificates and a readable HVPQ mooring table.", "Low")
+    else:
+        line_rows = mooring_inventory[mooring_inventory["Type"].astype(str).str.contains("Tail|Rope|Wire", case=False, regex=True)]
+        if line_rows.empty:
+            add("NOT VERIFIED", "Mooring", "Mooring ropes/tails last renewal or service dates", "No rope/tail/wire row was separable", "The document may contain a heading but not a reliable equipment inventory.", "Verify every line/tail against the LMP/MSMP and certificates.", "Low")
+        else:
+            for _, item in line_rows.iterrows():
+                visible_date = clean_text(item.get("Visible date", ""))
+                item_name = " / ".join(x for x in [clean_text(item.get("Type", "")), clean_text(item.get("Location / identity", ""))] if x)
+                if visible_date:
+                    add("REVIEW", "Mooring", f"{item_name} — last renewal/service date", visible_date, "A visible date is useful evidence but does not by itself prove the applicable retirement interval.", "Verify date basis (renewal/installation/service), line certificate and LMP/MSMP retirement criterion.", clean_text(item.get("Confidence", "Medium")))
+                else:
+                    add("NOT VERIFIED", "Mooring", f"{item_name} — last renewal/service date", "No date in reliable local row", "A line/tail without a date cannot be assessed for readiness.", "Verify the record and update the mooring inventory.", "Low")
+
+    brc = engine_best_field(fields, "mooring.brc_test_date", ["HVPQ", "Q88", "MOORING_PLAN"])
+    if not brc:
+        brc = engine_best_field(fields, "mooring.brake_test_date", ["HVPQ", "Q88", "MOORING_PLAN"])
+    brc_date = parse_date_any(clean_text(getattr(brc, "value", ""))) if brc else None
+    if not brc_date:
+        add("NOT VERIFIED", "Mooring", "Winch BRC / brake test within last 1 year", "No labelled BRC/brake test date was reliably extracted", "BRC/brake-test currency is a high-value SIRE/STS readiness item.", "Verify the latest winch brake holding capacity/BRC record and date.", "Low")
+    elif (ref_date - brc_date).days <= 366 and brc_date <= ref_date:
+        add("PASS", "Mooring", "Winch BRC / brake test within last 1 year", brc_date.isoformat(), "The visible BRC/brake test date is within the requested one-year screen.", "Confirm the test scope, result and supporting record before final approval.", "Medium")
+    else:
+        add("HOLD", "Mooring", "Winch BRC / brake test within last 1 year", brc_date.isoformat(), "The visible BRC/brake test is older than one year or future-dated relative to the review date.", "Obtain a current BRC/brake holding-capacity record before STS clearance.", "Medium")
+
+    # Q88 STS marker: only an explicit local answer is accepted as Yes.
+    sts_marker = engine_best_field(fields, "sts.q88_marked", ["Q88"])
+    sts_value = clean_text(getattr(sts_marker, "value", "")) if sts_marker else ""
+    if normalize_bool(sts_value) == "yes":
+        add("PASS", "Q88", "STS marked Yes in Q88", sts_value, "The requested Q88 STS declaration is visible.", "Confirm it matches the intended operation and current Q88 revision.", "High")
+    elif normalize_bool(sts_value) == "no":
+        add("HOLD", "Q88", "STS marked Yes in Q88", sts_value, "Q88 explicitly indicates STS is not marked Yes.", "Correct/confirm the Q88 entry or obtain charterer/terminal acceptance before proceeding.", "High")
+    else:
+        add("NOT VERIFIED", "Q88", "STS marked Yes in Q88", sts_value or "No explicit Q88 STS answer", "STS wording or a missing Q88 answer cannot be treated as Yes.", "Verify the exact Q88 question and answer in the current revision.", "Low")
+
+    # Last ten ports and sanctions cue. A clean keyword scan is not a live
+    # sanctions clearance, so it remains explicitly caveated.
+    history_fields = [f for f in fields if f.field_id == "port.history" and clean_text(f.value)]
+    sanctions = engine_best_field(fields, "sanctions.screening_status", ["PORT_HISTORY", "SANCTIONS", "HVPQ", "Q88"])
+    sanctions_value = clean_text(getattr(sanctions, "value", "")) if sanctions else ""
+    if history_fields:
+        if re.search(r"potential sanctions|verify against current|cue", sanctions_value, re.I) and re.search(r"potential|cue", sanctions_value, re.I):
+            add("REVIEW", "Sanctions / port history", "No sanctions doubt from last 10 ports", sanctions_value, "Port history contains a cue that requires a current sanctions-list review; this is not a legal determination.", "Run the current company/flag/charterer sanctions screening on the extracted last-ten-port history.", "Medium")
+        else:
+            add("PASS", "Sanctions / port history", "No obvious sanctions cue in last 10 ports", sanctions_value or "Port history identified; no cue extracted", "No obvious keyword was found in the extracted history, but lists and ownership screening change.", "Complete current-list screening and retain the screening result.", "Medium")
+    else:
+        add("NOT VERIFIED", "Sanctions / port history", "No sanctions doubt from last 10 ports", "Last 10 ports not identified", "Without the recent port history, this screening cannot be performed.", "Upload the last-ten-port/port-history sheet or a Q88/HVPQ containing it.", "Low")
+
+    screen_columns = ["Status", "Vessel", "Area", "Check", "Evidence", "Why it matters", "Required action", "Confidence"]
+    screen = pd.DataFrame(rows, columns=screen_columns).drop_duplicates()
+    rank = {"HOLD": 0, "REVIEW": 1, "NOT VERIFIED": 2, "PASS": 3}
+    if not screen.empty:
+        screen["_rank"] = screen["Status"].map(rank).fillna(9)
+        screen = screen.sort_values(["_rank", "Area", "Check"]).drop(columns="_rank")
+    decision = "HOLD" if (screen["Status"] == "HOLD").any() else ("CONDITIONAL / INCOMPLETE" if screen["Status"].isin(["REVIEW", "NOT VERIFIED"]).any() else "PRELIMINARY CLEAR")
+    return decision, screen, cert_watch, mooring_summary, mooring_inventory, df_from_fields(fields)
 
 # ----------------------------- Optional local LLM extraction assist -----------------------------
 
@@ -1439,21 +2416,154 @@ def extract_json_from_llm_response(resp: str) -> Dict[str, Any]:
         return {}
 
 
+LLM_RELEVANCE_RE = {
+    "HVPQ": re.compile(r"IMO|vessel\s+name|P\s*(?:&|and)\s*I|class|certificate|survey|dry\s*dock|incident|PSC|mooring|brake|rope|tail|STS|port\s+history", re.I),
+    "Q88": re.compile(r"IMO|vessel|P\s*(?:&|and)\s*I|class|certificate|survey|dry\s*dock|mooring|STS|ship\s*[- ]?to\s*[- ]?ship|port", re.I),
+    "PIQ": re.compile(r"vessel|class|superintendent|PSC|incident|audit|assessment|tank|retrofit|mooring", re.I),
+    "CLASS": re.compile(r"ship|IMO|certificate|issued|valid|expiry|survey|condition|memorand|dispensation|class", re.I),
+    "CERTIFICATE": re.compile(r"ship|IMO|certificate|issued|valid|expiry|annual|intermediate", re.I),
+    "PNI": re.compile(r"ship|IMO|P\s*(?:&|and)\s*I|club|entry|cover|valid|expiry|international\s+group", re.I),
+}
+
+
+def _llm_document_chunks(doc_type: str, pages: List[Tuple[int, str]], max_chars: int = 18000, max_pages: int = 40) -> List[Tuple[str, List[Tuple[int, str]]]]:
+    """Select all high-value pages, then retain their page boundaries in chunks."""
+    relevance = LLM_RELEVANCE_RE.get(doc_type.upper(), VISION_PRIORITY_RE)
+    scored: List[Tuple[int, int, str]] = []
+    for page_number, text in pages:
+        score = len(relevance.findall(text or ""))
+        if page_number <= 3:
+            score += 8
+        if _visible_char_count(text) < 80:
+            score -= 5
+        scored.append((score, page_number, text))
+    if doc_type.upper() in {"CLASS", "CERTIFICATE", "PNI"}:
+        selected = [(page_number, text) for _, page_number, text in scored]
+    else:
+        ranked = sorted(scored, key=lambda item: (-item[0], item[1]))[:max_pages]
+        selected_numbers = {page_number for score, page_number, _ in ranked if score > 0}
+        selected = [(page_number, text) for _, page_number, text in scored if page_number in selected_numbers]
+    chunks: List[Tuple[str, List[Tuple[int, str]]]] = []
+    current: List[Tuple[int, str]] = []
+    current_chars = 0
+    for page_number, text in selected:
+        block = f"\n--- PAGE {page_number} ---\n{text}"
+        if current and current_chars + len(block) > max_chars:
+            chunks.append((join_pages(current), current))
+            current = []
+            current_chars = 0
+        current.append((page_number, text))
+        current_chars += len(block)
+    if current:
+        chunks.append((join_pages(current), current))
+    return chunks
+
+
+def _date_evidence_for_llm(field_id: str, value: str, pages: List[Tuple[int, str]]) -> Tuple[int, str]:
+    target = parse_date_any(value)
+    if not target:
+        return 0, ""
+    role = field_id.rsplit(".", 1)[-1]
+    required_label = CERT_DATE_LABELS.get(role) if field_id.startswith("cert.") else None
+    cert_key = field_id.split(".")[1] if field_id.startswith("cert.") and len(field_id.split(".")) >= 3 else ""
+    cert_aliases = [normalize_key(alias) for alias, key in CERT_ALIASES.items() if key == cert_key]
+    anchor_terms = {
+        "last_drydock": r"dry\s*dock|docking",
+        "next_drydock_due": r"dry\s*dock|docking",
+        "last_iws": r"\bIWS\b|in[- ]water",
+        "next_iws_due": r"\bIWS\b|in[- ]water",
+        "last_special": r"special\s+survey",
+        "next_special_due": r"special\s+survey",
+        "last_annual": r"annual\s+survey",
+        "next_annual_due": r"annual\s+survey",
+        "last_intermediate": r"intermediate\s+survey",
+    }
+    anchor_re = re.compile(anchor_terms.get(role, r"date|survey|valid|issued|expiry"), re.I)
+    for page_number, text in pages:
+        for match in DATE_RE.finditer(text or ""):
+            if parse_date_any(match.group(0)) != target:
+                continue
+            window = (text or "")[max(0, match.start() - 650):min(len(text or ""), match.end() + 650)]
+            if required_label and not required_label.search(window):
+                continue
+            if cert_aliases and not any(alias in normalize_key(window) for alias in cert_aliases):
+                continue
+            if not required_label and not anchor_re.search(window):
+                continue
+            return page_number, clean_text(window)[:1200]
+    return 0, ""
+
+
+def _text_evidence_for_llm(field_id: str, value: str, pages: List[Tuple[int, str]]) -> Tuple[int, str]:
+    needle = normalize_value(value)
+    if not needle:
+        return 0, ""
+    boolean = normalize_bool(value)
+    if boolean in {"yes", "no"}:
+        anchor_patterns = {
+            "classification.conditions_of_class": r"conditions?\s+of\s+class|class\s+conditions?",
+            "classification.memo_of_class": r"memorand(?:um|a)\s+of\s+class|class\s+memorand",
+            "classification.flag_dispensation": r"dispensation|exemption|equivalence",
+            "insurance.international_group_member": r"international\s+group(?:\s+of\s+P\s*(?:&|and)\s*I\s+clubs?)?|member(?:ship)?\s+of\s+the\s+international\s+group",
+            "sts.q88_marked": r"ship\s*[- ]?to\s*[- ]?ship|\bSTS\b",
+            "incidents.pollution_grounding_collision_allision": r"pollution|grounding|collision|allision",
+            "incidents.other_incidents": r"other\s+incidents?",
+        }
+        fallback_tokens = [token for token in field_id.replace("_", ".").split(".") if len(token) >= 5]
+        anchor_re = re.compile(anchor_patterns.get(field_id, "|".join(re.escape(token) for token in fallback_tokens) or r"$^"), re.I)
+        answer_re = re.compile(r"\b(?:yes)\b" if boolean == "yes" else r"\b(?:no|nil|none)\b", re.I)
+        for page_number, text in pages:
+            for anchor in anchor_re.finditer(text or ""):
+                window = (text or "")[max(0, anchor.start() - 160):min(len(text or ""), anchor.end() + 520)]
+                if field_id in {"classification.conditions_of_class", "classification.memo_of_class"} and boolean == "no":
+                    if re.search(r"\b(?:open|outstanding|overdue|condition\s+no\.?|recommendation\s+no\.?)\b", window, re.I) and not re.search(r"\bno\s+open\b", window, re.I):
+                        continue
+                if answer_re.search(window):
+                    return page_number, clean_text(window)[:1200]
+        return 0, ""
+    for page_number, text in pages:
+        haystack = normalize_value(text)
+        if len(needle) >= 3 and needle in haystack:
+            return page_number, clean_text(text)[:1200]
+    return 0, ""
+
+
+def _verify_llm_field(field: FieldRecord, pages: List[Tuple[int, str]]) -> bool:
+    if field.field_id.startswith("cert.") or field.field_id.startswith("surveys.") or field.field_id.endswith((".date", ".expiry", ".issue")):
+        page, evidence = _date_evidence_for_llm(field.field_id, field.value, pages)
+    else:
+        page, evidence = _text_evidence_for_llm(field.field_id, field.value, pages)
+    if not evidence:
+        return False
+    field.page = page
+    field.raw = evidence
+    field.extraction_method = "local-ai-value-and-evidence-match"
+    field.confidence = "local-llm"
+    field.confidence_score = base_confidence_score("local-llm")
+    return True
+
+
 def llm_assist_extract(doc_type: str, pages: List[Tuple[int, str]], base_url: str, model: str) -> List[FieldRecord]:
-    source = doc_type.upper() + "_LLM"
-    text = join_pages(pages)
-    # Use only relevant first 18k chars to avoid local context overflow; class/Q88 certs in early pages generally.
-    snippet = text[:18000]
-    prompt = f"""
+    # AI candidates use the canonical source name but have lower confidence
+    # than native/table-aware extraction. This lets AI fill a proven gap while
+    # preventing it from overriding stronger evidence.
+    source = _source_for_document_type(doc_type.upper())
+    chunks = _llm_document_chunks(doc_type, pages)
+    all_fields: List[FieldRecord] = []
+    if not chunks:
+        return all_fields
+    for chunk_number, (snippet, chunk_pages) in enumerate(chunks, 1):
+        prompt = f"""
 You are a marine vetting document extraction engine. Extract only values visible in the text. Do not guess.
 Document type: {doc_type}
+Chunk: {chunk_number} of {len(chunks)}. Page markers are evidence boundaries.
 Return ONLY valid JSON. If value is not visible, use null.
 
 Required JSON keys:
 {{
   "vessel": {{"name": null, "imo": null, "flag": null, "port_registry": null, "type": null, "call_sign": null, "mmsi": null}},
   "owner": {{"registered_owner": null, "technical_operator": null, "commercial_operator": null}},
-  "insurance": {{"pni_club": null}},
+  "insurance": {{"pni_club": null, "international_group_member": null}},
   "classification": {{"class_society": null, "class_notation": null, "conditions_of_class": null, "memo_of_class": null, "flag_dispensation": null}},
   "environment": {{"cii_rating": null, "cii_verified_by": null, "eexi_rating": null, "eexi_verified_by": null}},
   "surveys": {{"last_drydock": null, "next_drydock_due": null, "last_iws": null, "next_iws_due": null, "last_special": null, "next_special_due": null, "last_annual": null, "next_annual_due": null, "last_intermediate": null}},
@@ -1467,20 +2577,46 @@ Required JSON keys:
     "loadline": {{"issue": null, "expiry": null, "last_annual": null, "last_intermediate": null}},
     "cof_chemical": {{"issue": null, "expiry": null, "last_annual": null, "last_intermediate": null}}
   }},
-  "incidents": {{"pollution_grounding_collision_allision": null, "other_incidents": null}}
+  "incidents": {{"pollution_grounding_collision_allision": null, "other_incidents": null}},
+  "sts": {{"q88_marked": null}}
 }}
+
+Date-role rule: return a certificate `expiry` only when the supplied text
+contains a nearby label such as Valid until, Valid to, Expiry, Date expires or
+Validity. Never use an issue/issued/annual/intermediate date as expiry. If the
+role is unclear, return null.
 
 TEXT:
 {snippet}
 """
-    try:
-        resp = ollama_generate(base_url, model, prompt)
-        data = extract_json_from_llm_response(resp)
-    except Exception as e:
-        return [FieldRecord(source=source, field_id="llm.error", label="LLM extraction error", value=str(e), confidence="llm-error")]
-    fields: List[FieldRecord] = []
-    flatten_llm_json(data, source, fields)
-    return fields
+        try:
+            resp = ollama_generate(base_url, model, prompt, timeout=240)
+            data = extract_json_from_llm_response(resp)
+        except Exception as exc:
+            all_fields.append(FieldRecord(source=source, field_id="llm.error", label="Local AI extraction error", value=f"Chunk {chunk_number}: {exc}", confidence="llm-error", extraction_method="local-ai-error"))
+            continue
+        candidates: List[FieldRecord] = []
+        flatten_llm_json(data, source, candidates)
+        all_fields.extend(item for item in candidates if _verify_llm_field(item, chunk_pages))
+
+    # A role-matched date can still be internally impossible. Reuse the same
+    # issue/expiry guard applied to deterministic extraction.
+    validated: List[FieldRecord] = []
+    by_cert: Dict[str, Dict[str, FieldRecord]] = defaultdict(dict)
+    for item in all_fields:
+        match = re.fullmatch(r"cert\.([^.]+)\.(issue|expiry)", item.field_id)
+        if match:
+            by_cert[match.group(1)][match.group(2)] = item
+    invalid_expiry_ids = set()
+    for key, pair in by_cert.items():
+        issue = pair.get("issue")
+        expiry = pair.get("expiry")
+        if issue and expiry and parse_date_any(issue.value) and parse_date_any(expiry.value) and parse_date_any(expiry.value) < parse_date_any(issue.value):
+            invalid_expiry_ids.add(id(expiry))
+    for item in all_fields:
+        if id(item) not in invalid_expiry_ids:
+            validated.append(item)
+    return dedupe_fields(validated)
 
 
 def flatten_llm_json(data: Dict[str, Any], source: str, fields: List[FieldRecord], prefix: str = ""):
@@ -1524,6 +2660,28 @@ def compare_field(findings: List[Finding], fields: List[FieldRecord], field_id: 
 
 def run_rules(fields: List[FieldRecord], ref_date: date, settings: Dict[str, Any], obs_df: pd.DataFrame) -> List[Finding]:
     findings: List[Finding] = []
+
+    # Surface date-role conflicts explicitly.  The extraction layer withholds
+    # an expiry when a visible expiry precedes issue; silently skipping it would
+    # make the user think the certificate was checked successfully.
+    for issue_field in [f for f in fields if f.field_id.endswith(".expiry_extraction_issue")]:
+        add_finding(
+            findings,
+            area="Extraction quality",
+            check=issue_field.label or issue_field.field_id,
+            status="MANUAL CHECK",
+            risk="HIGH",
+            hvpq_value=issue_field.value if issue_field.source == "HVPQ" else "",
+            q88_value=issue_field.value if issue_field.source == "Q88" else "",
+            class_value=issue_field.value if issue_field.source == "CLASS" else "",
+            reason="The visible date roles were internally impossible, so DocuSure withheld the expiry instead of using a likely issue/endorsement date.",
+            action="Open the original certificate/table, confirm the column labels and correct the source entry before relying on certificate validity.",
+            conclusion="Not verified",
+            confidence="Low",
+            confidence_score=30,
+            evidence=issue_field.raw,
+            rule_basis="Date-role validation: expiry must not precede issue",
+        )
 
     # 1. Identity only big mismatches
     compare_field(findings, fields, "vessel.imo", ["HVPQ", "PIQ", "Q88", "CLASS", "XML"], "Identity", "IMO consistency across documents", "CRITICAL", hard=True)
@@ -1948,7 +3106,98 @@ def observation_checklist_from_excel(obs_df: pd.DataFrame) -> List[Tuple[str, st
 # ----------------------------- Export helpers -----------------------------
 
 def df_from_fields(fields: List[FieldRecord]) -> pd.DataFrame:
-    return pd.DataFrame([asdict(f) for f in fields]) if fields else pd.DataFrame(columns=["document_name", "page", "source", "field_id", "label", "value", "date_value", "confidence", "confidence_score", "raw"])
+    return pd.DataFrame([asdict(f) for f in fields]) if fields else pd.DataFrame(columns=["document_name", "page", "source", "field_id", "label", "value", "date_value", "confidence", "confidence_score", "extraction_method", "raw"])
+
+
+def machine_tables_df(documents: List[ProcessedDocument]) -> pd.DataFrame:
+    """Show the normalised table/sheet channel used by the extractors."""
+    rows: List[Dict[str, Any]] = []
+    for document in documents:
+        if not document.structured_tables:
+            rows.append({
+                "File": document.profile.filename,
+                "Format": document.document_format.upper(),
+                "Page / sheet": "",
+                "Table": "",
+                "Rows": 0,
+                "Machine-readable excerpt": "No structured table detected; paragraph/page text retained",
+            })
+            continue
+        for table in document.structured_tables:
+            rows.append({
+                "File": document.profile.filename,
+                "Format": document.document_format.upper(),
+                "Page / sheet": table.get("sheet") or table.get("page", ""),
+                "Table": table.get("table", ""),
+                "Rows": len(table.get("rows", []) or []),
+                "Machine-readable excerpt": clean_text(table.get("text", ""))[:900],
+            })
+    columns = ["File", "Format", "Page / sheet", "Table", "Rows", "Machine-readable excerpt"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def reading_diagnostics_df(documents: List[ProcessedDocument]) -> pd.DataFrame:
+    """Expose exactly how every file was read and where a fallback failed."""
+    rows: List[Dict[str, Any]] = []
+    for document in documents:
+        rows.append({
+            "File": document.profile.filename,
+            "Format": document.document_format.upper(),
+            "Reading channels": " → ".join(document.reading_methods) or "No successful reading channel recorded",
+            "Pages / sheets": len(document.pages),
+            "Structured tables": len(document.structured_tables),
+            "Status": "Ready with fallback note" if document.reading_notes else "Ready",
+            "Fallback notes": " | ".join(document.reading_notes)[:1600],
+        })
+    return pd.DataFrame(rows, columns=["File", "Format", "Reading channels", "Pages / sheets", "Structured tables", "Status", "Fallback notes"])
+
+
+def make_machine_readable_pack(documents: List[ProcessedDocument]) -> bytes:
+    """Build an in-memory Markdown/JSON evidence pack showing what the engine read."""
+    output = io.BytesIO()
+    manifest: List[Dict[str, Any]] = []
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        used_names = set()
+        for index, document in enumerate(documents, 1):
+            base = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(document.profile.filename)[0]).strip("._") or f"document_{index}"
+            candidate = base
+            suffix = 2
+            while candidate.lower() in used_names:
+                candidate = f"{base}_{suffix}"
+                suffix += 1
+            used_names.add(candidate.lower())
+            header = {
+                "source_file": document.profile.filename,
+                "format": document.document_format,
+                "detected_type": document.profile.doc_type,
+                "assigned_group": document.profile.assigned_group,
+                "classification_confidence": document.profile.confidence_score,
+                "reading_methods": document.reading_methods,
+                "reading_notes": document.reading_notes,
+            }
+            markdown_parts = ["---", json.dumps(header, ensure_ascii=False, indent=2), "---", ""]
+            for page_number, page_text in document.pages:
+                markdown_parts.extend([f"## Page or sheet {page_number}", "", page_text or "[[no readable text]]", ""])
+            archive.writestr(f"documents/{candidate}.md", "\n".join(markdown_parts))
+            archive.writestr(
+                f"evidence/{candidate}.fields.json",
+                json.dumps([asdict(item) for item in document.fields], ensure_ascii=False, indent=2),
+            )
+            archive.writestr(
+                f"evidence/{candidate}.tables.json",
+                json.dumps(document.structured_tables, ensure_ascii=False, indent=2),
+            )
+            manifest.append(header | {
+                "markdown": f"documents/{candidate}.md",
+                "fields": f"evidence/{candidate}.fields.json",
+                "tables": f"evidence/{candidate}.tables.json",
+            })
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        archive.writestr(
+            "README.txt",
+            "This pack is generated in memory from the active DocuSure session. Markdown preserves page/sheet boundaries; JSON preserves extracted fields, confidence and table rows. It is evidence for review, not a replacement for the source documents.\n",
+        )
+    return output.getvalue()
 
 
 def df_from_findings(findings: List[Finding]) -> pd.DataFrame:
@@ -2283,7 +3532,9 @@ def add_section_and_operational_fields(fields: List[FieldRecord], source: str, t
         sec = section_text_by_qid(text, q, max_chars=22000 if q == "10.1.7" else 9000)
         if sec:
             add_field(fields, source, f"section.{q}", sec, label=f"Section {q}", raw=sec, confidence="section-snippet")
-    # Brake test: look around brake test keywords, fall back to HVPQ 10.1.4 section
+    # Brake/BRC test: look around the dedicated section and labelled winch-test
+    # phrases.  The alias lets STS screening apply the requested one-year BRC
+    # watch without conflating it with an unrelated line installation date.
     brake_windows = []
     brake_section = section_text_by_qid(text, "10.1.4", max_chars=9000)
     if brake_section:
@@ -2293,9 +3544,29 @@ def add_section_and_operational_fields(fields: List[FieldRecord], source: str, t
             brake_windows.append(text[max(0, m.start()-500):min(len(text), m.end()+900)])
     if brake_windows:
         joined = " ".join(brake_windows[:3])
-        dt = latest_date_in_text(joined)
+        labelled_windows = []
+        for match in re.finditer(r"(?:BRC|brake\s+holding\s+capacity|last\s+winch\s+test|date\s+of\s+last\s+brake\s+test)", joined, re.I):
+            labelled_windows.append(joined[max(0, match.start() - 80):min(len(joined), match.end() + 220)])
+        labelled_text = " ".join(labelled_windows)
+        # Prefer the first date after an explicit last-test/BRC label.  Using
+        # the latest date in a long section can accidentally select a future
+        # next-test date and make a valid BRC appear future-dated/overdue.
+        dt = ""
+        for label_pattern in (
+            r"(?:date\s+of\s+)?last\s+(?:winch\s+)?(?:brake\s+)?(?:holding\s+capacity\s+)?test",
+            r"(?:BRC|brake\s+holding\s+capacity)\s*(?:test|date)?",
+        ):
+            dt = date_near_label(labelled_text or joined, re.compile(label_pattern, re.I), after_chars=140, before_chars=35)
+            if dt:
+                break
+        if not dt:
+            candidate_text = labelled_text or joined
+            candidate_dates = extract_dates(candidate_text)
+            # A single visible date is safe; multiple unlabelled dates are not.
+            dt = candidate_dates[0] if len(candidate_dates) == 1 else ""
         if dt:
             add_field(fields, source, "mooring.brake_test_date", dt, label="Latest brake test date found", raw=clean_text(joined[:1600]), confidence="best-effort")
+            add_field(fields, source, "mooring.brc_test_date", dt, label="Latest winch BRC/brake test date", raw=clean_text(joined[:1600]), confidence="best-effort", extraction_method="brc-labelled-date")
         add_field(fields, source, "mooring.brake_section", clean_text(joined[:2000]), label="Brake/mooring section", raw=clean_text(joined[:2000]), confidence="section-snippet")
     # Rope / tail information is scoped to 10.1.7 so dates from unrelated
     # sections cannot create a false age conclusion.
@@ -2896,7 +4167,7 @@ for _rule in EMBEDDED_KNOWLEDGE_BASE.get("validation_rules", []):
             "action_if_fail": "Verify every line/tail against the documented retirement criteria; replace or correct records only when a breach is supported.",
         })
 
-EMBEDDED_KNOWLEDGE_BASE["schema_version"] = "2026-09-18.v20"
+EMBEDDED_KNOWLEDGE_BASE["schema_version"] = "2026-09-20.v22"
 EMBEDDED_KNOWLEDGE_BASE["description"] = "Evidence-led DocuSure rule base. Observation history prioritises review; only supported contradictions or explicit rule breaches become discrepancies, while extraction gaps remain Not verified."
 
 ENHANCED_VALIDATION_RULES = [
@@ -2906,6 +4177,11 @@ ENHANCED_VALIDATION_RULES = [
     {"rule_id":"CLASS-OPEN-001","source_scope":["CLASS","HVPQ","Q88"],"question_refs":["1.5.14","1.5.16","1.5.18"],"category":"Class / chartering","rule_type":"open_item_watch","severity":"CRITICAL","statement":"Open Conditions of Class, significant memoranda/recommendations and dispensations must be highlighted with their actual text and due date where visible.","machine_logic":"A heading alone is not an open item; require explicit Nil/None or an actual open/status marker.","evidence_required":"Current Class Status context.","action_if_fail":"Review restriction, due date and acceptance before fixture/STS clearance.","skip_when":[]},
     {"rule_id":"MOOR-FACTS-001","source_scope":["HVPQ","Q88","LMP","MSMP"],"question_refs":["10.1.3","10.1.4","10.1.7"],"category":"Mooring","rule_type":"key_fact_inventory","severity":"HIGH","statement":"Surface brake-test date, SDMBL/LDBF/TDBF and recognised rope/wire/tail particulars with evidence confidence.","machine_logic":"Only structure a line/tail row when at least two local attributes are visible; otherwise show a verification gap.","evidence_required":"HVPQ/LMP row context and certificates.","action_if_fail":"Verify every line/tail against LMP, certificates and retirement criteria.","skip_when":[]},
     {"rule_id":"STS-PRE-001","source_scope":["TWO_VESSELS"],"question_refs":["STS"],"category":"STS clearance","rule_type":"pre_clearance_screen","severity":"CRITICAL","statement":"STS pre-check separates holds, review points, missing evidence and compatible particulars for both vessels.","machine_logic":"Group by IMO; review certificates/class/insurance/plans and compare available principal, manifold, transfer and mooring particulars.","evidence_required":"Both vessel packs and operation-specific JPO/risk assessment.","action_if_fail":"Do not treat the screening result as final operational clearance.","skip_when":[]},
+    {"rule_id":"EXTRACT-DATE-001","source_scope":["HVPQ","Q88","CLASS","CERTIFICATE"],"question_refs":["2.1.5"],"category":"Extraction quality","rule_type":"date_role_guard","severity":"HIGH","statement":"An issue/endorsement date must not be silently used as a certificate expiry.","machine_logic":"Accept expiry only from an expiry/valid-until label or explicit table header; withhold impossible issue/expiry pairs and create a manual extraction item.","evidence_required":"Date labels, table header and row provenance.","action_if_fail":"Open the original table/certificate and confirm the date role before relying on validity.","skip_when":[]},
+    {"rule_id":"OFFICE-NORMALIZE-001","source_scope":["DOCX","XLSX","XLS","CSV"],"question_refs":["UPLOAD"],"category":"Document recognition","rule_type":"machine_readable_normalization","severity":"HIGH","statement":"Word and spreadsheet uploads are converted into searchable text with paragraph/table/sheet provenance before classification and extraction.","machine_logic":"Retain row boundaries, sheet names and table excerpts; use page/sheet provenance in the evidence register.","evidence_required":"Normalized text/table channel and source filename.","action_if_fail":"Provide a readable office file or PDF; do not treat missing extraction as a vessel defect.","skip_when":[]},
+    {"rule_id":"EXTRACT-MULTIENGINE-001","source_scope":["PDF"],"question_refs":["UPLOAD"],"category":"Extraction quality","rule_type":"multi_engine_reconciliation","severity":"HIGH","statement":"Accuracy-first PDF reading reconciles layout-aware Markdown, native text, layout text, tables and OCR before classification.","machine_logic":"Compare PyMuPDF4LLM, native PyMuPDF and Poppler reading order; retain table rows; OCR sparse pages; use rotate/deskew OCR fallback when available.","evidence_required":"Reading diagnostics, page text and table channel.","action_if_fail":"Review the original page or provide a clearer source; never convert unreadable evidence into a vessel defect.","skip_when":[]},
+    {"rule_id":"AI-EVIDENCE-001","source_scope":["LOCAL_AI"],"question_refs":["UPLOAD"],"category":"Extraction quality","rule_type":"ai_evidence_gate","severity":"CRITICAL","statement":"A local-AI candidate may fill a gap only when its value is matched back to a source page and the correct semantic label.","machine_logic":"Discard unsupported AI values; require certificate date-role labels; score AI below native/table evidence; reject expiry before issue.","evidence_required":"Matched source page, local evidence excerpt and extraction method.","action_if_fail":"Treat the item as Not verified and inspect the original document.","skip_when":[]},
+    {"rule_id":"STS-SINGLE-001","source_scope":["ONE_VESSEL"],"question_refs":["STS"],"category":"STS clearance","rule_type":"single_vessel_readiness","severity":"CRITICAL","statement":"Single-vessel STS readiness checks expiry, International Group P&I membership, Class Status alignment, Conditions of Class, short-term certificates, mooring renewal/service evidence, one-year BRC, Q88 STS=Yes and last-ten-port sanctions cues.","machine_logic":"Run the checklist without requiring a counterpart vessel; missing evidence is NOT VERIFIED and is never treated as a pass.","evidence_required":"Selected vessel document pack and current operation date.","action_if_fail":"Resolve HOLD/REVIEW/NOT VERIFIED items before final STS approval.","skip_when":[]},
 ]
 
 
@@ -3501,10 +4777,15 @@ def build_document_pack_v20(documents: List[ProcessedDocument], group: str) -> p
         ("SIRE / chartering", "PIQ", {"PIQ"}, "Required for PIQ review"),
         ("SIRE / chartering", "Original certificates", {"CERTIFICATE"}, "Strongly recommended"),
         ("SIRE / chartering", "P&I / insurance evidence", {"PNI"}, "Strongly recommended"),
+        ("SIRE / chartering", "Crew matrix / Safe Manning evidence", {"CREW_MATRIX"}, "Recommended"),
+        ("SIRE / chartering", "Last 10 ports / PSC history", {"PORT_HISTORY", "HVPQ", "Q88"}, "Recommended"),
+        ("SIRE / chartering", "Sanctions screening evidence", {"SANCTIONS", "PORT_HISTORY"}, "Recommended"),
         ("SIRE / chartering", "Class Status", {"CLASS"}, "Required for reliable class status"),
         ("STS clearance", "Vessel particulars", {"HVPQ", "Q88"}, "Required"),
         ("STS clearance", "Class Status", {"CLASS"}, "Required"),
         ("STS clearance", "P&I / insurance", {"PNI"}, "Required"),
+        ("STS clearance", "Crew matrix / Safe Manning evidence", {"CREW_MATRIX"}, "Recommended"),
+        ("STS clearance", "Last 10 ports / sanctions screening", {"PORT_HISTORY", "SANCTIONS", "HVPQ", "Q88"}, "Recommended"),
         ("STS clearance", "Certificate evidence", {"CERTIFICATE"}, "Required for final clearance"),
         ("STS clearance", "STS plan / procedure", {"STS_PLAN"}, "Required onboard"),
         ("STS clearance", "Compatibility / JPO / risk assessment", {"STS_ASSESSMENT"}, "Operation-specific requirement"),
@@ -3791,7 +5072,7 @@ def main():
     st.caption(APP_SUBTITLE)
     st.markdown(
         """<div class="privacy-box"><b>🔒 Your documents are not saved by DocuSure</b><br>
-        The app code processes files in the active Streamlit session and does not write them to a DocuSure database or permanent document store. No external AI service is called by default. Use <b>Clear documents from this session</b> to remove the processed session cache. If optional Ollama assist is enabled, document excerpts go to the configured endpoint; your hosting platform's transport, memory and logging policy still applies.</div>""",
+        The app processes files in the active Streamlit session and uses only self-deleting temporary files for format conversion/OCR. It does not write uploads to a DocuSure database or permanent document store. No external AI service is called by default. Use <b>Clear documents from this session</b> to remove the processed session cache. If optional Ollama assist is enabled, document excerpts—and page images when vision reading is selected—go to the configured endpoint; your hosting platform and that endpoint's transport, memory and logging policy still apply.</div>""",
         unsafe_allow_html=True,
     )
 
@@ -3799,13 +5080,18 @@ def main():
         st.header("Review settings")
         ref_date_input = st.date_input("Review / intended operation date", value=date.today(), help="Certificate and due-date checks are measured against this date.")
         watch_days = st.slider("Certificate watch window", min_value=30, max_value=365, value=180, step=30, help="Highlights certificates expiring inside this window.")
+        accuracy_first = st.checkbox("Accuracy-first multi-engine reading", value=True, help="Compares layout-aware PyMuPDF4LLM Markdown, native PDF text and Poppler layout text, then uses an OCRmyPDF rotate/deskew fallback for unreadable pages. Slower, but safer for forms and tables.")
         enable_ocr = st.checkbox("Try OCR on scanned pages", value=True, help="Uses OCR only when a PDF page has almost no searchable text and OCR is available on the host.")
         show_low = st.checkbox("Include low-priority checks", value=False)
-        with st.expander("Optional local AI assist"):
-            use_llm = st.checkbox("Use local Ollama extraction assist", value=False)
+        with st.expander("Optional private local-AI reader"):
+            use_llm = st.checkbox("Use local Ollama extraction + evidence verification", value=False)
             ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", disabled=not use_llm)
-            ollama_model = st.text_input("Model", value="qwen2.5:14b", disabled=not use_llm)
-            st.caption("Only enable this when the Ollama endpoint is controlled by your organisation. Deterministic rules remain the decision authority.")
+            ollama_model = st.text_input("Text model", value="qwen2.5:14b", disabled=not use_llm)
+            use_vision = st.checkbox("Also transcribe PDF page images", value=False, disabled=not use_llm, help="Useful for scans, tick boxes and difficult table layouts. Requires a vision-capable model and is considerably slower.")
+            ollama_vision_model = st.text_input("Vision model", value="", placeholder="Vision-capable Ollama model; blank reuses text model", disabled=not (use_llm and use_vision))
+            vision_scope = st.selectbox("Vision pages", ["Critical and unreadable pages", "Every page"], disabled=not (use_llm and use_vision))
+            vision_page_limit = st.slider("Maximum vision pages per PDF", min_value=5, max_value=200, value=30, step=5, disabled=not (use_llm and use_vision))
+            st.caption("AI output is accepted only when the exact value can be matched back to a source page and, for certificate dates, to the correct issue/expiry/endorsement label. Deterministic/table evidence remains higher priority.")
         st.divider()
         if st.button("Clear documents from this session", width="stretch"):
             st.session_state.pop("docusure_processed_documents", None)
@@ -3815,15 +5101,15 @@ def main():
             st.rerun()
 
     st.subheader("1. Upload the document pack")
-    st.write("Drop everything together. DocuSure will identify the document type and vessel automatically—no separate HVPQ, PIQ, Q88 or Class upload boxes.")
+    st.write("Drop everything together. DocuSure first builds a page/sheet-aware Markdown + JSON evidence layer using independent text, table and OCR readers, then identifies the document type and vessel automatically—no separate HVPQ, PIQ, Q88 or Class upload boxes.")
     uploaded_files = st.file_uploader(
-        "PDF or XML files",
-        type=["pdf", "xml"],
+        "Any supported vessel document",
+        type=["pdf", "xml", "doc", "docx", "docm", "xlsx", "xlsm", "xls", "csv"],
         accept_multiple_files=True,
         key=f"docusure_upload_{st.session_state.get('docusure_uploader_version', 0)}",
-        help="Examples: HVPQ, PIQ, Q88, Class Status, certificates, P&I, PSC reports, LMP/MSMP, STS plan, compatibility study, JPO or risk assessment.",
+        help="PDF/XML/Word/Excel/CSV accepted. Examples: HVPQ, PIQ, Q88, Class Status, certificates, P&I, crew matrix, last 10 ports, PSC reports, sanctions evidence, LMP/MSMP, STS plan, compatibility study, JPO or risk assessment.",
     )
-    st.caption("Useful pack: HVPQ/XML • PIQ • Q88 (optional value-add) • current Class Status • original certificates • P&I evidence • PSC/incident records • LMP/MSMP • STS plan/JPO where applicable.")
+    st.caption("Useful pack: HVPQ/XML • PIQ • Q88 (optional value-add) • current Class Status • original certificates • P&I evidence • crew matrix / Safe Manning • last 10 ports / PSC history • sanctions evidence • LMP/MSMP • STS plan/JPO where applicable. Legacy .doc files are converted when the host provides LibreOffice; .docx/PDF is preferred.")
 
     if not uploaded_files:
         st.markdown(
@@ -3833,8 +5119,19 @@ def main():
         )
         return
 
-    with st.spinner("Reading, OCR-checking and classifying the uploaded pack..."):
-        documents = process_uploaded_documents(uploaded_files, enable_ocr, use_llm, ollama_url, ollama_model)
+    with st.spinner("Building the machine-readable evidence layer, reconciling reading engines and classifying the pack..."):
+        documents = process_uploaded_documents(
+            uploaded_files,
+            enable_ocr,
+            use_llm,
+            ollama_url,
+            ollama_model,
+            accuracy_first,
+            use_vision,
+            ollama_vision_model,
+            vision_scope,
+            vision_page_limit,
+        )
 
     st.subheader("2. Confirm what DocuSure recognised")
     profiles = [doc.profile for doc in documents]
@@ -3861,7 +5158,21 @@ def main():
                     doc.profile.grouping_confidence = "User confirmed" if selected_assignment != "Unassigned" else "Unassigned"
                     doc.profile.grouping_evidence = "User-confirmed session assignment" if selected_assignment != "Unassigned" else "Left unassigned by user"
     inventory = document_inventory_df(profiles)
+    machine_tables = machine_tables_df(documents)
+    reading_diagnostics = reading_diagnostics_df(documents)
     _show_dataframe_or_message(inventory, "No documents could be classified.", height=min(520, 95 + len(inventory) * 42))
+    with st.expander("Machine-readable conversion evidence", expanded=False):
+        st.caption("These are the independent reading channels and the text/table/sheet evidence used by the extractors. A fallback failure is visible here; it is never silently turned into a vessel finding.")
+        _show_dataframe_or_message(reading_diagnostics, "No reading diagnostics were generated.", height=min(360, 110 + len(reading_diagnostics) * 42))
+        _show_dataframe_or_message(machine_tables, "No structured tables were detected; page/paragraph text is still retained.", height=min(420, 110 + len(machine_tables) * 42))
+        st.download_button(
+            "Download normalized Markdown + JSON evidence pack",
+            make_machine_readable_pack(documents),
+            file_name="docusure_machine_readable_evidence.zip",
+            mime="application/zip",
+            width="stretch",
+            help="Shows exactly what DocuSure read, with page/sheet boundaries, fields, tables and confidence metadata.",
+        )
     unknown_count = sum(doc.profile.doc_type == "UNKNOWN" for doc in documents)
     poor_count = sum(doc.profile.text_quality.startswith("Poor") for doc in documents)
     provisional_count = sum(doc.profile.grouping_confidence == "Low" for doc in documents)
@@ -3920,6 +5231,8 @@ def main():
         ("Q88 Value Add", result["q88"]),
         ("Detailed Findings", action_df),
         ("Extracted Evidence", df_from_fields(result["fields"])),
+        ("Reading Diagnostics", reading_diagnostics),
+        ("Machine-readable Tables", machine_tables),
         ("Document Inventory", inventory),
     ]
 
@@ -4003,42 +5316,77 @@ def main():
     elif mode == "sts":
         st.header("STS Clearance Pre-Check")
         st.caption("Pre-screen only—not final STS approval. Final clearance still requires verified operation-specific compatibility, JPO/risk assessment, weather/location limits, authority/terminal requirements and responsible-person approval.")
-        if len(valid_groups) < 2:
-            st.error("At least two different checksum-valid vessel IMO groups are required. Upload searchable documents identifying both vessels.")
-            st.dataframe(inventory, width="stretch", hide_index=True)
-            return
-        s1, s2 = st.columns(2)
-        primary_imo = s1.selectbox("Primary vessel", valid_groups, format_func=lambda group: group_labels[group], key="sts_primary")
-        counterpart_options = [group for group in valid_groups if group != primary_imo]
-        counterpart_imo = s2.selectbox("STS counterpart", counterpart_options, format_func=lambda group: group_labels[group], key="sts_counterpart")
-        fields_by_vessel: Dict[str, List[FieldRecord]] = {}
-        texts_by_vessel: Dict[str, List[str]] = {}
-        for group in valid_groups:
-            group_docs = documents_for_group(documents, group)
-            group_fields, _, _ = merge_group_content(group_docs)
-            fields_by_vessel[group] = group_fields
-            texts_by_vessel[group] = [doc.text for doc in group_docs]
-        decision, sts_screen, sts_facts, sts_cert_watch = build_sts_screen(profiles, fields_by_vessel, texts_by_vessel, primary_imo, counterpart_imo, ref_date_input, watch_days)
-        h1, h2, h3, h4 = st.columns(4)
-        h1.metric("Pre-screen decision", decision)
-        h2.metric("Holds", int((sts_screen["Status"] == "HOLD").sum()))
-        h3.metric("Review items", int((sts_screen["Status"] == "REVIEW").sum()))
-        h4.metric("Not verified", int((sts_screen["Status"] == "NOT VERIFIED").sum()))
-        if decision == "HOLD":
-            st.error("Do not treat the pack as cleared: at least one document-supported hold item was found.")
-        elif decision == "CONDITIONAL / INCOMPLETE":
-            st.warning("No automatic final clearance: resolve the review and missing-evidence items first.")
+        sts_mode = st.radio("STS review mode", ["Single-vessel readiness", "Two-vessel compatibility"], horizontal=True, key="sts_review_mode")
+        if sts_mode == "Single-vessel readiness":
+            if selected_group == "Unassigned":
+                st.error("Select a recognised vessel group before running single-vessel STS readiness. Unassigned documents are not silently mixed into a vessel.")
+                return
+            single_docs = documents_for_group(documents, selected_group)
+            decision, sts_screen, single_cert_watch, mooring_summary, mooring_inventory, single_evidence = build_single_sts_screen(single_docs, selected_group, ref_date_input, watch_days)
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Pre-screen decision", decision)
+            h2.metric("Holds", int((sts_screen["Status"] == "HOLD").sum()))
+            h3.metric("Review items", int((sts_screen["Status"] == "REVIEW").sum()))
+            h4.metric("Not verified", int((sts_screen["Status"] == "NOT VERIFIED").sum()))
+            if decision == "HOLD":
+                st.error("Do not treat the vessel as STS-cleared: at least one hold item was found.")
+            elif decision == "CONDITIONAL / INCOMPLETE":
+                st.warning("The vessel is not automatically cleared. Resolve review and missing-evidence items before relying on the result.")
+            else:
+                st.success("No hold/review item was found in the uploaded evidence. This remains a preliminary screen, not final operational clearance.")
+            _show_dataframe_or_message(sts_screen, "No single-vessel STS screening row was generated.", height=700)
+            st.subheader("Mooring renewal and BRC evidence")
+            _show_dataframe_or_message(mooring_summary, "No mooring summary was reliably extracted.")
+            _show_dataframe_or_message(mooring_inventory, "No individual mooring line/tail rows were reliably extracted.", height=420)
+            st.subheader("Machine-readable evidence used")
+            _show_dataframe_or_message(single_evidence, "No structured evidence was extracted.", height=420)
+            single_pack = build_document_pack_v20(documents, selected_group)
+            common_sheets = [
+                ("STS Decision", pd.DataFrame([{"Mode": "Single-vessel readiness", "Vessel": group_labels.get(selected_group, selected_group), "Decision": decision, "Reference date": ref_date_input.isoformat(), "Important": "Pre-screen only; not final operational clearance"}])),
+                ("STS Screening", sts_screen), ("Certificate Watch", single_cert_watch),
+                ("Mooring Summary", mooring_summary), ("Mooring Inventory", mooring_inventory),
+                ("Evidence", single_evidence), ("Document Pack", single_pack), ("Document Inventory", inventory),
+                ("Reading Diagnostics", reading_diagnostics),
+                ("Machine-readable Tables", machine_tables),
+            ]
+            export_name = "docusure_sts_single_vessel_readiness.xlsx"
         else:
-            st.success("No hold/review item was found in the uploaded evidence. This remains a preliminary screen, not final operational clearance.")
-        _show_dataframe_or_message(sts_screen, "No STS screening row was generated.", height=680)
-        st.subheader("Side-by-side compatibility facts")
-        _show_dataframe_or_message(sts_facts, "No comparable STS particulars were reliably extracted.")
-        sts_pack = pd.concat([
-            build_document_pack_v20(documents, primary_imo).assign(Vessel=group_labels[primary_imo]),
-            build_document_pack_v20(documents, counterpart_imo).assign(Vessel=group_labels[counterpart_imo]),
-        ], ignore_index=True)
-        common_sheets = [("STS Decision", pd.DataFrame([{"Decision": decision, "Reference date": ref_date_input.isoformat(), "Important": "Pre-screen only; not final operational clearance"}])), ("STS Screening", sts_screen), ("STS Compatibility", sts_facts), ("STS Certificate Watch", sts_cert_watch), ("STS Document Packs", sts_pack), ("Document Inventory", inventory)]
-        export_name = "docusure_sts_clearance_precheck.xlsx"
+            if len(valid_groups) < 2:
+                st.error("Two-vessel compatibility needs at least two different checksum-valid vessel IMO groups. Switch to Single-vessel readiness if you are screening only one vessel.")
+                st.dataframe(inventory, width="stretch", hide_index=True)
+                return
+            s1, s2 = st.columns(2)
+            primary_imo = s1.selectbox("Primary vessel", valid_groups, format_func=lambda group: group_labels[group], key="sts_primary")
+            counterpart_options = [group for group in valid_groups if group != primary_imo]
+            counterpart_imo = s2.selectbox("STS counterpart", counterpart_options, format_func=lambda group: group_labels[group], key="sts_counterpart")
+            fields_by_vessel: Dict[str, List[FieldRecord]] = {}
+            texts_by_vessel: Dict[str, List[str]] = {}
+            for group in valid_groups:
+                group_docs = documents_for_group(documents, group)
+                group_fields, _, _ = merge_group_content(group_docs)
+                fields_by_vessel[group] = group_fields
+                texts_by_vessel[group] = [doc.text for doc in group_docs]
+            decision, sts_screen, sts_facts, sts_cert_watch = build_sts_screen(profiles, fields_by_vessel, texts_by_vessel, primary_imo, counterpart_imo, ref_date_input, watch_days)
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Pre-screen decision", decision)
+            h2.metric("Holds", int((sts_screen["Status"] == "HOLD").sum()))
+            h3.metric("Review items", int((sts_screen["Status"] == "REVIEW").sum()))
+            h4.metric("Not verified", int((sts_screen["Status"] == "NOT VERIFIED").sum()))
+            if decision == "HOLD":
+                st.error("Do not treat the pack as cleared: at least one document-supported hold item was found.")
+            elif decision == "CONDITIONAL / INCOMPLETE":
+                st.warning("No automatic final clearance: resolve the review and missing-evidence items first.")
+            else:
+                st.success("No hold/review item was found in the uploaded evidence. This remains a preliminary screen, not final operational clearance.")
+            _show_dataframe_or_message(sts_screen, "No STS screening row was generated.", height=680)
+            st.subheader("Side-by-side compatibility facts")
+            _show_dataframe_or_message(sts_facts, "No comparable STS particulars were reliably extracted.")
+            sts_pack = pd.concat([
+                build_document_pack_v20(documents, primary_imo).assign(Vessel=group_labels[primary_imo]),
+                build_document_pack_v20(documents, counterpart_imo).assign(Vessel=group_labels[counterpart_imo]),
+            ], ignore_index=True)
+            common_sheets = [("STS Decision", pd.DataFrame([{"Mode": "Two-vessel compatibility", "Decision": decision, "Reference date": ref_date_input.isoformat(), "Important": "Pre-screen only; not final operational clearance"}])), ("STS Screening", sts_screen), ("STS Compatibility", sts_facts), ("STS Certificate Watch", sts_cert_watch), ("STS Document Packs", sts_pack), ("Reading Diagnostics", reading_diagnostics), ("Machine-readable Tables", machine_tables), ("Document Inventory", inventory)]
+            export_name = "docusure_sts_clearance_precheck.xlsx"
     else:
         st.error("Unknown check mode.")
         return

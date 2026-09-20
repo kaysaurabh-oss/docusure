@@ -1,5 +1,5 @@
 {
-  "schema_version": "2026-09-18.v20",
+  "schema_version": "2026-09-20.v22",
   "description": "Evidence-led DocuSure rule base. Observation history prioritises review; only supported contradictions or explicit rule breaches become discrepancies, while extraction gaps remain Not verified.",
   "observation_library": [
     {
@@ -3044,6 +3044,71 @@
       "machine_logic": "Group by IMO; review certificates/class/insurance/plans and compare available principal, manifold, transfer and mooring particulars without issuing final operational clearance.",
       "evidence_required": "Both vessel packs and operation-specific compatibility/JPO/risk assessment.",
       "action_if_fail": "Resolve holds and evidence gaps through the responsible STS review process.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "EXTRACT-DATE-001",
+      "source_scope": ["HVPQ", "Q88", "CLASS", "CERTIFICATE"],
+      "question_refs": ["2.1.5"],
+      "category": "Extraction quality",
+      "rule_type": "date_role_guard",
+      "severity": "HIGH",
+      "statement": "An issue/endorsement date must not be silently used as a certificate expiry.",
+      "machine_logic": "Accept expiry only from an expiry/valid-until label or explicit table header; withhold impossible issue/expiry pairs and create a manual extraction item.",
+      "evidence_required": "Date labels, table header and row provenance.",
+      "action_if_fail": "Open the original table/certificate and confirm the date role before relying on validity.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "OFFICE-NORMALIZE-001",
+      "source_scope": ["DOCX", "XLSX", "XLS", "CSV"],
+      "question_refs": ["UPLOAD"],
+      "category": "Document recognition",
+      "rule_type": "machine_readable_normalization",
+      "severity": "HIGH",
+      "statement": "Word and spreadsheet uploads are converted into searchable text with paragraph/table/sheet provenance before classification and extraction.",
+      "machine_logic": "Retain row boundaries, sheet names and table excerpts; use page/sheet provenance in the evidence register.",
+      "evidence_required": "Normalized text/table channel and source filename.",
+      "action_if_fail": "Provide a readable office file or PDF; do not treat missing extraction as a vessel defect.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "EXTRACT-MULTIENGINE-001",
+      "source_scope": ["PDF"],
+      "question_refs": ["UPLOAD"],
+      "category": "Extraction quality",
+      "rule_type": "multi_engine_reconciliation",
+      "severity": "HIGH",
+      "statement": "Accuracy-first PDF reading reconciles layout-aware Markdown, native text, layout text, tables and OCR before classification.",
+      "machine_logic": "Compare PyMuPDF4LLM, native PyMuPDF and Poppler reading order; retain table rows; OCR sparse pages; use rotate/deskew OCR fallback when available.",
+      "evidence_required": "Reading diagnostics, page text and table channel.",
+      "action_if_fail": "Review the original page or provide a clearer source; never convert unreadable evidence into a vessel defect.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "AI-EVIDENCE-001",
+      "source_scope": ["LOCAL_AI"],
+      "question_refs": ["UPLOAD"],
+      "category": "Extraction quality",
+      "rule_type": "ai_evidence_gate",
+      "severity": "CRITICAL",
+      "statement": "A local-AI candidate may fill a gap only when its value is matched back to a source page and the correct semantic label.",
+      "machine_logic": "Discard unsupported AI values; require certificate date-role labels; score AI below native/table evidence; reject expiry before issue.",
+      "evidence_required": "Matched source page, local evidence excerpt and extraction method.",
+      "action_if_fail": "Treat the item as Not verified and inspect the original document.",
+      "skip_when": []
+    },
+    {
+      "rule_id": "STS-SINGLE-001",
+      "source_scope": ["ONE_VESSEL"],
+      "question_refs": ["STS"],
+      "category": "STS clearance",
+      "rule_type": "single_vessel_readiness",
+      "severity": "CRITICAL",
+      "statement": "Single-vessel STS readiness checks expiry, International Group P&I membership, Class Status alignment, Conditions of Class, short-term certificates, mooring renewal/service evidence, one-year BRC, Q88 STS=Yes and last-ten-port sanctions cues.",
+      "machine_logic": "Run the checklist without requiring a counterpart vessel; missing evidence is NOT VERIFIED and is never treated as a pass.",
+      "evidence_required": "Selected vessel document pack and current operation date.",
+      "action_if_fail": "Resolve HOLD/REVIEW/NOT VERIFIED items before final STS approval.",
       "skip_when": []
     }
   ]

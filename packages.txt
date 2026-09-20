@@ -1,0 +1,6 @@
+poppler-utils
+tesseract-ocr
+tesseract-ocr-eng
+ghostscript
+qpdf
+libreoffice

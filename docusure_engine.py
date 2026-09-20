@@ -26,6 +26,9 @@ DOC_LABELS = {
     "STS_ASSESSMENT": "STS compatibility / risk assessment / JPO",
     "PSC_REPORT": "Port State Control report",
     "MOORING_PLAN": "Mooring line management / mooring plan",
+    "CREW_MATRIX": "Crew matrix / manning document",
+    "PORT_HISTORY": "Last 10 ports / port history",
+    "SANCTIONS": "Sanctions / port screening evidence",
     "HVPQ_XML": "HVPQ XML",
     "UNKNOWN": "Unclassified document",
 }
@@ -65,6 +68,9 @@ SOURCE_PRIORITY = {
     "PIQ": 3,
     "Q88": 2,
     "XML": 1,
+    "CREW_MATRIX": 3,
+    "PORT_HISTORY": 3,
+    "SANCTIONS": 3,
 }
 
 
@@ -85,9 +91,10 @@ def valid_imo(value: Any) -> bool:
     return sum(int(digits[i]) * (7 - i) for i in range(6)) % 10 == int(digits[-1])
 
 
+MONTH_TOKEN = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 DATE_TOKEN_RE = re.compile(
-    r"\b(?:\d{1,2}[\s./-]+[A-Za-z]{3,9}[\s,./-]+\d{2,4}|"
-    r"[A-Za-z]{3,9}[\s./-]+\d{1,2},?[\s./-]+\d{2,4}|"
+    rf"\b(?:\d{{1,2}}[\s./-]+{MONTH_TOKEN}[\s,./-]+\d{{2,4}}|"
+    rf"{MONTH_TOKEN}[\s./-]+\d{{1,2}},?[\s./-]+\d{{2,4}}|"
     r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b",
     re.I,
 )
@@ -135,6 +142,8 @@ class DocumentProfile:
     related_imos: str = ""
     grouping_confidence: str = ""
     grouping_evidence: str = ""
+    document_format: str = "pdf"
+    machine_readable: str = "Yes"
 
     def row(self) -> Dict[str, Any]:
         return asdict(self)
@@ -189,6 +198,22 @@ TYPE_SIGNATURES: Dict[str, Sequence[Tuple[str, int, str]]] = {
         (r"mooring\s+system\s+management\s+plan|\bMSMP\b", 12, "Mooring System Management Plan"),
         (r"mooring\s+rope\s+inspection\s+(?:and\s+)?retirement", 7, "Mooring management wording"),
     ),
+    "CREW_MATRIX": (
+        (r"crew\s+(?:matrix|list|complement)", 13, "Crew matrix/list title"),
+        (r"minimum\s+safe\s+manning", 11, "Minimum safe manning wording"),
+        (r"matrix\s+of\s+(?:competence|crew)", 9, "Crew competence matrix wording"),
+        (r"\b(?:master|chief\s+officer|chief\s+engineer|second\s+engineer|2nd\s+engineer)\b", 4, "Marine rank table"),
+    ),
+    "PORT_HISTORY": (
+        (r"last\s+(?:10|ten)\s+ports?", 14, "Last ten ports heading"),
+        (r"port\s+history|previous\s+ports?|ports?\s+of\s+call", 10, "Port history wording"),
+        (r"last\s+port.*(?:arrival|departure|sailing)", 7, "Last port movement wording"),
+    ),
+    "SANCTIONS": (
+        (r"sanction(?:s)?\s+(?:screening|declaration|check|list)", 13, "Sanctions screening wording"),
+        (r"screened\s+against\s+(?:sanctions|sanction\s+lists?)", 11, "Sanctions screening assertion"),
+        (r"high\s+risk\s+ports?", 8, "High-risk port wording"),
+    ),
     "CERTIFICATE": (
         (r"\bcertificate\s+(?:number|no\.?|of)\b", 5, "Certificate wording"),
         (r"\bvalid\s+(?:until|to)\b|\bexpiry\s+date\b", 5, "Certificate validity field"),
@@ -208,6 +233,9 @@ FILENAME_HINTS = {
     "STS_ASSESSMENT": ("sts assessment", "compatibility", "jpo", "clearance"),
     "PSC_REPORT": ("psc", "port state"),
     "MOORING_PLAN": ("lmp", "msmp", "mooring plan", "line management"),
+    "CREW_MATRIX": ("crew matrix", "crew list", "manning", "complement", "crew"),
+    "PORT_HISTORY": ("last 10", "last10", "port history", "ports", "port calls"),
+    "SANCTIONS": ("sanction", "screening", "high risk port"),
     "CERTIFICATE": ("certificate", "cert ", "coc", "iopp", "smc", "issc"),
 }
 
@@ -299,7 +327,7 @@ def detect_vessel_name(text: str, filename: str = "") -> str:
     return base[:60] if 2 < len(base) <= 60 else ""
 
 
-def profile_document(filename: str, pages: Sequence[Tuple[int, str]], text: str, is_xml: bool = False) -> DocumentProfile:
+def profile_document(filename: str, pages: Sequence[Tuple[int, str]], text: str, is_xml: bool = False, document_format: str = "") -> DocumentProfile:
     doc_type, type_score, evidence = detect_document_type(filename, text, is_xml=is_xml)
     imo, _, _ = detect_imo(text)
     related_imos = detect_all_imos(text)
@@ -330,14 +358,16 @@ def profile_document(filename: str, pages: Sequence[Tuple[int, str]], text: str,
         related_imos=", ".join(related_imos),
         grouping_confidence="High" if imo and len(related_imos) == 1 else ("Medium" if imo else "Unassigned"),
         grouping_evidence=("Checksum-valid IMO extracted" if imo and len(related_imos) == 1 else (f"Multiple checksum-valid IMOs visible: {', '.join(related_imos)}" if related_imos else "No checksum-valid IMO extracted")),
+        document_format=document_format or ("xml" if is_xml else "pdf"),
+        machine_readable="Yes" if chars >= 100 else "Partial",
     )
 
 
 def document_inventory_df(profiles: Sequence[DocumentProfile]) -> pd.DataFrame:
     columns = [
-        "File", "Detected document", "Assigned vessel group", "Vessel / IMO",
+        "File", "Format", "Detected document", "Assigned vessel group", "Vessel / IMO",
         "Group confidence", "Why grouped", "Classification confidence",
-        "Why classified", "Pages", "Text quality", "Action",
+        "Why classified", "Pages", "Text quality", "Machine-readable", "Action",
     ]
     rows = []
     for profile in profiles:
@@ -353,6 +383,7 @@ def document_inventory_df(profiles: Sequence[DocumentProfile]) -> pd.DataFrame:
             action = "OCR/searchable PDF required for reliable checking"
         rows.append({
             "File": profile.filename,
+            "Format": clean(getattr(profile, "document_format", "") or "—").upper(),
             "Detected document": profile.doc_label,
             "Assigned vessel group": assigned_display,
             "Vessel / IMO": vessel,
@@ -362,6 +393,7 @@ def document_inventory_df(profiles: Sequence[DocumentProfile]) -> pd.DataFrame:
             "Why classified": profile.classification_evidence,
             "Pages": profile.pages,
             "Text quality": profile.text_quality,
+            "Machine-readable": getattr(profile, "machine_readable", "Yes"),
             "Action": action,
         })
     return pd.DataFrame(rows, columns=columns)
@@ -405,6 +437,33 @@ def _nearest_date_context(section: str, keyword_re: str) -> List[Tuple[date, str
     return rows
 
 
+def _labelled_brake_date_context(section: str) -> List[Tuple[date, str]]:
+    """Return only dates tied to an explicit brake/BRC test label.
+
+    Mooring sections often show both a last-test date and a future next-test
+    date. Selecting the newest visible date would therefore be unsafe. Prefer
+    the first date after a ``last``/``BRC`` label; accept an unlabelled date
+    only when it is the sole date in the local context.
+    """
+    rows: List[Tuple[date, str]] = []
+    label_re = re.compile(
+        r"(?:date\s+of\s+)?last\s+(?:winch\s+)?(?:brake\s+)?(?:holding\s+capacity\s+)?test|"
+        r"(?:BRC|brake\s+holding\s+capacity)\s*(?:test|date)?",
+        re.I,
+    )
+    for match in label_re.finditer(section or ""):
+        after = dates_in_text((section or "")[match.end():match.end() + 180])
+        if after:
+            rows.append((after[0], clean((section or "")[max(0, match.start() - 100):match.end() + 260])[:420]))
+    if rows:
+        return rows
+    # No explicit role: only a single local date is safe to use.
+    dates = dates_in_text(section or "")
+    if len(dates) == 1:
+        return [(dates[0], clean(section or "")[:420])]
+    return []
+
+
 def extract_mooring_summary(texts_by_source: Dict[str, str], ref_date: date) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Return a cautious mooring facts summary and any row-like line/tail details.
 
@@ -434,10 +493,7 @@ def extract_mooring_summary(texts_by_source: Dict[str, str], ref_date: date) -> 
         # Keep the search inside the brake-test section where possible. A long
         # combined section can also contain line installation dates, which must
         # never be presented as the brake-test date.
-        brake_dates = _nearest_date_context(
-            brake_section or combined,
-            r"brake\s+(?:holding\s+capacity\s+)?test|BHC\s+test",
-        )
+        brake_dates = _labelled_brake_date_context(brake_section or combined)
         if brake_dates:
             brake_date = max(d for d, _ in brake_dates)
             age_days = (ref_date - brake_date).days
@@ -528,6 +584,13 @@ def extract_mooring_summary(texts_by_source: Dict[str, str], ref_date: date) -> 
             if attributes < 2:
                 continue
             item_date = max(visible_dates).isoformat() if visible_dates else ""
+            date_basis = ""
+            if re.search(r"renew(?:al|ed)|replaced|end[- ]?for[- ]?end|service", window, re.I):
+                date_basis = "Renewal/service wording visible"
+            elif re.search(r"installed|installation", window, re.I):
+                date_basis = "Installation date visible"
+            elif item_date:
+                date_basis = "Date visible; basis unclear"
             key = (source, kind, material.group(1).lower() if material else "", diameter.group(1) if diameter else "", length.group(1) if length else "", item_date, normalise(location.group(0)) if location else "")
             if key in seen_inventory:
                 continue
@@ -541,6 +604,8 @@ def extract_mooring_summary(texts_by_source: Dict[str, str], ref_date: date) -> 
                 "Length": f"{length.group(1)} m" if length else "",
                 "Strength value": f"{strength.group(1)} tonnes" if strength else "",
                 "Visible date": item_date,
+                "Last renewal/service date": item_date,
+                "Date basis": date_basis,
                 "Confidence": "Medium" if attributes >= 3 else "Low",
                 "Evidence excerpt": window[:500],
             })
@@ -560,7 +625,7 @@ def extract_mooring_summary(texts_by_source: Dict[str, str], ref_date: date) -> 
                     })
 
     summary_cols = ["Source", "Item", "Value", "Status", "Confidence", "Evidence"]
-    inventory_cols = ["Source", "Type", "Location / identity", "Material", "Diameter", "Length", "Strength value", "Visible date", "Confidence", "Evidence excerpt"]
+    inventory_cols = ["Source", "Type", "Location / identity", "Material", "Diameter", "Length", "Strength value", "Visible date", "Last renewal/service date", "Date basis", "Confidence", "Evidence excerpt"]
     return pd.DataFrame(summary, columns=summary_cols).drop_duplicates(), pd.DataFrame(inventory, columns=inventory_cols).drop_duplicates()
 
 
